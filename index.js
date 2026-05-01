@@ -57,7 +57,6 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// URLパラメータから会社名・担当者名・電話番号を受け取る
 fastify.all('/incoming-call', async (request, reply) => {
     const company = request.query.company || 'unknown';
     const contact = request.query.contact || 'unknown';
@@ -86,7 +85,6 @@ fastify.register(async (fastify) => {
         let markQueue = [];
         let responseStartTimestampTwilio = null;
         let sessionId = null;
-        let callStartTime = Date.now();
 
         // Supabaseにセッション作成
         const createSession = async (params) => {
@@ -118,20 +116,6 @@ fastify.register(async (fastify) => {
                 content
             }).then(({ error }) => {
                 if (error) console.error('Transcript save error:', error);
-            });
-        };
-
-        // セッション終了
-        const endSession = (result) => {
-            if (!sessionId) return;
-            const duration = Math.floor((Date.now() - callStartTime) / 1000);
-            supabase.from('call_sessions').update({
-                status: 'completed',
-                result: result || 'unknown',
-                ended_at: new Date().toISOString(),
-                duration_seconds: duration
-            }).eq('id', sessionId).then(({ error }) => {
-                if (error) console.error('Session end error:', error);
             });
         };
 
@@ -281,7 +265,6 @@ fastify.register(async (fastify) => {
                         console.log('Incoming stream has started', streamSid);
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
-                        // カスタムパラメータから会社名・担当者名・電話番号を取得
                         const params = data.start.customParameters || {};
                         console.log('Custom parameters:', params);
                         createSession(params);
@@ -300,7 +283,6 @@ fastify.register(async (fastify) => {
 
         connection.on('close', () => {
             if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-            endSession('completed');
             console.log('Client disconnected.');
         });
 
