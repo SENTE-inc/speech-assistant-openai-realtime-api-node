@@ -14,7 +14,6 @@ if (!OPENAI_API_KEY) {
     process.exit(1);
 }
 
-// Supabaseクライアント初期化
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const fastify = Fastify();
@@ -54,17 +53,24 @@ const LOG_EVENT_TYPES = [
     'session.updated'
 ];
 
-const SHOW_TIMING_MATH = false;
-
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
+// URLパラメータから会社名・担当者名・電話番号を受け取る
 fastify.all('/incoming-call', async (request, reply) => {
+    const company = request.query.company || 'unknown';
+    const contact = request.query.contact || 'unknown';
+    const phone = request.query.phone || 'unknown';
+
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                           <Response>
                               <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream" />
+                                  <Stream url="wss://${request.headers.host}/media-stream">
+                                      <Parameter name="company" value="${company}" />
+                                      <Parameter name="contact" value="${contact}" />
+                                      <Parameter name="phone" value="${phone}" />
+                                  </Stream>
                               </Connect>
                           </Response>`;
     reply.type('text/xml').send(twimlResponse);
@@ -83,11 +89,13 @@ fastify.register(async (fastify) => {
         let callStartTime = Date.now();
 
         // Supabaseにセッション作成
-        const createSession = async (phoneNumber) => {
+        const createSession = async (params) => {
             const { data, error } = await supabase
                 .from('call_sessions')
                 .insert({
-                    phone_number: phoneNumber || 'unknown',
+                    phone_number: params?.phone || 'unknown',
+                    company_name: params?.company || null,
+                    contact_name: params?.contact || null,
                     status: 'calling',
                     script_phase: 'greeting'
                 })
@@ -213,7 +221,6 @@ fastify.register(async (fastify) => {
                     console.log(`Received event: ${response.type}`, response);
                 }
 
-                // AIの発話テキストを保存
                 if (response.type === 'response.content.done') {
                     if (response.content) {
                         response.content.forEach(item => {
@@ -245,7 +252,6 @@ fastify.register(async (fastify) => {
                     handleSpeechStartedEvent();
                 }
 
-                // ユーザーの発話テキストを保存
                 if (response.type === 'input_audio_buffer.committed') {
                     if (response.transcript) {
                         saveTranscript('user', response.transcript);
@@ -275,8 +281,10 @@ fastify.register(async (fastify) => {
                         console.log('Incoming stream has started', streamSid);
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
-                        // セッション作成
-                        createSession(data.start.customParameters?.phone_number);
+                        // カスタムパラメータから会社名・担当者名・電話番号を取得
+                        const params = data.start.customParameters || {};
+                        console.log('Custom parameters:', params);
+                        createSession(params);
                         break;
                     case 'mark':
                         if (markQueue.length > 0) markQueue.shift();
