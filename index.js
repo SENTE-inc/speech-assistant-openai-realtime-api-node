@@ -46,11 +46,13 @@ const PORT = process.env.PORT || 5050;
 const LOG_EVENT_TYPES = [
     'error',
     'response.content.done',
+    'response.output_item.done',
     'rate_limits.updated',
     'response.done',
     'input_audio_buffer.committed',
     'input_audio_buffer.speech_stopped',
     'input_audio_buffer.speech_started',
+    'conversation.item.input_audio_transcription.completed',
     'session.created',
     'session.updated'
 ];
@@ -90,20 +92,24 @@ fastify.register(async (fastify) => {
 
         // トランスクリプト保存（call_sidで紐付け）
         const saveTranscript = (role, content, callSid) => {
-            if (!callSid) return;
+            if (!callSid || !content) return;
             supabase
                 .from('call_sessions')
                 .select('id')
                 .eq('call_sid', callSid)
                 .single()
                 .then(({ data, error }) => {
-                    if (error || !data) return;
+                    if (error || !data) {
+                        console.error('Session lookup error:', error);
+                        return;
+                    }
                     supabase.from('call_transcripts').insert({
                         session_id: data.id,
                         role,
                         content
                     }).then(({ error }) => {
                         if (error) console.error('Transcript save error:', error);
+                        else console.log(`Transcript saved: [${role}] ${content.substring(0, 50)}`);
                     });
                 });
         };
@@ -140,7 +146,6 @@ fastify.register(async (fastify) => {
                     instructions: dynamicInstructions,
                     modalities: ['text', 'audio'],
                     temperature: TEMPERATURE,
-                    // 音声のトランスクリプトを有効化
                     input_audio_transcription: {
                         model: 'whisper-1'
                     }
@@ -204,15 +209,16 @@ fastify.register(async (fastify) => {
                 const response = JSON.parse(data);
 
                 if (LOG_EVENT_TYPES.includes(response.type)) {
-                    console.log(`Received event: ${response.type}`, response);
+                    console.log(`Received event: ${response.type}`, JSON.stringify(response).substring(0, 200));
                 }
 
                 // AIの発話テキストを保存
-                if (response.type === 'response.content.done') {
-                    if (response.content) {
-                        response.content.forEach(item => {
-                            if (item.type === 'text') {
-                                saveTranscript('assistant', item.text, callParams?.callSid);
+                if (response.type === 'response.output_item.done') {
+                    const item = response.item;
+                    if (item?.type === 'message' && item?.role === 'assistant') {
+                        item.content?.forEach(c => {
+                            if (c.type === 'text' && c.text) {
+                                saveTranscript('assistant', c.text, callParams?.callSid);
                             }
                         });
                     }
@@ -242,6 +248,7 @@ fastify.register(async (fastify) => {
                 // ユーザーの音声トランスクリプトを保存
                 if (response.type === 'conversation.item.input_audio_transcription.completed') {
                     if (response.transcript) {
+                        console.log('User transcript:', response.transcript);
                         saveTranscript('user', response.transcript, callParams?.callSid);
                     }
                 }
