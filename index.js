@@ -45,11 +45,8 @@ const PORT = process.env.PORT || 5050;
 
 const LOG_EVENT_TYPES = [
     'error',
-    'response.content.done',
-    'response.output_item.done',
-    'rate_limits.updated',
     'response.done',
-    'input_audio_buffer.committed',
+    'rate_limits.updated',
     'input_audio_buffer.speech_stopped',
     'input_audio_buffer.speech_started',
     'conversation.item.input_audio_transcription.completed',
@@ -92,7 +89,7 @@ fastify.register(async (fastify) => {
 
         // トランスクリプト保存（call_sidで紐付け）
         const saveTranscript = (role, content, callSid) => {
-            if (!callSid || !content) return;
+            if (!callSid || !content?.trim()) return;
             supabase
                 .from('call_sessions')
                 .select('id')
@@ -106,10 +103,10 @@ fastify.register(async (fastify) => {
                     supabase.from('call_transcripts').insert({
                         session_id: data.id,
                         role,
-                        content
+                        content: content.trim()
                     }).then(({ error }) => {
                         if (error) console.error('Transcript save error:', error);
-                        else console.log(`Transcript saved: [${role}] ${content.substring(0, 50)}`);
+                        else console.log(`Transcript saved: [${role}] ${content.trim().substring(0, 50)}`);
                     });
                 });
         };
@@ -209,19 +206,28 @@ fastify.register(async (fastify) => {
                 const response = JSON.parse(data);
 
                 if (LOG_EVENT_TYPES.includes(response.type)) {
-                    console.log(`Received event: ${response.type}`, JSON.stringify(response).substring(0, 200));
+                    console.log(`Received event: ${response.type}`);
                 }
 
-                // AIの発話テキストを保存
-                if (response.type === 'response.output_item.done') {
-                    const item = response.item;
-                    if (item?.type === 'message' && item?.role === 'assistant') {
-                        item.content?.forEach(c => {
-                            if (c.type === 'text' && c.text) {
-                                saveTranscript('assistant', c.text, callParams?.callSid);
-                            }
-                        });
-                    }
+                // AIの発話テキストをresponse.doneから取得して保存
+                if (response.type === 'response.done') {
+                    const output = response.response?.output || [];
+                    output.forEach(item => {
+                        if (item?.type === 'message' && item?.role === 'assistant') {
+                            item.content?.forEach(c => {
+                                // 音声のトランスクリプト
+                                if (c.type === 'audio' && c.transcript) {
+                                    console.log('Assistant transcript:', c.transcript.substring(0, 50));
+                                    saveTranscript('assistant', c.transcript, callParams?.callSid);
+                                }
+                                // テキストコンテンツ
+                                if (c.type === 'text' && c.text) {
+                                    console.log('Assistant text:', c.text.substring(0, 50));
+                                    saveTranscript('assistant', c.text, callParams?.callSid);
+                                }
+                            });
+                        }
+                    });
                 }
 
                 if (response.type === 'response.audio.delta' && response.delta) {
@@ -267,51 +273,4 @@ fastify.register(async (fastify) => {
                         if (openAiWs.readyState === WebSocket.OPEN) {
                             const audioAppend = {
                                 type: 'input_audio_buffer.append',
-                                audio: data.media.payload
-                            };
-                            openAiWs.send(JSON.stringify(audioAppend));
-                        }
-                        break;
-                    case 'start':
-                        streamSid = data.start.streamSid;
-                        console.log('Incoming stream has started', streamSid);
-                        responseStartTimestampTwilio = null;
-                        latestMediaTimestamp = 0;
-                        callParams = data.start.customParameters || {};
-                        callParams.callSid = data.start.callSid || null;
-                        console.log('Call params:', callParams);
-                        break;
-                    case 'mark':
-                        if (markQueue.length > 0) markQueue.shift();
-                        break;
-                    default:
-                        console.log('Received non-media event:', data.event);
-                        break;
-                }
-            } catch (error) {
-                console.error('Error parsing message:', error, 'Message:', message);
-            }
-        });
-
-        connection.on('close', () => {
-            if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-            console.log('Client disconnected.');
-        });
-
-        openAiWs.on('close', () => {
-            console.log('Disconnected from the OpenAI Realtime API');
-        });
-
-        openAiWs.on('error', (error) => {
-            console.error('Error in the OpenAI WebSocket:', error);
-        });
-    });
-});
-
-fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
-    if (err) {
-        console.error(err);
-        process.exit(1);
-    }
-    console.log(`Server is listening on port ${PORT}`);
-});
+                                audio: data.media.payloa
