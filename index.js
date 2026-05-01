@@ -3,24 +3,24 @@ import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import { createClient } from '@supabase/supabase-js';
 
-// Load environment variables from .env file
 dotenv.config();
 
-// Retrieve the OpenAI API key from environment variables.
-const { OPENAI_API_KEY } = process.env;
+const { OPENAI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
 
 if (!OPENAI_API_KEY) {
     console.error('Missing OpenAI API key. Please set it in the .env file.');
     process.exit(1);
 }
 
-// Initialize Fastify
+// Supabaseクライアント初期化
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// Constants
 const SYSTEM_MESSAGE = `あなたはプロの営業アシスタントです。必ず日本語で話してください。
 以下の役割で電話対応を行います。
 
@@ -56,12 +56,10 @@ const LOG_EVENT_TYPES = [
 
 const SHOW_TIMING_MATH = false;
 
-// Root Route
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// Route for Twilio to handle incoming calls
 fastify.all('/incoming-call', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                           <Response>
@@ -69,11 +67,9 @@ fastify.all('/incoming-call', async (request, reply) => {
                                   <Stream url="wss://${request.headers.host}/media-stream" />
                               </Connect>
                           </Response>`;
-
     reply.type('text/xml').send(twimlResponse);
 });
 
-// WebSocket route for media-stream
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         console.log('Client connected');
@@ -83,8 +79,55 @@ fastify.register(async (fastify) => {
         let lastAssistantItem = null;
         let markQueue = [];
         let responseStartTimestampTwilio = null;
+        let sessionId = null;
+        let callStartTime = Date.now();
 
-        const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`, {
+        // Supabaseにセッション作成
+        const createSession = async (phoneNumber) => {
+            const { data, error } = await supabase
+                .from('call_sessions')
+                .insert({
+                    phone_number: phoneNumber || 'unknown',
+                    status: 'calling',
+                    script_phase: 'greeting'
+                })
+                .select()
+                .single();
+            if (error) {
+                console.error('Supabase session create error:', error);
+            } else {
+                sessionId = data.id;
+                console.log('Session created:', sessionId);
+            }
+        };
+
+        // トランスクリプト保存（非同期）
+        const saveTranscript = (role, content) => {
+            if (!sessionId) return;
+            supabase.from('call_transcripts').insert({
+                session_id: sessionId,
+                role,
+                content
+            }).then(({ error }) => {
+                if (error) console.error('Transcript save error:', error);
+            });
+        };
+
+        // セッション終了
+        const endSession = (result) => {
+            if (!sessionId) return;
+            const duration = Math.floor((Date.now() - callStartTime) / 1000);
+            supabase.from('call_sessions').update({
+                status: 'completed',
+                result: result || 'unknown',
+                ended_at: new Date().toISOString(),
+                duration_seconds: duration
+            }).eq('id', sessionId).then(({ error }) => {
+                if (error) console.error('Session end error:', error);
+            });
+        };
+
+        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', {
             headers: {
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
                 'OpenAI-Beta': 'realtime=v1'
@@ -104,8 +147,6 @@ fastify.register(async (fastify) => {
                     temperature: TEMPERATURE,
                 }
             };
-
-            console.log('Sending session update:', JSON.stringify(sessionUpdate));
             openAiWs.send(JSON.stringify(sessionUpdate));
             sendInitialConversationItem();
         };
@@ -124,7 +165,6 @@ fastify.register(async (fastify) => {
                     ]
                 }
             };
-
             openAiWs.send(JSON.stringify(initialConversationItem));
             openAiWs.send(JSON.stringify({ type: 'response.create' }));
         };
@@ -132,7 +172,6 @@ fastify.register(async (fastify) => {
         const handleSpeechStartedEvent = () => {
             if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
                 const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-
                 if (lastAssistantItem) {
                     const truncateEvent = {
                         type: 'conversation.item.truncate',
@@ -142,12 +181,7 @@ fastify.register(async (fastify) => {
                     };
                     openAiWs.send(JSON.stringify(truncateEvent));
                 }
-
-                connection.send(JSON.stringify({
-                    event: 'clear',
-                    streamSid: streamSid
-                }));
-
+                connection.send(JSON.stringify({ event: 'clear', streamSid }));
                 markQueue = [];
                 lastAssistantItem = null;
                 responseStartTimestampTwilio = null;
@@ -158,7 +192,7 @@ fastify.register(async (fastify) => {
             if (streamSid) {
                 const markEvent = {
                     event: 'mark',
-                    streamSid: streamSid,
+                    streamSid,
                     mark: { name: 'responsePart' }
                 };
                 connection.send(JSON.stringify(markEvent));
@@ -179,10 +213,21 @@ fastify.register(async (fastify) => {
                     console.log(`Received event: ${response.type}`, response);
                 }
 
+                // AIの発話テキストを保存
+                if (response.type === 'response.content.done') {
+                    if (response.content) {
+                        response.content.forEach(item => {
+                            if (item.type === 'text') {
+                                saveTranscript('assistant', item.text);
+                            }
+                        });
+                    }
+                }
+
                 if (response.type === 'response.audio.delta' && response.delta) {
                     const audioDelta = {
                         event: 'media',
-                        streamSid: streamSid,
+                        streamSid,
                         media: { payload: Buffer.from(response.delta, 'base64').toString('base64') }
                     };
                     connection.send(JSON.stringify(audioDelta));
@@ -190,16 +235,21 @@ fastify.register(async (fastify) => {
                     if (!responseStartTimestampTwilio) {
                         responseStartTimestampTwilio = latestMediaTimestamp;
                     }
-
                     if (response.item_id) {
                         lastAssistantItem = response.item_id;
                     }
-
                     sendMark(connection, streamSid);
                 }
 
                 if (response.type === 'input_audio_buffer.speech_started') {
                     handleSpeechStartedEvent();
+                }
+
+                // ユーザーの発話テキストを保存
+                if (response.type === 'input_audio_buffer.committed') {
+                    if (response.transcript) {
+                        saveTranscript('user', response.transcript);
+                    }
                 }
             } catch (error) {
                 console.error('Error processing OpenAI message:', error, 'Raw message:', data);
@@ -209,7 +259,6 @@ fastify.register(async (fastify) => {
         connection.on('message', (message) => {
             try {
                 const data = JSON.parse(message);
-
                 switch (data.event) {
                     case 'media':
                         latestMediaTimestamp = data.media.timestamp;
@@ -226,11 +275,11 @@ fastify.register(async (fastify) => {
                         console.log('Incoming stream has started', streamSid);
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
+                        // セッション作成
+                        createSession(data.start.customParameters?.phone_number);
                         break;
                     case 'mark':
-                        if (markQueue.length > 0) {
-                            markQueue.shift();
-                        }
+                        if (markQueue.length > 0) markQueue.shift();
                         break;
                     default:
                         console.log('Received non-media event:', data.event);
@@ -243,6 +292,7 @@ fastify.register(async (fastify) => {
 
         connection.on('close', () => {
             if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+            endSession('completed');
             console.log('Client disconnected.');
         });
 
