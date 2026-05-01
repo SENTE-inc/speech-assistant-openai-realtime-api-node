@@ -84,41 +84,27 @@ fastify.register(async (fastify) => {
         let lastAssistantItem = null;
         let markQueue = [];
         let responseStartTimestampTwilio = null;
-        let sessionId = null;
         let callParams = {};
 
-        // Supabaseにセッション作成
-        const createSession = async (params) => {
-            callParams = params;
-            const { data, error } = await supabase
+        // トランスクリプト保存（call_sidで紐付け）
+        const saveTranscript = (role, content, callSid) => {
+            if (!callSid) return;
+            // call_sidからsession_idを取得して保存
+            supabase
                 .from('call_sessions')
-                .insert({
-                    phone_number: params?.phone || 'unknown',
-                    company_name: params?.company || null,
-                    contact_name: params?.contact || null,
-                    status: 'calling',
-                    script_phase: 'greeting'
-                })
-                .select()
-                .single();
-            if (error) {
-                console.error('Supabase session create error:', error);
-            } else {
-                sessionId = data.id;
-                console.log('Session created:', sessionId);
-            }
-        };
-
-        // トランスクリプト保存（非同期）
-        const saveTranscript = (role, content) => {
-            if (!sessionId) return;
-            supabase.from('call_transcripts').insert({
-                session_id: sessionId,
-                role,
-                content
-            }).then(({ error }) => {
-                if (error) console.error('Transcript save error:', error);
-            });
+                .select('id')
+                .eq('call_sid', callSid)
+                .single()
+                .then(({ data, error }) => {
+                    if (error || !data) return;
+                    supabase.from('call_transcripts').insert({
+                        session_id: data.id,
+                        role,
+                        content
+                    }).then(({ error }) => {
+                        if (error) console.error('Transcript save error:', error);
+                    });
+                });
         };
 
         const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', {
@@ -147,11 +133,9 @@ fastify.register(async (fastify) => {
 
         const sendInitialConversationItem = () => {
             const company = callParams?.company && callParams.company !== 'unknown'
-                ? callParams.company
-                : null;
+                ? callParams.company : null;
             const contact = callParams?.contact && callParams.contact !== 'unknown'
-                ? callParams.contact
-                : null;
+                ? callParams.contact : null;
 
             const greetingInstruction = contact
                 ? `以下の情報を使って日本語で営業電話の挨拶をしてください。
@@ -170,12 +154,7 @@ fastify.register(async (fastify) => {
                 item: {
                     type: 'message',
                     role: 'user',
-                    content: [
-                        {
-                            type: 'input_text',
-                            text: greetingInstruction
-                        }
-                    ]
+                    content: [{ type: 'input_text', text: greetingInstruction }]
                 }
             };
             openAiWs.send(JSON.stringify(initialConversationItem));
@@ -230,7 +209,7 @@ fastify.register(async (fastify) => {
                     if (response.content) {
                         response.content.forEach(item => {
                             if (item.type === 'text') {
-                                saveTranscript('assistant', item.text);
+                                saveTranscript('assistant', item.text, callParams?.callSid);
                             }
                         });
                     }
@@ -259,7 +238,7 @@ fastify.register(async (fastify) => {
 
                 if (response.type === 'input_audio_buffer.committed') {
                     if (response.transcript) {
-                        saveTranscript('user', response.transcript);
+                        saveTranscript('user', response.transcript, callParams?.callSid);
                     }
                 }
             } catch (error) {
@@ -286,9 +265,10 @@ fastify.register(async (fastify) => {
                         console.log('Incoming stream has started', streamSid);
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
-                        const params = data.start.customParameters || {};
-                        console.log('Custom parameters:', params);
-                        createSession(params);
+                        callParams = data.start.customParameters || {};
+                        // TwilioのCallSidを取得
+                        callParams.callSid = data.start.callSid || null;
+                        console.log('Call params:', callParams);
                         break;
                     case 'mark':
                         if (markQueue.length > 0) markQueue.shift();
