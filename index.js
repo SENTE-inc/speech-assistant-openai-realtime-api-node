@@ -121,7 +121,6 @@ fastify.register(async (fastify) => {
             const contact = callParams?.contact && callParams.contact !== 'unknown'
                 ? callParams.contact : null;
 
-            // 架電情報をinstructionsに組み込む
             const dynamicInstructions = SYSTEM_MESSAGE + `
 
 【今回の架電情報】
@@ -141,6 +140,10 @@ fastify.register(async (fastify) => {
                     instructions: dynamicInstructions,
                     modalities: ['text', 'audio'],
                     temperature: TEMPERATURE,
+                    // 音声のトランスクリプトを有効化
+                    input_audio_transcription: {
+                        model: 'whisper-1'
+                    }
                 }
             };
             openAiWs.send(JSON.stringify(sessionUpdate));
@@ -148,7 +151,6 @@ fastify.register(async (fastify) => {
         };
 
         const sendInitialConversationItem = () => {
-            // シンプルなトリガーだけ送る（指示を読み上げさせない）
             const initialConversationItem = {
                 type: 'conversation.item.create',
                 item: {
@@ -205,6 +207,7 @@ fastify.register(async (fastify) => {
                     console.log(`Received event: ${response.type}`, response);
                 }
 
+                // AIの発話テキストを保存
                 if (response.type === 'response.content.done') {
                     if (response.content) {
                         response.content.forEach(item => {
@@ -236,11 +239,13 @@ fastify.register(async (fastify) => {
                     handleSpeechStartedEvent();
                 }
 
-                if (response.type === 'input_audio_buffer.committed') {
+                // ユーザーの音声トランスクリプトを保存
+                if (response.type === 'conversation.item.input_audio_transcription.completed') {
                     if (response.transcript) {
                         saveTranscript('user', response.transcript, callParams?.callSid);
                     }
                 }
+
             } catch (error) {
                 console.error('Error processing OpenAI message:', error, 'Raw message:', data);
             }
