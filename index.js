@@ -273,4 +273,51 @@ fastify.register(async (fastify) => {
                         if (openAiWs.readyState === WebSocket.OPEN) {
                             const audioAppend = {
                                 type: 'input_audio_buffer.append',
-                                audio: data.media.payloa
+                                audio: data.media.payload
+                            };
+                            openAiWs.send(JSON.stringify(audioAppend));
+                        }
+                        break;
+                    case 'start':
+                        streamSid = data.start.streamSid;
+                        console.log('Incoming stream has started', streamSid);
+                        responseStartTimestampTwilio = null;
+                        latestMediaTimestamp = 0;
+                        callParams = data.start.customParameters || {};
+                        callParams.callSid = data.start.callSid || null;
+                        console.log('Call params:', callParams);
+                        break;
+                    case 'mark':
+                        if (markQueue.length > 0) markQueue.shift();
+                        break;
+                    default:
+                        console.log('Received non-media event:', data.event);
+                        break;
+                }
+            } catch (error) {
+                console.error('Error parsing message:', error, 'Message:', message);
+            }
+        });
+
+        connection.on('close', () => {
+            if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+            console.log('Client disconnected.');
+        });
+
+        openAiWs.on('close', () => {
+            console.log('Disconnected from the OpenAI Realtime API');
+        });
+
+        openAiWs.on('error', (error) => {
+            console.error('Error in the OpenAI WebSocket:', error);
+        });
+    });
+});
+
+fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
+    if (err) {
+        console.error(err);
+        process.exit(1);
+    }
+    console.log(`Server is listening on port ${PORT}`);
+});
