@@ -348,7 +348,7 @@ async function transcribeWhisper(mulawBuffer) {
     const wav = mulawToWav(mulawBuffer);
     const formData = new FormData();
     formData.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
-    formData.append('model', 'whisper-1');
+    formData.append('model', 'gpt-4o-mini-transcribe');
     formData.append('language', 'ja');
 
     const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
@@ -422,7 +422,13 @@ async function classifyWithClaude(transcript, ctx = {}) {
         const message = await anthropic.messages.create({
             model: 'claude-haiku-4-5-20251001',
             max_tokens: 200,
-            system: CLAUDE_SYSTEM_PROMPT,
+            system: [
+                {
+                    type: 'text',
+                    text: CLAUDE_SYSTEM_PROMPT,
+                    cache_control: { type: 'ephemeral' },
+                },
+            ],
             messages: [
                 { role: 'user', content: userMessage },
                 { role: 'assistant', content: '{' },
@@ -506,7 +512,7 @@ fastify.register(async (fastify) => {
         // VAD
         const VAD_RMS_THRESHOLD = 2000;
         const SPEECH_START_FRAMES = 3;   // 3 consecutive frames (~60ms) required
-        const SILENCE_END_FRAMES = 40;   // 40 frames * 20ms = 800ms of silence ends utterance
+        const SILENCE_END_FRAMES = 25;   // 25 frames * 20ms = 500ms of silence ends utterance
         const MIN_UTTERANCE_BYTES = 4000; // ~500ms of audio (8kHz mulaw)
         const CALL_START_GRACE_MS = 5000;  // ignore inbound audio for the first 5s (Twilio trial preamble)
         const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
@@ -561,15 +567,31 @@ fastify.register(async (fastify) => {
         // Supabase transcript persistence (preserved from previous version)
         // -----------------------------------------------------------------
         const saveTranscript = (role, content) => {
-            if (!callSid || !content || !content.trim()) return;
+            const trimmed = content?.trim();
+            console.log(
+                `[saveTranscript] called role=${role} callSid=${callSid} ` +
+                    `contentLen=${trimmed?.length ?? 0} preview="${trimmed?.substring(0, 40) ?? ''}"`
+            );
+            if (!callSid) {
+                console.warn('[saveTranscript] SKIPPED: callSid is missing');
+                return;
+            }
+            if (!trimmed) {
+                console.warn('[saveTranscript] SKIPPED: content is empty');
+                return;
+            }
             supabase
                 .from('call_sessions')
                 .select('id')
                 .eq('call_sid', callSid)
                 .single()
                 .then(({ data, error }) => {
+                    console.log(
+                        `[saveTranscript] session lookup callSid=${callSid} ` +
+                            `result=${JSON.stringify(data)} error=${JSON.stringify(error)}`
+                    );
                     if (error || !data) {
-                        console.error('Session lookup error:', error);
+                        console.error('[saveTranscript] Session lookup failed:', error);
                         return;
                     }
                     supabase
@@ -577,11 +599,19 @@ fastify.register(async (fastify) => {
                         .insert({
                             session_id: data.id,
                             role,
-                            content: content.trim(),
+                            content: trimmed,
                         })
                         .then(({ error: insErr }) => {
-                            if (insErr) console.error('Transcript save error:', insErr);
-                            else console.log(`✓ Transcript [${role}]: ${content.trim().substring(0, 60)}`);
+                            if (insErr) {
+                                console.error(
+                                    `[saveTranscript] INSERT FAILED session_id=${data.id} role=${role}:`,
+                                    insErr
+                                );
+                            } else {
+                                console.log(
+                                    `[saveTranscript] ✓ INSERT OK session_id=${data.id} role=${role}: ${trimmed.substring(0, 60)}`
+                                );
+                            }
                         });
                 });
         };
@@ -943,12 +973,26 @@ fastify.register(async (fastify) => {
                         console.log('Twilio: connected');
                         break;
                     case 'start':
+                        console.log(
+                            '[start event] full data.start payload:',
+                            JSON.stringify(data.start, null, 2)
+                        );
                         streamSid = data.start.streamSid;
                         callSid = data.start.callSid || null;
                         callParams = data.start.customParameters || {};
                         callParams.callSid = callSid;
                         callStartTime = Date.now();
                         vadEnabled = false;
+                        console.log(
+                            `[start event] extracted streamSid=${streamSid} callSid=${callSid} ` +
+                                `(callSid type=${typeof data.start.callSid}, present=${'callSid' in data.start})`
+                        );
+                        if (!callSid) {
+                            console.error(
+                                '[start event] WARNING: callSid is null/missing — transcripts will not save. ' +
+                                    `Available keys on data.start: ${Object.keys(data.start).join(', ')}`
+                            );
+                        }
                         console.log(
                             `Twilio: start ${streamSid} (VAD muted for first ${CALL_START_GRACE_MS}ms) params:`,
                             callParams
