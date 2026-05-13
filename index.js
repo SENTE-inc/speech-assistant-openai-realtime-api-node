@@ -506,7 +506,7 @@ fastify.register(async (fastify) => {
         // VAD
         const VAD_RMS_THRESHOLD = 2000;
         const SPEECH_START_FRAMES = 3;   // 3 consecutive frames (~60ms) required
-        const SILENCE_END_FRAMES = 75;   // 75 frames * 20ms = 1500ms of silence ends utterance
+        const SILENCE_END_FRAMES = 40;   // 40 frames * 20ms = 800ms of silence ends utterance
         const MIN_UTTERANCE_BYTES = 4000; // ~500ms of audio (8kHz mulaw)
         const CALL_START_GRACE_MS = 5000;  // ignore inbound audio for the first 5s (Twilio trial preamble)
         const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
@@ -623,6 +623,8 @@ fastify.register(async (fastify) => {
             const token = ++markCounter;
             currentPlaybackToken = token;
 
+            const wasCached = audioCache.has(key);
+            const loadT0 = Date.now();
             let mulaw;
             try {
                 mulaw = await getAudioBuffer(key);
@@ -630,9 +632,13 @@ fastify.register(async (fastify) => {
                 console.error(`Failed to load ${key}:`, err);
                 return;
             }
+            const loadMs = Date.now() - loadT0;
             if (currentPlaybackToken !== token) return; // Interrupted while loading
 
-            console.log(`▶ Playing ${key} (${AUDIO_FILES[key]}, ${mulaw.length} bytes)`);
+            console.log(
+                `▶ Playing ${key} (${AUDIO_FILES[key]}) cache=${wasCached ? 'HIT' : 'MISS'} ` +
+                    `load=${loadMs}ms size=${mulaw.length}B`
+            );
             const chunkSize = 160; // 20ms at 8kHz mulaw
             for (let i = 0; i < mulaw.length; i += chunkSize) {
                 if (currentPlaybackToken !== token) return;
@@ -678,19 +684,23 @@ fastify.register(async (fastify) => {
             if (state === 'PROCESSING' || state === 'ENDED' || state === 'REALTIME') return;
             state = 'PROCESSING';
             disableVad('processing utterance');
+            const t0 = Date.now();
             console.log(`▶ State: PROCESSING (${mulawAudio.length} bytes captured)`);
 
-            // Filler "はい" in parallel with Whisper+Claude
+            // Kick off the filler clip and the Whisper request at the same
+            // tick so they run concurrently. We do not await the filler — it
+            // plays out while we are still talking to OpenAI and Claude.
             const fillerPromise = playAudio('hai').catch((err) =>
                 console.error('Filler playback error:', err)
             );
-
-            let transcript = null;
-            try {
-                transcript = await transcribeWhisper(mulawAudio);
-            } catch (err) {
+            const whisperPromise = transcribeWhisper(mulawAudio).catch((err) => {
                 console.error('Whisper error:', err);
-            }
+                return null;
+            });
+            console.log('[parallel] filler + Whisper started');
+
+            const transcript = await whisperPromise;
+            console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
 
             if (!transcript) {
                 console.log('Empty transcript, returning to LISTENING');
@@ -704,11 +714,15 @@ fastify.register(async (fastify) => {
             lastUserTranscript = transcript;
             saveTranscript('user', transcript);
 
+            const claudeT0 = Date.now();
             const decision = await classifyWithClaude(transcript, {
                 company: callParams?.company,
                 contact: callParams?.contact,
             });
-            console.log('Claude decision:', decision);
+            console.log(
+                `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms):`,
+                decision
+            );
 
             // Filler must complete before we play the real response.
             await fillerPromise;
