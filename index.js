@@ -504,14 +504,53 @@ fastify.register(async (fastify) => {
         let lastUserTranscript = null;
 
         // VAD
-        const VAD_RMS_THRESHOLD = 500;
-        const SPEECH_START_FRAMES = 3;   // ~60ms of speech triggers start
-        const SILENCE_END_FRAMES = 40;   // ~800ms of silence ends utterance
+        const VAD_RMS_THRESHOLD = 2000;
+        const SPEECH_START_FRAMES = 3;   // 3 consecutive frames (~60ms) required
+        const SILENCE_END_FRAMES = 75;   // 75 frames * 20ms = 1500ms of silence ends utterance
         const MIN_UTTERANCE_BYTES = 4000; // ~500ms of audio (8kHz mulaw)
+        const CALL_START_GRACE_MS = 5000;  // ignore inbound audio for the first 5s (Twilio trial preamble)
+        const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
         let speechActive = false;
         let speechFrames = 0;
         let silenceFrames = 0;
         let speechChunks = [];
+        let vadEnabled = false;
+        let vadEnableTimer = null;
+        let callStartTime = 0;
+
+        const resetVadCapture = () => {
+            speechActive = false;
+            speechFrames = 0;
+            silenceFrames = 0;
+            speechChunks = [];
+        };
+
+        const disableVad = (reason) => {
+            if (vadEnableTimer) {
+                clearTimeout(vadEnableTimer);
+                vadEnableTimer = null;
+            }
+            if (vadEnabled) console.log(`[vad] disabled (${reason})`);
+            vadEnabled = false;
+            resetVadCapture();
+        };
+
+        const enableVadDelayed = (minDelayMs, reason) => {
+            if (vadEnableTimer) clearTimeout(vadEnableTimer);
+            const sinceStart = callStartTime ? Date.now() - callStartTime : 0;
+            const remainingGrace = Math.max(0, CALL_START_GRACE_MS - sinceStart);
+            const delay = Math.max(minDelayMs, remainingGrace);
+            vadEnableTimer = setTimeout(() => {
+                vadEnableTimer = null;
+                if (state !== 'LISTENING') {
+                    console.log(`[vad] enable timer fired but state=${state}; staying disabled`);
+                    return;
+                }
+                vadEnabled = true;
+                resetVadCapture();
+                console.log(`[vad] enabled (after ${delay}ms, ${reason})`);
+            }, delay);
+        };
 
         // Playback / mark tracking
         let markCounter = 0;
@@ -610,22 +649,14 @@ fastify.register(async (fastify) => {
             saveTranscript('assistant', AUDIO_TEXTS[key] || '');
         };
 
-        const interruptPlayback = () => {
-            if (currentPlaybackToken === null) return;
-            console.log('✗ Interrupting playback');
-            currentPlaybackToken = null;
-            clearTwilioBuffer();
-            for (const [, resolve] of pendingMarks) resolve();
-            pendingMarks.clear();
-        };
-
         // -----------------------------------------------------------------
         // Greeting flow (greeting → greeting_with_name or greeting_no_name)
         // -----------------------------------------------------------------
         const playGreeting = async () => {
             state = 'PLAYING';
+            disableVad('playing greeting');
             await playAudio('greeting');
-            if (state !== 'PLAYING') return; // interrupted
+            if (state !== 'PLAYING') return;
 
             const contact = callParams?.contact;
             if (contact && contact !== 'unknown') {
@@ -637,6 +668,7 @@ fastify.register(async (fastify) => {
 
             state = 'LISTENING';
             console.log('▶ State: LISTENING');
+            enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after greeting');
         };
 
         // -----------------------------------------------------------------
@@ -645,6 +677,7 @@ fastify.register(async (fastify) => {
         const handleUserUtterance = async (mulawAudio) => {
             if (state === 'PROCESSING' || state === 'ENDED' || state === 'REALTIME') return;
             state = 'PROCESSING';
+            disableVad('processing utterance');
             console.log(`▶ State: PROCESSING (${mulawAudio.length} bytes captured)`);
 
             // Filler "はい" in parallel with Whisper+Claude
@@ -663,6 +696,7 @@ fastify.register(async (fastify) => {
                 console.log('Empty transcript, returning to LISTENING');
                 await fillerPromise;
                 state = 'LISTENING';
+                enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'empty transcript');
                 return;
             }
 
@@ -682,6 +716,7 @@ fastify.register(async (fastify) => {
 
             if (decision.action === 'play_audio' && decision.audio_key && AUDIO_FILES[decision.audio_key]) {
                 state = 'PLAYING';
+                disableVad('playing response');
                 await playAudio(decision.audio_key);
 
                 if (END_CALL_KEYS.has(decision.audio_key)) {
@@ -692,9 +727,11 @@ fastify.register(async (fastify) => {
                     }, 500);
                 } else if (state === 'PLAYING') {
                     state = 'LISTENING';
+                    enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after response');
                 }
             } else if (decision.action === 'end_call') {
                 state = 'PLAYING';
+                disableVad('playing farewell');
                 const farewell = decision.audio_key && AUDIO_FILES[decision.audio_key]
                     ? decision.audio_key
                     : 'thanks';
@@ -839,9 +876,14 @@ fastify.register(async (fastify) => {
                 return;
             }
 
-            // VAD is only meaningful while we can react: LISTENING (start a
-            // capture) or PLAYING (interrupt our own clip).
-            if (state !== 'LISTENING' && state !== 'PLAYING') return;
+            // While we are speaking (or in any non-listening state) we
+            // intentionally discard everything: no interruption, no VAD.
+            if (state !== 'LISTENING') return;
+
+            // Within the call-start grace window / post-playback delay we
+            // also discard inbound audio so spurious noise (e.g. Twilio's
+            // trial preamble) cannot trigger a capture.
+            if (!vadEnabled) return;
 
             const mulaw = Buffer.from(base64Payload, 'base64');
             const rms = calculateRms(mulaw);
@@ -853,10 +895,7 @@ fastify.register(async (fastify) => {
                 if (!speechActive && speechFrames >= SPEECH_START_FRAMES) {
                     speechActive = true;
                     speechChunks = [];
-                    if (state === 'PLAYING') {
-                        interruptPlayback();
-                        state = 'LISTENING';
-                    }
+                    console.log(`[vad] speech start (rms=${rms.toFixed(0)})`);
                 }
             } else {
                 speechFrames = 0;
@@ -865,6 +904,7 @@ fastify.register(async (fastify) => {
                     speechActive = false;
                     const utterance = Buffer.concat(speechChunks);
                     speechChunks = [];
+                    console.log(`[vad] speech end (${utterance.length} bytes)`);
                     if (utterance.length >= MIN_UTTERANCE_BYTES) {
                         handleUserUtterance(utterance).catch((err) =>
                             console.error('handleUserUtterance error:', err)
@@ -893,7 +933,12 @@ fastify.register(async (fastify) => {
                         callSid = data.start.callSid || null;
                         callParams = data.start.customParameters || {};
                         callParams.callSid = callSid;
-                        console.log('Twilio: start', streamSid, 'params:', callParams);
+                        callStartTime = Date.now();
+                        vadEnabled = false;
+                        console.log(
+                            `Twilio: start ${streamSid} (VAD muted for first ${CALL_START_GRACE_MS}ms) params:`,
+                            callParams
+                        );
                         playGreeting().catch((err) =>
                             console.error('Greeting flow error:', err)
                         );
@@ -925,6 +970,7 @@ fastify.register(async (fastify) => {
             console.log('Twilio WS closed');
             state = 'ENDED';
             currentPlaybackToken = null;
+            disableVad('connection closed');
             if (realtimeWs?.readyState === WebSocket.OPEN) realtimeWs.close();
         });
 
