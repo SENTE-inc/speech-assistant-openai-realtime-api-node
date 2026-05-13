@@ -1,21 +1,26 @@
 {
   "name": "speech-assistant-openai-realtime-api-node",
-  "version": "1.0.1",
-  "description": "",
+  "version": "2.0.0",
+  "description": "Hybrid Twilio voice agent: pre-recorded MP3 playback with OpenAI Realtime fallback",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "build": "node --check index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
     "@fastify/formbody": "^8.0.0",
     "@fastify/websocket": "^11.0.0",
     "@supabase/supabase-js": "^2.39.0",
     "dotenv": "^16.4.5",
     "fastify": "^5.0.0",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "node-fetch": "^3.3.2",
     "ws": "^8.18.0"
   }
 }
