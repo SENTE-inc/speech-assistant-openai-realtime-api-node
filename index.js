@@ -6,14 +6,69 @@ import fastifyWs from '@fastify/websocket';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
 import fetch from 'node-fetch';
-import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
-import { PassThrough } from 'node:stream';
+import { spawn } from 'node:child_process';
+import {
+    existsSync,
+    statSync,
+    accessSync,
+    mkdtempSync,
+    writeFileSync,
+    rmSync,
+    constants as fsConstants,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Blob } from 'node:buffer';
 
 dotenv.config();
 
-if (ffmpegStatic) ffmpeg.setFfmpegPath(ffmpegStatic);
+// ---------------------------------------------------------------------
+// ffmpeg binary discovery + boot-time diagnostics
+// ---------------------------------------------------------------------
+const FFMPEG_PATH = ffmpegStatic || 'ffmpeg';
+console.log(`[ffmpeg] ffmpeg-static resolved to: ${ffmpegStatic ?? '(null)'}`);
+console.log(`[ffmpeg] using binary path: ${FFMPEG_PATH}`);
+
+if (ffmpegStatic) {
+    try {
+        if (!existsSync(ffmpegStatic)) {
+            console.error(`[ffmpeg] WARNING: binary does not exist at ${ffmpegStatic}`);
+        } else {
+            const st = statSync(ffmpegStatic);
+            console.log(
+                `[ffmpeg] binary stat: size=${st.size}, mode=${st.mode.toString(8)}, ` +
+                    `isFile=${st.isFile()}`
+            );
+            try {
+                accessSync(ffmpegStatic, fsConstants.X_OK);
+                console.log('[ffmpeg] binary is executable');
+            } catch (e) {
+                console.error('[ffmpeg] WARNING: binary is NOT executable:', e.message);
+            }
+        }
+    } catch (err) {
+        console.error('[ffmpeg] binary check failed:', err);
+    }
+}
+
+// Smoke-test ffmpeg at boot so we know it can run.
+(() => {
+    try {
+        const proc = spawn(FFMPEG_PATH, ['-version']);
+        let out = '';
+        let err = '';
+        proc.stdout.on('data', (d) => (out += d.toString()));
+        proc.stderr.on('data', (d) => (err += d.toString()));
+        proc.on('error', (e) => console.error('[ffmpeg] -version spawn error:', e));
+        proc.on('close', (code) => {
+            const firstLine = (out || err).split('\n')[0];
+            console.log(`[ffmpeg] -version exit=${code}: ${firstLine}`);
+        });
+    } catch (e) {
+        console.error('[ffmpeg] -version smoke-test threw:', e);
+    }
+})();
 
 const {
     OPENAI_API_KEY,
@@ -97,26 +152,108 @@ const audioCache = new Map(); // audio_key -> mulaw Buffer
 
 async function fetchMp3(filename) {
     const url = AUDIO_BASE_URL + filename;
+    console.log(`[fetch] GET ${url}`);
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`Fetch ${url} failed: ${res.status}`);
-    return Buffer.from(await res.arrayBuffer());
+    if (!res.ok) {
+        throw new Error(`Fetch ${url} failed: ${res.status} ${res.statusText}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    console.log(
+        `[fetch] ${filename} -> ${buf.length} bytes, content-type=${res.headers.get('content-type') || 'n/a'}`
+    );
+    if (buf.length === 0) {
+        throw new Error(`Fetched MP3 is empty: ${filename}`);
+    }
+    return buf;
 }
 
-function convertMp3ToMulaw(mp3Buffer) {
+// Convert MP3 buffer -> mulaw 8kHz mono by spawning ffmpeg directly.
+// We MUST write to a temp file rather than stdin, because the MP3 demuxer
+// needs to seek over ID3v2/VBR headers — which fails on a pipe with
+// "Failed to read frame size: Could not seek to N. pipe:0: Invalid argument".
+function convertMp3ToMulaw(mp3Buffer, label = '') {
     return new Promise((resolve, reject) => {
-        const input = new PassThrough();
-        input.end(mp3Buffer);
-        const chunks = [];
-        const stream = ffmpeg(input)
-            .inputFormat('mp3')
-            .audioFrequency(8000)
-            .audioChannels(1)
-            .format('mulaw')
-            .on('error', reject)
-            .pipe();
-        stream.on('data', (chunk) => chunks.push(chunk));
-        stream.on('end', () => resolve(Buffer.concat(chunks)));
-        stream.on('error', reject);
+        if (!mp3Buffer || mp3Buffer.length === 0) {
+            return reject(new Error(`[ffmpeg ${label}] input mp3 buffer is empty`));
+        }
+
+        let tmpDir;
+        let tmpFile;
+        try {
+            tmpDir = mkdtempSync(join(tmpdir(), 'mp3conv-'));
+            tmpFile = join(tmpDir, 'in.mp3');
+            writeFileSync(tmpFile, mp3Buffer);
+        } catch (err) {
+            console.error(`[ffmpeg ${label}] tmp file write failed:`, err);
+            return reject(err);
+        }
+
+        const cleanup = () => {
+            try { rmSync(tmpDir, { recursive: true, force: true }); }
+            catch (e) { console.error(`[ffmpeg ${label}] tmp cleanup error:`, e); }
+        };
+
+        const args = [
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-i', tmpFile,
+            '-ar', '8000',
+            '-ac', '1',
+            '-acodec', 'pcm_mulaw',
+            '-f', 'mulaw',
+            'pipe:1',
+        ];
+        console.log(
+            `[ffmpeg ${label}] spawn ${FFMPEG_PATH} input=${mp3Buffer.length} bytes ` +
+                `tmp=${tmpFile}`
+        );
+
+        let proc;
+        try {
+            proc = spawn(FFMPEG_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        } catch (err) {
+            console.error(`[ffmpeg ${label}] spawn threw:`, err);
+            cleanup();
+            return reject(err);
+        }
+
+        const outChunks = [];
+        const errChunks = [];
+        let settled = false;
+        const settle = (fn, val) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            fn(val);
+        };
+
+        proc.stdout.on('data', (c) => outChunks.push(c));
+        proc.stderr.on('data', (c) => errChunks.push(c));
+
+        proc.on('error', (err) => {
+            console.error(`[ffmpeg ${label}] process error:`, err);
+            settle(reject, err);
+        });
+
+        proc.on('close', (code, signal) => {
+            const out = Buffer.concat(outChunks);
+            const errText = Buffer.concat(errChunks).toString('utf8').trim();
+            console.log(
+                `[ffmpeg ${label}] exit code=${code} signal=${signal || 'none'} ` +
+                    `output=${out.length} bytes${errText ? `\n[ffmpeg ${label} stderr] ${errText}` : ''}`
+            );
+            if (code !== 0) {
+                return settle(reject, new Error(
+                    `ffmpeg ${label} exited with code ${code}: ${errText || 'no stderr'}`
+                ));
+            }
+            if (out.length === 0) {
+                return settle(reject, new Error(
+                    `ffmpeg ${label} produced 0 bytes: ${errText || 'no stderr'}`
+                ));
+            }
+            settle(resolve, out);
+        });
     });
 }
 
@@ -124,21 +261,30 @@ async function getAudioBuffer(key) {
     if (audioCache.has(key)) return audioCache.get(key);
     const filename = AUDIO_FILES[key];
     if (!filename) throw new Error(`Unknown audio key: ${key}`);
+
     const mp3 = await fetchMp3(filename);
-    const mulaw = await convertMp3ToMulaw(mp3);
+    const mulaw = await convertMp3ToMulaw(mp3, key);
+    if (mulaw.length === 0) {
+        throw new Error(`Converted mulaw is 0 bytes for ${key} (${filename})`);
+    }
     audioCache.set(key, mulaw);
-    console.log(`Cached ${key} (${filename}): ${mulaw.length} bytes mulaw`);
+    console.log(
+        `[audio] ✓ cached ${key} (${filename}): mp3=${mp3.length} -> mulaw=${mulaw.length} bytes`
+    );
     return mulaw;
 }
 
 // Preload everything in the background so first calls are responsive.
 (async () => {
-    try {
-        await Promise.all(Object.keys(AUDIO_FILES).map(getAudioBuffer));
-        console.log('All audio files preloaded');
-    } catch (err) {
-        console.error('Audio preload error:', err);
-    }
+    const keys = Object.keys(AUDIO_FILES);
+    console.log(`[preload] starting preload for ${keys.length} audio files`);
+    const results = await Promise.allSettled(keys.map((k) => getAudioBuffer(k)));
+    let ok = 0;
+    results.forEach((r, i) => {
+        if (r.status === 'fulfilled') ok++;
+        else console.error(`[preload] ✗ ${keys[i]} failed:`, r.reason?.message || r.reason);
+    });
+    console.log(`[preload] done: ${ok}/${keys.length} loaded`);
 })();
 
 // =====================================================================
