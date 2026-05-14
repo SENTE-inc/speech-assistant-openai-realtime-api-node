@@ -75,6 +75,8 @@ const {
     ANTHROPIC_API_KEY,
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY,
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
 } = process.env;
 
 const PORT = process.env.PORT || 5050;
@@ -464,6 +466,36 @@ async function classifyWithClaude(transcript, ctx = {}) {
 }
 
 // =====================================================================
+// Twilio REST: hand off the live call to a human agent
+// =====================================================================
+
+async function transferCall(callSid, agentPhone) {
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+        throw new Error('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not configured');
+    }
+    const url =
+        `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+
+    const twiml = `<Response><Dial>${agentPhone}</Dial></Response>`;
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            Authorization: `Basic ${auth}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ Twiml: twiml }),
+    });
+
+    if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Twilio transfer failed: ${res.status} ${text}`);
+    }
+    console.log(`✓ Call transferred to ${agentPhone} (callSid=${callSid})`);
+}
+
+// =====================================================================
 // Fastify app
 // =====================================================================
 
@@ -481,6 +513,8 @@ fastify.all('/incoming-call', async (request, reply) => {
     const company = decodeURIComponent(request.query.company || 'unknown');
     const contact = decodeURIComponent(request.query.contact || 'unknown');
     const phone = decodeURIComponent(request.query.phone || 'unknown');
+    const agent_phone = decodeURIComponent(request.query.agent_phone || '');
+    const agent_name = decodeURIComponent(request.query.agent_name || '');
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -489,6 +523,8 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="company" value="${company}" />
             <Parameter name="contact" value="${contact}" />
             <Parameter name="phone" value="${phone}" />
+            <Parameter name="agent_phone" value="${agent_phone}" />
+            <Parameter name="agent_name" value="${agent_name}" />
         </Stream>
     </Connect>
 </Response>`;
@@ -720,6 +756,43 @@ fastify.register(async (fastify) => {
         };
 
         // -----------------------------------------------------------------
+        // Hand off the live call to a human agent via Twilio Calls API.
+        // Called after the transfer_success clip has finished playing.
+        // -----------------------------------------------------------------
+        const handleTransfer = async () => {
+            state = 'ENDED';
+            disableVad('transferring');
+            const agentPhone = callParams?.agent_phone;
+            const agentName = callParams?.agent_name;
+            if (!callSid) {
+                console.error('[transfer] callSid missing; cannot transfer');
+                return;
+            }
+            if (!agentPhone) {
+                console.error('[transfer] agent_phone missing in callParams; cannot transfer');
+                return;
+            }
+            console.log(
+                `[transfer] handing off callSid=${callSid} to ${agentName || '(no name)'} <${agentPhone}>`
+            );
+            try {
+                await transferCall(callSid, agentPhone);
+            } catch (err) {
+                console.error('[transfer] Twilio transfer failed:', err);
+                return;
+            }
+            const { error: updErr } = await supabase
+                .from('call_sessions')
+                .update({ result: 'transferred' })
+                .eq('call_sid', callSid);
+            if (updErr) {
+                console.error('[transfer] call_sessions update error:', updErr);
+            } else {
+                console.log(`[transfer] call_sessions.result='transferred' set for ${callSid}`);
+            }
+        };
+
+        // -----------------------------------------------------------------
         // After a user utterance: filler + Whisper + Claude + action
         // -----------------------------------------------------------------
         const handleUserUtterance = async (mulawAudio) => {
@@ -778,7 +851,9 @@ fastify.register(async (fastify) => {
                 disableVad('playing response');
                 await playAudio(decision.audio_key);
 
-                if (END_CALL_KEYS.has(decision.audio_key)) {
+                if (decision.audio_key === 'transfer_success') {
+                    await handleTransfer();
+                } else if (END_CALL_KEYS.has(decision.audio_key)) {
                     state = 'ENDED';
                     console.log('▶ Call ended after farewell clip');
                     setTimeout(() => {
