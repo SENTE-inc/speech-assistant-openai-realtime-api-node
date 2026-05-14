@@ -114,12 +114,20 @@ const AUDIO_FILES = {
     callback_confirm: '13_callback_confirm.mp3',
     thanks: '14_thanks.mp3',
     sorry_disturb: '15_sorry_disturb.mp3',
-    hai: '16_hai.mp3',
     kashikomarimashita: '17_kashikomarimashita.mp3',
     soudesuka: '18_soudesuka.mp3',
     shoshomachi: '19_shoshomachi.mp3',
     arigatou: '20_arigatou.mp3',
 };
+
+// Filler clips played while we wait for STT + classifier. Rotated per
+// utterance so the agent does not always say the same thing.
+const HAI_PATTERNS = [
+    '16a_hai.mp3',   // 「はい。」
+    '16b_hai.mp3',   // 「あっ、はい。」
+    '16c_hai.mp3',   // 「そうですね。」
+];
+let haiPatternIndex = 0; // reset on each new Twilio call (start event)
 
 // Transcript text persisted to Supabase when a clip is played
 const AUDIO_TEXTS = {
@@ -138,7 +146,9 @@ const AUDIO_TEXTS = {
     callback_confirm: '承知いたしました。それでは改めてご連絡いたします。',
     thanks: 'ありがとうございました。失礼いたします。',
     sorry_disturb: 'お時間をいただきありがとうございました。失礼いたします。',
-    hai: 'はい。',
+    '16a_hai.mp3': 'はい。',
+    '16b_hai.mp3': 'あっ、はい。',
+    '16c_hai.mp3': 'そうですね。',
     kashikomarimashita: 'かしこまりました。',
     soudesuka: 'さようでございますか。',
     shoshomachi: '少々お待ちくださいませ。',
@@ -257,34 +267,35 @@ function convertMp3ToMulaw(mp3Buffer, label = '') {
     });
 }
 
-async function getAudioBuffer(key) {
-    if (audioCache.has(key)) return audioCache.get(key);
-    const filename = AUDIO_FILES[key];
-    if (!filename) throw new Error(`Unknown audio key: ${key}`);
+async function getAudioBuffer(keyOrFilename) {
+    // Accept either an AUDIO_FILES key (e.g. "greeting") or a raw filename
+    // (e.g. "16a_hai.mp3"). Cache is keyed by filename so both paths share it.
+    const filename = AUDIO_FILES[keyOrFilename] || keyOrFilename;
+    if (audioCache.has(filename)) return audioCache.get(filename);
 
     const mp3 = await fetchMp3(filename);
-    const mulaw = await convertMp3ToMulaw(mp3, key);
+    const mulaw = await convertMp3ToMulaw(mp3, filename);
     if (mulaw.length === 0) {
-        throw new Error(`Converted mulaw is 0 bytes for ${key} (${filename})`);
+        throw new Error(`Converted mulaw is 0 bytes for ${filename}`);
     }
-    audioCache.set(key, mulaw);
+    audioCache.set(filename, mulaw);
     console.log(
-        `[audio] ✓ cached ${key} (${filename}): mp3=${mp3.length} -> mulaw=${mulaw.length} bytes`
+        `[audio] ✓ cached ${filename}: mp3=${mp3.length} -> mulaw=${mulaw.length} bytes`
     );
     return mulaw;
 }
 
 // Preload everything in the background so first calls are responsive.
 (async () => {
-    const keys = Object.keys(AUDIO_FILES);
-    console.log(`[preload] starting preload for ${keys.length} audio files`);
-    const results = await Promise.allSettled(keys.map((k) => getAudioBuffer(k)));
+    const targets = [...Object.keys(AUDIO_FILES), ...HAI_PATTERNS];
+    console.log(`[preload] starting preload for ${targets.length} audio files`);
+    const results = await Promise.allSettled(targets.map((t) => getAudioBuffer(t)));
     let ok = 0;
     results.forEach((r, i) => {
         if (r.status === 'fulfilled') ok++;
-        else console.error(`[preload] ✗ ${keys[i]} failed:`, r.reason?.message || r.reason);
+        else console.error(`[preload] ✗ ${targets[i]} failed:`, r.reason?.message || r.reason);
     });
-    console.log(`[preload] done: ${ok}/${keys.length} loaded`);
+    console.log(`[preload] done: ${ok}/${targets.length} loaded`);
 })();
 
 // =====================================================================
@@ -649,24 +660,25 @@ fastify.register(async (fastify) => {
         // -----------------------------------------------------------------
         // Playback (one key → cached mulaw → chunked → mark → await)
         // -----------------------------------------------------------------
-        const playAudio = async (key) => {
+        const playAudio = async (keyOrFilename) => {
             const token = ++markCounter;
             currentPlaybackToken = token;
 
-            const wasCached = audioCache.has(key);
+            const filename = AUDIO_FILES[keyOrFilename] || keyOrFilename;
+            const wasCached = audioCache.has(filename);
             const loadT0 = Date.now();
             let mulaw;
             try {
-                mulaw = await getAudioBuffer(key);
+                mulaw = await getAudioBuffer(keyOrFilename);
             } catch (err) {
-                console.error(`Failed to load ${key}:`, err);
+                console.error(`Failed to load ${keyOrFilename}:`, err);
                 return;
             }
             const loadMs = Date.now() - loadT0;
             if (currentPlaybackToken !== token) return; // Interrupted while loading
 
             console.log(
-                `▶ Playing ${key} (${AUDIO_FILES[key]}) cache=${wasCached ? 'HIT' : 'MISS'} ` +
+                `▶ Playing ${keyOrFilename} (${filename}) cache=${wasCached ? 'HIT' : 'MISS'} ` +
                     `load=${loadMs}ms size=${mulaw.length}B`
             );
             const chunkSize = 160; // 20ms at 8kHz mulaw
@@ -681,8 +693,8 @@ fastify.register(async (fastify) => {
                 sendMark(markName);
             });
 
-            console.log(`✓ Finished ${key}`);
-            saveTranscript('assistant', AUDIO_TEXTS[key] || '');
+            console.log(`✓ Finished ${keyOrFilename}`);
+            saveTranscript('assistant', AUDIO_TEXTS[keyOrFilename] || '');
         };
 
         // -----------------------------------------------------------------
@@ -720,7 +732,10 @@ fastify.register(async (fastify) => {
             // Kick off the filler clip and the Whisper request at the same
             // tick so they run concurrently. We do not await the filler — it
             // plays out while we are still talking to OpenAI and Claude.
-            const fillerPromise = playAudio('hai').catch((err) =>
+            // Rotate through HAI_PATTERNS so the agent does not sound robotic.
+            const fillerFilename = HAI_PATTERNS[haiPatternIndex % HAI_PATTERNS.length];
+            haiPatternIndex++;
+            const fillerPromise = playAudio(fillerFilename).catch((err) =>
                 console.error('Filler playback error:', err)
             );
             const whisperPromise = transcribeWhisper(mulawAudio).catch((err) => {
@@ -983,6 +998,7 @@ fastify.register(async (fastify) => {
                         callParams.callSid = callSid;
                         callStartTime = Date.now();
                         vadEnabled = false;
+                        haiPatternIndex = 0;
                         console.log(
                             `[start event] extracted streamSid=${streamSid} callSid=${callSid} ` +
                                 `(callSid type=${typeof data.start.callSid}, present=${'callSid' in data.start})`
