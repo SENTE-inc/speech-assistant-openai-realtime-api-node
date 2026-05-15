@@ -391,7 +391,10 @@ const CLAUDE_SYSTEM_PROMPT = `あなたはB2B営業電話のAI判断エンジン
 - who: 担当者名・個人名を聞かれた（「どなた様」「お名前は」など）
 - appointment: アポの有無を聞かれた（「アポイントはありますか」など）
 - not_available: 担当者は不在（「不在」「外出中」「席を外している」など）
-- transfer_success: 担当者に取り次いでもらえた（「お繋ぎします」「少々お待ち」など）
+- transfer_success: 担当者に取り次いでもらえた、または相手が話を聞く意思を示した
+  （「お繋ぎします」「少々お待ち」「詳しく聞かせてください」「ぜひ聞かせてください」
+   「聞かせてください」「興味あります」「話を聞きたい」「担当者と話したい」
+   などの前向きな反応すべて）
 - pitch_start: ピッチ開始
 - callback_request: 折り返しを提案された
 - when_callback: いつ頃か聞く
@@ -410,11 +413,18 @@ const CLAUDE_SYSTEM_PROMPT = `あなたはB2B営業電話のAI判断エンジン
 - アポの有無 → audio_key="appointment"
 - 不在系 → audio_key="not_available"
 - 取り次ぎ成功 → audio_key="transfer_success"
+- 相手が前向き・興味を示している（「詳しく聞かせてください」「ぜひ聞かせてください」
+  「聞かせてください」「興味あります」「話を聞きたい」「担当者と話したい」など
+  サービスを聞こうとしている発話すべて）
+  → action="play_audio", audio_key="transfer_success"
+  ※この場合は必ず transfer_success を返すこと。openai_realtime は使わない。
 - 折り返し提案 → audio_key="callback_request"
 - いつ頃か聞く → audio_key="when_callback"
 - お断り・終話（「結構です」「必要ありません」等） → action="play_audio", audio_key="sorry_disturb" （これを再生後に通話終了）
 - 「ありがとうございました」「失礼します」等の終話 → action="play_audio", audio_key="thanks" （これを再生後に通話終了）
 - 上記で対応しきれない想定外の質問・複雑な質問・営業詳細を深掘りされた場合 → action="openai_realtime"
+  ただし「聞かせてください」「興味あります」等の前向きな反応は openai_realtime ではなく
+  必ず transfer_success を返すこと。
 
 出力フォーマット（厳密にこのJSONのみ、前後に文字を付けない）:
 {"action":"play_audio|openai_realtime|end_call","audio_key":"キー名 または null","reason":"判断理由"}`;
