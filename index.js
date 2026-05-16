@@ -102,8 +102,6 @@ const AUDIO_BASE_URL =
 
 const AUDIO_FILES = {
     greeting: '01_greeting.mp3',
-    greeting_with_name: '02_greeting_with_name.mp3',
-    greeting_no_name: '03_greeting_no_name.mp3',
     reason: '04_reason.mp3',
     company: '05_company.mp3',
     who: '06_who.mp3',
@@ -134,8 +132,6 @@ let haiPatternIndex = 0; // reset on each new Twilio call (start event)
 // Transcript text persisted to Supabase when a clip is played
 const AUDIO_TEXTS = {
     greeting: 'お世話になっております。株式会社SENTEと申します。',
-    greeting_with_name: '〇〇様はいらっしゃいますでしょうか？',
-    greeting_no_name: '御社のご担当者様はいらっしゃいますでしょうか？',
     reason: 'Uber Eatsの売上改善に関するご提案でございます。',
     company: '株式会社SENTEと申します。',
     who: '私、SENTEの営業担当と申します。',
@@ -382,52 +378,53 @@ async function transcribeWhisper(mulawBuffer) {
 // Claude intent classifier
 // =====================================================================
 
-const CLAUDE_SYSTEM_PROMPT = `あなたはB2B営業電話のAI判断エンジンです。
-電話相手の発話文字起こしを受け取り、次に取るべきアクションをJSONのみで決定してください。
+const CLAUDE_SYSTEM_PROMPT = `あなたは営業電話の応対判断AIです。
+以下の会話履歴と直近の発言を見て、次に再生すべき音声を判断してください。
 
-利用可能な音声キー（audio_key）と用途:
-- reason: 用件を聞かれた（「ご用件は」「どのような件で」など）
-- company: 会社名を聞かれた（「どちらの会社」「どこの」など）
-- who: 担当者名・個人名を聞かれた（「どなた様」「お名前は」など）
-- appointment: アポの有無を聞かれた（「アポイントはありますか」など）
-- not_available: 担当者は不在（「不在」「外出中」「席を外している」など）
-- transfer_success: 担当者に取り次いでもらえた、または相手が話を聞く意思を示した
-  （「お繋ぎします」「少々お待ち」「詳しく聞かせてください」「ぜひ聞かせてください」
-   「聞かせてください」「興味あります」「話を聞きたい」「担当者と話したい」
-   などの前向きな反応すべて）
-- pitch_start: ピッチ開始
-- callback_request: 折り返しを提案された
-- when_callback: いつ頃か聞く
-- callback_confirm: 折り返し確認
-- thanks: 終話（ありがとう系・「失礼します」など）
-- sorry_disturb: 終話（お断り系・「結構です」「必要ありません」「間に合っています」など）
-- kashikomarimashita: 「かしこまりました」
-- soudesuka: 「さようでございますか」
-- shoshomachi: 「少々お待ちくださいませ」
-- arigatou: 「ありがとうございます」
+【判断基準】
 
-判断ルール:
-- 用件を聞かれた → action="play_audio", audio_key="reason"
-- 会社名を聞かれた → audio_key="company"
-- 担当者名を聞かれた → audio_key="who"
-- アポの有無 → audio_key="appointment"
-- 不在系 → audio_key="not_available"
-- 取り次ぎ成功 → audio_key="transfer_success"
-- 相手が前向き・興味を示している（「詳しく聞かせてください」「ぜひ聞かせてください」
-  「聞かせてください」「興味あります」「話を聞きたい」「担当者と話したい」など
-  サービスを聞こうとしている発話すべて）
-  → action="play_audio", audio_key="transfer_success"
-  ※この場合は必ず transfer_success を返すこと。openai_realtime は使わない。
-- 折り返し提案 → audio_key="callback_request"
-- いつ頃か聞く → audio_key="when_callback"
-- お断り・終話（「結構です」「必要ありません」等） → action="play_audio", audio_key="sorry_disturb" （これを再生後に通話終了）
-- 「ありがとうございました」「失礼します」等の終話 → action="play_audio", audio_key="thanks" （これを再生後に通話終了）
-- 上記で対応しきれない想定外の質問・複雑な質問・営業詳細を深掘りされた場合 → action="openai_realtime"
-  ただし「聞かせてください」「興味あります」等の前向きな反応は openai_realtime ではなく
-  必ず transfer_success を返すこと。
+転送（transfer_success）：
+- 「お繋ぎします」「少々お待ち」「担当者に代わります」
+- 「はい、私が担当です」「私でよければ」
+- 「詳しく聞かせてください」「ぜひ聞かせてください」
+- 「興味があります」「聞いてみます」
+- 「社長に代わります」「担当に代わります」
+- 相手が前向きな反応・担当者本人が出た場合
+→ { "action": "play_audio", "audio_key": "transfer_success" }
 
-出力フォーマット（厳密にこのJSONのみ、前後に文字を付けない）:
-{"action":"play_audio|openai_realtime|end_call","audio_key":"キー名 または null","reason":"判断理由"}`;
+用件を聞かれた（reason）：
+- 「どのようなご用件」「何のご用件」「どういったご提案」
+→ { "action": "play_audio", "audio_key": "reason" }
+
+会社名を聞かれた（company）：
+- 「どちらの会社」「どこの会社」「会社名は」
+→ { "action": "play_audio", "audio_key": "company" }
+
+担当者名を聞かれた（who）：
+- 「どなた様」「お名前は」「担当者のお名前」
+→ { "action": "play_audio", "audio_key": "who" }
+
+アポの有無を聞かれた（appointment）：
+- 「アポイントは」「お約束は」「ご予約は」
+→ { "action": "play_audio", "audio_key": "appointment" }
+
+担当者不在（not_available）：
+- 「只今不在」「席を外している」「いません」「外出中」「会議中」
+→ { "action": "play_audio", "audio_key": "not_available" }
+
+折り返し提案（callback_request）：
+- 「折り返しましょうか」「後ほど」「またかけ直して」
+→ { "action": "play_audio", "audio_key": "callback_request" }
+
+お断り・終話（sorry_disturb → end_call）：
+- 「結構です」「必要ありません」「間に合っています」「けっこうです」
+- 「忙しい」「時間がない」
+→ { "action": "play_audio", "audio_key": "sorry_disturb" }
+
+それ以外の想定外の質問：
+→ { "action": "openai_realtime" }
+
+必ずJSONのみを返してください。説明文は不要です。`;
 
 async function classifyWithClaude(transcript, ctx = {}) {
     try {
@@ -744,20 +741,12 @@ fastify.register(async (fastify) => {
         };
 
         // -----------------------------------------------------------------
-        // Greeting flow (greeting → greeting_with_name or greeting_no_name)
+        // Greeting flow (single clip)
         // -----------------------------------------------------------------
         const playGreeting = async () => {
             state = 'PLAYING';
             disableVad('playing greeting');
             await playAudio('greeting');
-            if (state !== 'PLAYING') return;
-
-            const contact = callParams?.contact;
-            if (contact && contact !== 'unknown') {
-                await playAudio('greeting_with_name');
-            } else {
-                await playAudio('greeting_no_name');
-            }
             if (state !== 'PLAYING') return;
 
             state = 'LISTENING';
