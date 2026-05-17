@@ -118,14 +118,16 @@ const AUDIO_FILES = {
     soudesuka: '18_soudesuka.mp3',
     shoshomachi: '19_shoshomachi.mp3',
     arigatou: '20_arigatou.mp3',
+    farewell: '21_farewell.mp3',
 };
 
 // Filler clips played while we wait for STT + classifier. Rotated per
 // utterance so the agent does not always say the same thing.
+// 16c_hai.mp3 ("そうですね。") is kept in storage but excluded here because
+// it reads as agreement, which sounds wrong as a generic filler.
 const HAI_PATTERNS = [
     '16a_hai.mp3',   // 「はい。」
     '16b_hai.mp3',   // 「あっ、はい。」
-    '16c_hai.mp3',   // 「そうですね。」
 ];
 let haiPatternIndex = 0; // reset on each new Twilio call (start event)
 
@@ -151,6 +153,8 @@ const AUDIO_TEXTS = {
     soudesuka: 'さようでございますか。',
     shoshomachi: '少々お待ちくださいませ。',
     arigatou: 'ありがとうございます。',
+    farewell: 'それでは失礼いたします。',
+    '21_farewell.mp3': 'それでは失礼いたします。',
 };
 
 // audio_key values that should terminate the call after playback
@@ -277,8 +281,12 @@ async function getAudioBuffer(keyOrFilename) {
         throw new Error(`Converted mulaw is 0 bytes for ${filename}`);
     }
     audioCache.set(filename, mulaw);
+    const label =
+        keyOrFilename === filename
+            ? filename
+            : `${keyOrFilename} (${filename})`;
     console.log(
-        `[audio] ✓ cached ${filename}: mp3=${mp3.length} -> mulaw=${mulaw.length} bytes`
+        `[preload] ${label}: mp3=${mp3.length} -> mulaw=${mulaw.length} bytes`
     );
     return mulaw;
 }
@@ -862,10 +870,15 @@ fastify.register(async (fastify) => {
                 await playAudio(decision.audio_key);
 
                 if (decision.audio_key === 'transfer_success') {
+                    // Transfer flow skips farewell — the caller is about to
+                    // start talking to the human agent.
                     await handleTransfer();
                 } else if (END_CALL_KEYS.has(decision.audio_key)) {
+                    // Tack the farewell clip on so the line doesn't drop
+                    // mid-sentence after thanks / sorry_disturb.
+                    await playAudio('farewell');
                     state = 'ENDED';
-                    console.log('▶ Call ended after farewell clip');
+                    console.log(`▶ Call ended (${decision.audio_key} + farewell)`);
                     setTimeout(() => {
                         try { connection.close(); } catch (_) {}
                     }, 500);
@@ -875,13 +888,17 @@ fastify.register(async (fastify) => {
                 }
             } else if (decision.action === 'end_call') {
                 state = 'PLAYING';
-                disableVad('playing farewell');
-                const farewell = decision.audio_key && AUDIO_FILES[decision.audio_key]
+                disableVad('playing end_call clip');
+                const closingKey = decision.audio_key && AUDIO_FILES[decision.audio_key]
                     ? decision.audio_key
                     : 'thanks';
-                await playAudio(farewell);
+                await playAudio(closingKey);
+                // Append farewell unless the closing clip already was the farewell.
+                if (closingKey !== 'farewell') {
+                    await playAudio('farewell');
+                }
                 state = 'ENDED';
-                console.log('▶ Call ended by explicit end_call');
+                console.log(`▶ Call ended (end_call: ${closingKey} + farewell)`);
                 setTimeout(() => {
                     try { connection.close(); } catch (_) {}
                 }, 500);
