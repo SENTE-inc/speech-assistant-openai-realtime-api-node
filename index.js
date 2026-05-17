@@ -570,6 +570,7 @@ fastify.register(async (fastify) => {
         const MIN_UTTERANCE_BYTES = 4000; // ~500ms of audio (8kHz mulaw)
         const CALL_START_GRACE_MS = 5000;  // ignore inbound audio for the first 5s (Twilio trial preamble)
         const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
+        const HUMAN_PAUSE_MS = 600; // hold the filler clip for this long after silence-end so the caller's last word lands cleanly
         let speechActive = false;
         let speechFrames = 0;
         let silenceFrames = 0;
@@ -801,20 +802,30 @@ fastify.register(async (fastify) => {
             const t0 = Date.now();
             console.log(`▶ State: PROCESSING (${mulawAudio.length} bytes captured)`);
 
-            // Kick off the filler clip and the Whisper request at the same
-            // tick so they run concurrently. We do not await the filler — it
-            // plays out while we are still talking to OpenAI and Claude.
-            // Rotate through HAI_PATTERNS so the agent does not sound robotic.
-            const fillerFilename = HAI_PATTERNS[haiPatternIndex % HAI_PATTERNS.length];
-            haiPatternIndex++;
-            const fillerPromise = playAudio(fillerFilename).catch((err) =>
-                console.error('Filler playback error:', err)
-            );
+            // Start Whisper immediately so STT runs during the human-pause
+            // window — the overall response latency stays roughly the same
+            // even though the filler is delayed.
             const whisperPromise = transcribeWhisper(mulawAudio).catch((err) => {
                 console.error('Whisper error:', err);
                 return null;
             });
-            console.log('[parallel] filler + Whisper started');
+
+            // Hold the filler clip for HUMAN_PAUSE_MS after silence-end so
+            // the caller's last word does not get stepped on. Without this
+            // pause the agent fires "はい" the instant VAD flips, which
+            // sounds robotic and impatient.
+            // Rotate through HAI_PATTERNS so the agent does not sound robotic.
+            const fillerFilename = HAI_PATTERNS[haiPatternIndex % HAI_PATTERNS.length];
+            haiPatternIndex++;
+            const fillerPromise = new Promise((resolve) =>
+                setTimeout(resolve, HUMAN_PAUSE_MS)
+            ).then(() => {
+                if (state === 'ENDED') return;
+                return playAudio(fillerFilename);
+            }).catch((err) => console.error('Filler playback error:', err));
+            console.log(
+                `[parallel] Whisper started; filler ${fillerFilename} scheduled in ${HUMAN_PAUSE_MS}ms`
+            );
 
             const transcript = await whisperPromise;
             console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
