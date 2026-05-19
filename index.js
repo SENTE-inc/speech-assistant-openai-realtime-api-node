@@ -160,6 +160,66 @@ const AUDIO_TEXTS = {
 // audio_key values that should terminate the call after playback
 const END_CALL_KEYS = new Set(['thanks', 'sorry_disturb']);
 
+// =====================================================================
+// Call-termination thresholds and patterns
+// =====================================================================
+
+// Time-based limits
+const SILENCE_TIMEOUT_MS = 30 * 1000;            // 30s of no user speech (while LISTENING) → hang up
+const CALL_DURATION_TIMEOUT_MS = 5 * 60 * 1000;  // 5min hard cap on overall call length
+const TIMEOUT_CHECK_INTERVAL_MS = 5 * 1000;      // poll the timers every 5s
+
+// Loop detection
+const LOOP_DECISION_THRESHOLD = 3;               // same Claude audio_key N times in a row
+const LOOP_UTTERANCE_THRESHOLD = 3;              // N highly-similar user utterances in a row
+const UTTERANCE_SIMILARITY = 0.8;                // ≥80% similar → counts as repeat
+
+// Voicemail detection — immediate hang-up, no farewell
+const VOICEMAIL_PATTERNS = [
+    'ただいま電話に出ることができません',
+    '録音させていただきます',
+    'メッセージをどうぞ',
+    '発信音の後にお話しください',
+    '留守番電話',
+];
+
+// User explicit hang-up — play farewell then hang up, skip Claude
+const USER_HANGUP_PATTERNS = [
+    '電話を切ります',
+    '失礼します',
+    'もう結構です',
+];
+
+// Levenshtein distance between two strings. Used by the loop detector
+// to spot a caller repeating the same utterance over and over.
+function levenshteinDistance(a, b) {
+    if (a === b) return 0;
+    const m = a.length;
+    const n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    let prev = new Array(n + 1);
+    let curr = new Array(n + 1);
+    for (let j = 0; j <= n; j++) prev[j] = j;
+    for (let i = 1; i <= m; i++) {
+        curr[0] = i;
+        for (let j = 1; j <= n; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+        }
+        [prev, curr] = [curr, prev];
+    }
+    return prev[n];
+}
+
+function stringSimilarity(a, b) {
+    if (!a && !b) return 1;
+    if (!a || !b) return 0;
+    const maxLen = Math.max(a.length, b.length);
+    if (maxLen === 0) return 1;
+    return 1 - levenshteinDistance(a, b) / maxLen;
+}
+
 const audioCache = new Map(); // audio_key -> mulaw Buffer
 
 async function fetchMp3(filename) {
@@ -416,18 +476,41 @@ const CLAUDE_SYSTEM_PROMPT = `あなたは営業電話の応対判断AIです。
 - 「アポイントは」「お約束は」「ご予約は」
 → { "action": "play_audio", "audio_key": "appointment" }
 
-担当者不在（not_available）：
-- 「只今不在」「席を外している」「いません」「外出中」「会議中」
-→ { "action": "play_audio", "audio_key": "not_available" }
-
 折り返し提案（callback_request）：
 - 「折り返しましょうか」「後ほど」「またかけ直して」
 → { "action": "play_audio", "audio_key": "callback_request" }
 
-お断り・終話（sorry_disturb → end_call）：
-- 「結構です」「必要ありません」「間に合っています」「けっこうです」
-- 「忙しい」「時間がない」
-→ { "action": "play_audio", "audio_key": "sorry_disturb" }
+【終話パターン（必ず "end_call": true と "end_reason" を含めること）】
+
+担当者不在・戻り時間あり（callback_scheduled）：
+- 「夕方には戻ります」「16時頃戻ります」「明日には戻ります」「来週には戻る予定です」
+- 担当者は不在だが、戻り時間が明示されている場合
+→ { "action": "play_audio", "audio_key": "callback_request", "end_call": true, "end_reason": "callback_scheduled", "callback_info": "戻り時間の情報をそのまま記録" }
+
+担当者不在・戻り時間不明（not_available）：
+- 「担当者は本日不在」「外出中で戻り未定」
+- 「席を外しております」「会議中で長くなる」
+- 「只今不在」「いません」など、戻り時間が明示されていない場合
+→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "not_available" }
+
+検討不要（rejected）：
+- 「うちは間に合っています」「必要ありません」「結構です」「けっこうです」
+- 「導入予定ありません」「検討する予定はない」
+→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
+
+時間がない（rejected）：
+- 「今忙しいので」「時間がないんです」
+- 「会議中なので」「立て込んでまして」
+→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
+
+他社契約済み（rejected）：
+- 「すでに他社と契約しています」「他社にお願いしています」
+- 「別のところでやっています」
+→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
+
+断り全般（rejected）：
+- 「お断りします」「興味ないです」「いりません」「ご遠慮します」
+→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
 
 それ以外の想定外の質問：
 → { "action": "openai_realtime" }
@@ -596,6 +679,25 @@ fastify.register(async (fastify) => {
         let vadEnabled = false;
         let vadEnableTimer = null;
         let callStartTime = 0;
+
+        // -----------------------------------------------------------------
+        // Call-termination tracking (timeouts, loop detection, errors)
+        // -----------------------------------------------------------------
+        // Updated when the caller starts speaking (VAD start) or after we
+        // confirm a transcript. checkTimeouts compares it against now() to
+        // fire silence_timeout. Initialized to call-start so we don't wait
+        // forever when the caller never says anything.
+        let lastSpeechAt = Date.now();
+        let callStartAt = Date.now();
+        // Rolling windows for loop detection. Each holds the last N items;
+        // the recordX helpers below trim them in place.
+        let recentClaudeDecisions = [];
+        let recentUserUtterances = [];
+        let endReason = null;
+        let timeoutInterval = null;
+        // Realtime connection-failure tracking — flips true on 'open',
+        // stays false if the connection fails before opening.
+        let realtimeOpened = false;
 
         const resetVadCapture = () => {
             speechActive = false;
@@ -769,6 +871,9 @@ fastify.register(async (fastify) => {
             if (state !== 'PLAYING') return;
 
             state = 'LISTENING';
+            // Reset the silence clock now that we're actually listening —
+            // gives the caller a clean SILENCE_TIMEOUT_MS window to respond.
+            lastSpeechAt = Date.now();
             console.log('▶ State: LISTENING');
             enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after greeting');
         };
@@ -808,6 +913,142 @@ fastify.register(async (fastify) => {
             } else {
                 console.log(`[transfer] call_sessions.result='transferred' set for ${callSid}`);
             }
+        };
+
+        // -----------------------------------------------------------------
+        // Unified call-termination helper. Plays the farewell clip (unless
+        // suppressed, e.g. for voicemail), records the reason on
+        // call_sessions.result, and closes the Twilio WS shortly after.
+        // Safe to call multiple times — re-entrancy is gated on state.
+        // -----------------------------------------------------------------
+        const endCallWithFarewell = async (reason, { playFarewell = true } = {}) => {
+            if (state === 'ENDED') {
+                console.log(`[end] endCallWithFarewell(${reason}) called but state=ENDED already; ignoring`);
+                return;
+            }
+            console.log(`[end] ending call: reason=${reason} playFarewell=${playFarewell}`);
+            state = 'ENDED';
+            endReason = reason;
+            disableVad(`end: ${reason}`);
+
+            // Stop the timeout poll — we're going down regardless.
+            if (timeoutInterval) {
+                clearInterval(timeoutInterval);
+                timeoutInterval = null;
+            }
+
+            // Invalidate any in-progress playback so the filler "はい" or a
+            // partially-streamed response doesn't keep sending media after
+            // we've decided to end. playAudio() loops check this token and
+            // bail when it changes.
+            currentPlaybackToken = ++markCounter;
+
+            if (playFarewell) {
+                try {
+                    await playAudio('farewell');
+                } catch (err) {
+                    console.error('[end] farewell playback failed:', err);
+                }
+            }
+
+            if (callSid) {
+                try {
+                    const { error: updErr } = await supabase
+                        .from('call_sessions')
+                        .update({ result: reason })
+                        .eq('call_sid', callSid);
+                    if (updErr) {
+                        console.error(`[end] call_sessions.result='${reason}' update failed:`, updErr);
+                    } else {
+                        console.log(`[end] call_sessions.result='${reason}' saved for ${callSid}`);
+                    }
+                } catch (err) {
+                    console.error('[end] Supabase update threw:', err);
+                }
+            }
+
+            // Give Twilio a moment to flush the farewell audio before we
+            // tear down the WebSocket. 500ms matches what handleUserUtterance
+            // historically used for end_call paths.
+            setTimeout(() => {
+                try { connection.close(); } catch (_) {}
+            }, 500);
+        };
+
+        // Periodic timer check — runs every TIMEOUT_CHECK_INTERVAL_MS while
+        // the call is active. Bails on ENDED to avoid double-firing.
+        const checkTimeouts = () => {
+            if (state === 'ENDED') return;
+            const now = Date.now();
+            const silenceMs = now - lastSpeechAt;
+            const durationMs = now - callStartAt;
+
+            // Silence timeout only fires while we're actively waiting for
+            // the caller. During PLAYING/PROCESSING/REALTIME the assistant
+            // is busy and silence is expected.
+            if (state === 'LISTENING' && silenceMs >= SILENCE_TIMEOUT_MS) {
+                console.log(
+                    `[timeout] silence ${Math.round(silenceMs / 1000)}s ≥ ` +
+                        `${SILENCE_TIMEOUT_MS / 1000}s; ending call`
+                );
+                endCallWithFarewell('silence_timeout').catch((err) =>
+                    console.error('[timeout] silence handler error:', err)
+                );
+                return;
+            }
+
+            // Duration cap is unconditional (except already-ended). Note
+            // transferred calls have state=ENDED, so they're skipped.
+            if (durationMs >= CALL_DURATION_TIMEOUT_MS) {
+                console.log(
+                    `[timeout] duration ${Math.round(durationMs / 1000)}s ≥ ` +
+                        `${CALL_DURATION_TIMEOUT_MS / 1000}s; ending call`
+                );
+                endCallWithFarewell('duration_timeout').catch((err) =>
+                    console.error('[timeout] duration handler error:', err)
+                );
+            }
+        };
+
+        // Loop detection: same audio_key returned LOOP_DECISION_THRESHOLD
+        // times in a row implies Claude is stuck — caller probably keeps
+        // saying the same thing back.
+        const recordClaudeDecision = (audioKey) => {
+            if (!audioKey) return false;
+            recentClaudeDecisions.push(audioKey);
+            if (recentClaudeDecisions.length > LOOP_DECISION_THRESHOLD) {
+                recentClaudeDecisions.shift();
+            }
+            if (recentClaudeDecisions.length < LOOP_DECISION_THRESHOLD) return false;
+            const looped = recentClaudeDecisions.every((k) => k === recentClaudeDecisions[0]);
+            if (looped) {
+                console.log(
+                    `[loop] same Claude decision '${recentClaudeDecisions[0]}' ` +
+                        `${LOOP_DECISION_THRESHOLD}x in a row`
+                );
+            }
+            return looped;
+        };
+
+        // Loop detection: caller repeating themselves. Every pair in the
+        // last N utterances must be ≥UTTERANCE_SIMILARITY similar.
+        const recordUserUtterance = (text) => {
+            recentUserUtterances.push(text);
+            if (recentUserUtterances.length > LOOP_UTTERANCE_THRESHOLD) {
+                recentUserUtterances.shift();
+            }
+            if (recentUserUtterances.length < LOOP_UTTERANCE_THRESHOLD) return false;
+            for (let i = 0; i < recentUserUtterances.length; i++) {
+                for (let j = i + 1; j < recentUserUtterances.length; j++) {
+                    const sim = stringSimilarity(recentUserUtterances[i], recentUserUtterances[j]);
+                    if (sim < UTTERANCE_SIMILARITY) return false;
+                }
+            }
+            console.log(
+                `[loop] caller repeated ${LOOP_UTTERANCE_THRESHOLD} highly-similar ` +
+                    `utterances (≥${UTTERANCE_SIMILARITY * 100}% similar)`
+            );
+            return true;
         };
 
         // -----------------------------------------------------------------
@@ -851,14 +1092,52 @@ fastify.register(async (fastify) => {
             if (!transcript) {
                 console.log('Empty transcript, returning to LISTENING');
                 await fillerPromise;
+                if (state === 'ENDED') return;
                 state = 'LISTENING';
+                lastSpeechAt = Date.now();
                 enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'empty transcript');
                 return;
             }
 
             console.log(`User said: "${transcript}"`);
             lastUserTranscript = transcript;
+            lastSpeechAt = Date.now();
             saveTranscript('user', transcript);
+
+            // -----------------------------------------------------------------
+            // D — Voicemail detection. Hang up immediately without farewell so
+            // we don't leave a goodbye recording on the prospect's voicemail.
+            // -----------------------------------------------------------------
+            const voicemailHit = VOICEMAIL_PATTERNS.find((p) => transcript.includes(p));
+            if (voicemailHit) {
+                console.log(`[voicemail] detected pattern "${voicemailHit}"; hanging up without farewell`);
+                await endCallWithFarewell('voicemail', { playFarewell: false });
+                return;
+            }
+
+            // -----------------------------------------------------------------
+            // E — User-explicit hang-up keywords. Skip Claude entirely; just
+            // play the farewell and close.
+            // -----------------------------------------------------------------
+            const hangupHit = USER_HANGUP_PATTERNS.find((p) => transcript.includes(p));
+            if (hangupHit) {
+                console.log(`[user_hangup] detected keyword "${hangupHit}"; playing farewell`);
+                // Let the filler "はい" land first so it doesn't get clipped.
+                await fillerPromise;
+                await endCallWithFarewell('user_hangup');
+                return;
+            }
+
+            // -----------------------------------------------------------------
+            // B-2 — Loop detection on the caller's side (same utterance over
+            // and over). Triggers before we even call Claude, since asking
+            // Claude again would just produce the same response.
+            // -----------------------------------------------------------------
+            if (recordUserUtterance(transcript)) {
+                await fillerPromise;
+                await endCallWithFarewell('loop_detected');
+                return;
+            }
 
             const claudeT0 = Date.now();
             const decision = await classifyWithClaude(transcript, {
@@ -870,48 +1149,97 @@ fastify.register(async (fastify) => {
                 decision
             );
 
+            // -----------------------------------------------------------------
+            // C-1 — Claude API failure. classifyWithClaude already retries
+            // 3× internally on 529 overload before returning classifier_error.
+            // If we still got an error, end the call rather than fall back to
+            // Realtime (Realtime would likely fail too if Anthropic is down).
+            // -----------------------------------------------------------------
+            if (decision.reason === 'classifier_error') {
+                console.log('[claude] classifier_error after retries; ending call');
+                await fillerPromise;
+                await endCallWithFarewell('error_limit');
+                return;
+            }
+
             // Filler must complete before we play the real response.
             await fillerPromise;
             if (state === 'ENDED') return;
 
             if (decision.action === 'play_audio' && decision.audio_key && AUDIO_FILES[decision.audio_key]) {
+                // B-1 — Loop detection on Claude's decisions. Record FIRST so
+                // we still play the current clip before ending; otherwise the
+                // last user message goes unanswered.
+                const looped = recordClaudeDecision(decision.audio_key);
+
                 state = 'PLAYING';
                 disableVad('playing response');
                 await playAudio(decision.audio_key);
 
                 if (decision.audio_key === 'transfer_success') {
                     // Transfer flow skips farewell — the caller is about to
-                    // start talking to the human agent.
+                    // start talking to the human agent. handleTransfer writes
+                    // result='transferred' itself, so we don't call
+                    // endCallWithFarewell here.
                     await handleTransfer();
-                } else if (END_CALL_KEYS.has(decision.audio_key)) {
-                    // Tack the farewell clip on so the line doesn't drop
-                    // mid-sentence after thanks / sorry_disturb.
-                    await playAudio('farewell');
-                    state = 'ENDED';
-                    console.log(`▶ Call ended (${decision.audio_key} + farewell)`);
-                    setTimeout(() => {
-                        try { connection.close(); } catch (_) {}
-                    }, 500);
-                } else if (state === 'PLAYING') {
+                    if (timeoutInterval) {
+                        clearInterval(timeoutInterval);
+                        timeoutInterval = null;
+                    }
+                    return;
+                }
+
+                // G — Persist callback_info when Claude attached scheduling
+                // context (e.g. "16時頃戻ります"). n8n's post-call analysis
+                // uses this to compute the next call date.
+                if (decision.callback_info && callSid) {
+                    try {
+                        const { error: cbErr } = await supabase
+                            .from('call_sessions')
+                            .update({ metadata: { callback_info: decision.callback_info } })
+                            .eq('call_sid', callSid);
+                        if (cbErr) {
+                            console.error('[callback_info] save failed:', cbErr);
+                        } else {
+                            console.log(`[callback_info] saved: ${decision.callback_info}`);
+                        }
+                    } catch (err) {
+                        console.error('[callback_info] threw:', err);
+                    }
+                }
+
+                // Loop ends after playback so the caller hears the response.
+                if (looped) {
+                    await endCallWithFarewell('loop_detected');
+                    return;
+                }
+
+                // F & G — Claude can mark a decision as end_call with an
+                // optional end_reason. Map to Supabase result enum.
+                if (decision.end_call) {
+                    const reason =
+                        decision.end_reason ||
+                        (decision.audio_key === 'callback_request'
+                            ? 'callback_scheduled'
+                            : 'rejected');
+                    await endCallWithFarewell(reason);
+                    return;
+                }
+
+                // Legacy safety net: if Claude returns sorry_disturb / thanks
+                // without end_call:true (older prompt behaviour), still end.
+                if (END_CALL_KEYS.has(decision.audio_key)) {
+                    await endCallWithFarewell('rejected');
+                    return;
+                }
+
+                if (state === 'PLAYING') {
                     state = 'LISTENING';
+                    // Reset silence clock — assistant just finished talking,
+                    // give the caller a clean SILENCE_TIMEOUT_MS window.
+                    lastSpeechAt = Date.now();
                     enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after response');
                 }
-            } else if (decision.action === 'end_call') {
-                state = 'PLAYING';
-                disableVad('playing end_call clip');
-                const closingKey = decision.audio_key && AUDIO_FILES[decision.audio_key]
-                    ? decision.audio_key
-                    : 'thanks';
-                await playAudio(closingKey);
-                // Append farewell unless the closing clip already was the farewell.
-                if (closingKey !== 'farewell') {
-                    await playAudio('farewell');
-                }
-                state = 'ENDED';
-                console.log(`▶ Call ended (end_call: ${closingKey} + farewell)`);
-                setTimeout(() => {
-                    try { connection.close(); } catch (_) {}
-                }, 500);
             } else if (decision.action === 'openai_realtime') {
                 await switchToRealtime();
             } else {
@@ -926,18 +1254,26 @@ fastify.register(async (fastify) => {
         const switchToRealtime = async () => {
             console.log('▶ Switching to OpenAI Realtime mode');
             state = 'REALTIME';
+            realtimeOpened = false;
 
-            realtimeWs = new WebSocket(
-                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
-                {
-                    headers: {
-                        Authorization: `Bearer ${OPENAI_API_KEY}`,
-                        'OpenAI-Beta': 'realtime=v1',
-                    },
-                }
-            );
+            try {
+                realtimeWs = new WebSocket(
+                    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+                    {
+                        headers: {
+                            Authorization: `Bearer ${OPENAI_API_KEY}`,
+                            'OpenAI-Beta': 'realtime=v1',
+                        },
+                    }
+                );
+            } catch (err) {
+                console.error('[realtime] WebSocket construction failed:', err);
+                await endCallWithFarewell('error_limit');
+                return;
+            }
 
             realtimeWs.on('open', () => {
+                realtimeOpened = true;
                 console.log('Realtime WS opened');
                 const company =
                     callParams?.company && callParams.company !== 'unknown'
@@ -1027,8 +1363,28 @@ fastify.register(async (fastify) => {
                 }
             });
 
-            realtimeWs.on('error', (err) => console.error('Realtime WS error:', err));
-            realtimeWs.on('close', () => console.log('Realtime WS closed'));
+            // C-2 — Realtime connection failure. If the WS errors or closes
+            // before we ever saw 'open', treat it as a connection failure
+            // and end the call gracefully instead of leaving the caller in
+            // silence. Post-open errors/close are non-fatal (logged only).
+            realtimeWs.on('error', (err) => {
+                console.error('Realtime WS error:', err);
+                if (!realtimeOpened && state === 'REALTIME') {
+                    console.log('[realtime] never opened; treating as connection failure');
+                    endCallWithFarewell('error_limit').catch((e) =>
+                        console.error('[realtime] error-recovery end failed:', e)
+                    );
+                }
+            });
+            realtimeWs.on('close', () => {
+                console.log('Realtime WS closed');
+                if (!realtimeOpened && state === 'REALTIME') {
+                    console.log('[realtime] closed before open; treating as connection failure');
+                    endCallWithFarewell('error_limit').catch((e) =>
+                        console.error('[realtime] close-recovery end failed:', e)
+                    );
+                }
+            });
         };
 
         // -----------------------------------------------------------------
@@ -1066,6 +1422,10 @@ fastify.register(async (fastify) => {
                 if (!speechActive && speechFrames >= SPEECH_START_FRAMES) {
                     speechActive = true;
                     speechChunks = [];
+                    // Refresh silence clock as soon as we detect speech —
+                    // we don't need to wait for the transcript to confirm
+                    // the caller is engaged.
+                    lastSpeechAt = Date.now();
                     console.log(`[vad] speech start (rms=${rms.toFixed(0)})`);
                 }
             } else {
@@ -1111,6 +1471,25 @@ fastify.register(async (fastify) => {
                         callStartTime = Date.now();
                         vadEnabled = false;
                         haiPatternIndex = 0;
+
+                        // Reset all call-termination tracking for this call
+                        callStartAt = Date.now();
+                        lastSpeechAt = Date.now();
+                        recentClaudeDecisions = [];
+                        recentUserUtterances = [];
+                        endReason = null;
+                        realtimeOpened = false;
+
+                        // Start the timeout poll. checkTimeouts handles the
+                        // ENDED guard, but clear any stale interval just in
+                        // case (defensive — start should only fire once).
+                        if (timeoutInterval) clearInterval(timeoutInterval);
+                        timeoutInterval = setInterval(checkTimeouts, TIMEOUT_CHECK_INTERVAL_MS);
+                        console.log(
+                            `[timeout] poll started: silence=${SILENCE_TIMEOUT_MS / 1000}s ` +
+                                `duration=${CALL_DURATION_TIMEOUT_MS / 1000}s ` +
+                                `interval=${TIMEOUT_CHECK_INTERVAL_MS / 1000}s`
+                        );
                         console.log(
                             `[start event] extracted streamSid=${streamSid} callSid=${callSid} ` +
                                 `(callSid type=${typeof data.start.callSid}, present=${'callSid' in data.start})`
@@ -1153,10 +1532,14 @@ fastify.register(async (fastify) => {
         });
 
         connection.on('close', () => {
-            console.log('Twilio WS closed');
+            console.log(`Twilio WS closed (endReason=${endReason || 'n/a'})`);
             state = 'ENDED';
             currentPlaybackToken = null;
             disableVad('connection closed');
+            if (timeoutInterval) {
+                clearInterval(timeoutInterval);
+                timeoutInterval = null;
+            }
             if (realtimeWs?.readyState === WebSocket.OPEN) realtimeWs.close();
         });
 
