@@ -435,48 +435,58 @@ const CLAUDE_SYSTEM_PROMPT = `あなたは営業電話の応対判断AIです。
 必ずJSONのみを返してください。説明文は不要です。`;
 
 async function classifyWithClaude(transcript, ctx = {}) {
-    try {
-        const contextLine = [
-            ctx.company ? `架電先会社: ${ctx.company}` : null,
-            ctx.contact ? `担当者: ${ctx.contact}` : null,
-        ]
-            .filter(Boolean)
-            .join(' / ');
+    const contextLine = [
+        ctx.company ? `架電先会社: ${ctx.company}` : null,
+        ctx.contact ? `担当者: ${ctx.contact}` : null,
+    ]
+        .filter(Boolean)
+        .join(' / ');
 
-        const userMessage = contextLine
-            ? `[文脈] ${contextLine}\n[発話] ${transcript}`
-            : transcript;
+    const userMessage = contextLine
+        ? `[文脈] ${contextLine}\n[発話] ${transcript}`
+        : transcript;
 
-        const message = await anthropic.messages.create({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 200,
-            system: [
-                {
-                    type: 'text',
-                    text: CLAUDE_SYSTEM_PROMPT,
-                    cache_control: { type: 'ephemeral' },
-                },
-            ],
-            messages: [
-                { role: 'user', content: userMessage },
-                { role: 'assistant', content: '{' },
-            ],
-        });
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+            const message = await anthropic.messages.create({
+                model: 'claude-haiku-4-5-20251001',
+                max_tokens: 200,
+                system: [
+                    {
+                        type: 'text',
+                        text: CLAUDE_SYSTEM_PROMPT,
+                        cache_control: { type: 'ephemeral' },
+                    },
+                ],
+                messages: [
+                    { role: 'user', content: userMessage },
+                    { role: 'assistant', content: '{' },
+                ],
+            });
 
-        const raw = '{' + (message.content[0]?.text || '');
-        const start = raw.indexOf('{');
-        const end = raw.lastIndexOf('}');
-        if (start < 0 || end < 0) throw new Error('No JSON found');
-        const parsed = JSON.parse(raw.slice(start, end + 1));
-        if (!parsed.action) throw new Error('Missing action');
-        return parsed;
-    } catch (err) {
-        console.error('Claude classification error:', err);
-        return {
-            action: 'openai_realtime',
-            audio_key: null,
-            reason: 'classifier_error',
-        };
+            const raw = '{' + (message.content[0]?.text || '');
+            const start = raw.indexOf('{');
+            const end = raw.lastIndexOf('}');
+            if (start < 0 || end < 0) throw new Error('No JSON found');
+            const parsed = JSON.parse(raw.slice(start, end + 1));
+            if (!parsed.action) throw new Error('Missing action');
+            return parsed;
+        } catch (err) {
+            const isOverloaded = err?.status === 529;
+            if (isOverloaded && attempt < MAX_ATTEMPTS) {
+                const waitMs = 1000 * attempt;
+                console.log(`[claude] overloaded, retry ${attempt}/${MAX_ATTEMPTS} in ${waitMs}ms`);
+                await new Promise((resolve) => setTimeout(resolve, waitMs));
+                continue;
+            }
+            console.error('Claude classification error:', err);
+            return {
+                action: 'openai_realtime',
+                audio_key: null,
+                reason: 'classifier_error',
+            };
+        }
     }
 }
 
@@ -918,7 +928,7 @@ fastify.register(async (fastify) => {
             state = 'REALTIME';
 
             realtimeWs = new WebSocket(
-                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
+                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
                 {
                     headers: {
                         Authorization: `Bearer ${OPENAI_API_KEY}`,
