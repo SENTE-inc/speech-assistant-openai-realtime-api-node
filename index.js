@@ -160,6 +160,13 @@ const AUDIO_TEXTS = {
 // audio_key values that should terminate the call after playback
 const END_CALL_KEYS = new Set(['thanks', 'sorry_disturb']);
 
+// Closing clips whose recordings already contain 「失礼いたします」 — the
+// appended farewell clip is suppressed when one of these was the last
+// thing played, otherwise the caller hears 「失礼いたします」 twice.
+//   thanks:        「ありがとうございました。失礼いたします。」
+//   sorry_disturb: 「お時間をいただきありがとうございました。失礼いたします。」
+const END_CALL_WITHOUT_FAREWELL = new Set(['thanks', 'sorry_disturb']);
+
 // =====================================================================
 // Call-termination thresholds and patterns
 // =====================================================================
@@ -604,6 +611,36 @@ async function transferCall(callSid, agentPhone) {
 }
 
 // =====================================================================
+// Concurrent-call transfer lock
+// =====================================================================
+// When multiple calls run in parallel for the same operator, only one
+// can be handed off at a time. The lock is keyed by tenant + agent
+// phone so each operator has their own slot. Entries auto-expire after
+// LOCK_TTL_MS so a crashed/stuck call cannot block the operator forever.
+// key: `${tenantId}:${agentPhone}` -> { lockedAt, callSid }
+const transferLocks = new Map();
+const LOCK_TTL_MS = 60_000;
+
+function acquireTransferLock(tenantId, agentPhone, callSid) {
+    const key = `${tenantId}:${agentPhone}`;
+    const existing = transferLocks.get(key);
+    const now = Date.now();
+    if (existing && now - existing.lockedAt < LOCK_TTL_MS) {
+        console.log(`[lock] transfer blocked for ${key} (held by ${existing.callSid})`);
+        return false;
+    }
+    transferLocks.set(key, { lockedAt: now, callSid });
+    console.log(`[lock] transfer acquired for ${key} by ${callSid}`);
+    return true;
+}
+
+function releaseTransferLock(tenantId, agentPhone) {
+    const key = `${tenantId}:${agentPhone}`;
+    transferLocks.delete(key);
+    console.log(`[lock] transfer released for ${key}`);
+}
+
+// =====================================================================
 // Fastify app
 // =====================================================================
 
@@ -623,6 +660,7 @@ fastify.all('/incoming-call', async (request, reply) => {
     const phone = decodeURIComponent(request.query.phone || 'unknown');
     const agent_phone = decodeURIComponent(request.query.agent_phone || '');
     const agent_name = decodeURIComponent(request.query.agent_name || '');
+    const tenant_id = decodeURIComponent(request.query.tenant_id || '');
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -633,6 +671,7 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="phone" value="${phone}" />
             <Parameter name="agent_phone" value="${agent_phone}" />
             <Parameter name="agent_name" value="${agent_name}" />
+            <Parameter name="tenant_id" value="${tenant_id}" />
         </Stream>
     </Connect>
 </Response>`;
@@ -695,6 +734,10 @@ fastify.register(async (fastify) => {
         let recentUserUtterances = [];
         let endReason = null;
         let timeoutInterval = null;
+        // The most recent audio key/filename passed to playAudio. Used by
+        // endCallWithFarewell to suppress the farewell clip when the
+        // closing recording already says 「失礼いたします」.
+        let lastPlayedAudioKey = null;
         // Realtime connection-failure tracking — flips true on 'open',
         // stays false if the connection fails before opening.
         let realtimeOpened = false;
@@ -845,6 +888,9 @@ fastify.register(async (fastify) => {
                 `▶ Playing ${keyOrFilename} (${filename}) cache=${wasCached ? 'HIT' : 'MISS'} ` +
                     `load=${loadMs}ms size=${mulaw.length}B`
             );
+            // Record what we just played so endCallWithFarewell can decide
+            // whether to append the farewell clip or not.
+            lastPlayedAudioKey = keyOrFilename;
             const chunkSize = 160; // 20ms at 8kHz mulaw
             for (let i = 0; i < mulaw.length; i += chunkSize) {
                 if (currentPlaybackToken !== token) return;
@@ -881,20 +927,47 @@ fastify.register(async (fastify) => {
         // -----------------------------------------------------------------
         // Hand off the live call to a human agent via Twilio Calls API.
         // Called after the transfer_success clip has finished playing.
+        //
+        // Concurrent calls: only one transfer per (tenant, agent) at a
+        // time. If the lock is held by another call, fall back to the
+        // callback flow so the prospect doesn't hear silence. Lock is
+        // kept after a successful transfer and auto-expires via TTL —
+        // there is no live-call signal we can use to release it early.
         // -----------------------------------------------------------------
         const handleTransfer = async () => {
-            state = 'ENDED';
             disableVad('transferring');
+            const tenantId = callParams?.tenant_id;
             const agentPhone = callParams?.agent_phone;
             const agentName = callParams?.agent_name;
+
             if (!callSid) {
                 console.error('[transfer] callSid missing; cannot transfer');
+                state = 'ENDED';
                 return;
             }
-            if (!agentPhone) {
-                console.error('[transfer] agent_phone missing in callParams; cannot transfer');
+            if (!tenantId || !agentPhone) {
+                console.error(
+                    `[transfer] missing tenant_id (${tenantId || 'none'}) or ` +
+                        `agent_phone (${agentPhone || 'none'}); cannot transfer`
+                );
+                await endCallWithFarewell('error_limit');
                 return;
             }
+
+            if (!acquireTransferLock(tenantId, agentPhone, callSid)) {
+                console.log(
+                    `[transfer] agent ${agentPhone} already busy with another call; ` +
+                        `falling back to callback flow`
+                );
+                try {
+                    await playAudio('callback_request');
+                } catch (err) {
+                    console.error('[transfer] callback_request playback failed:', err);
+                }
+                await endCallWithFarewell('callback_scheduled', { playFarewell: false });
+                return;
+            }
+
             console.log(
                 `[transfer] handing off callSid=${callSid} to ${agentName || '(no name)'} <${agentPhone}>`
             );
@@ -902,8 +975,13 @@ fastify.register(async (fastify) => {
                 await transferCall(callSid, agentPhone);
             } catch (err) {
                 console.error('[transfer] Twilio transfer failed:', err);
+                releaseTransferLock(tenantId, agentPhone);
+                await endCallWithFarewell('error_limit');
                 return;
             }
+
+            state = 'ENDED';
+
             const { error: updErr } = await supabase
                 .from('call_sessions')
                 .update({ result: 'transferred' })
@@ -925,6 +1003,16 @@ fastify.register(async (fastify) => {
             if (state === 'ENDED') {
                 console.log(`[end] endCallWithFarewell(${reason}) called but state=ENDED already; ignoring`);
                 return;
+            }
+            // Suppress the appended farewell if the last clip we played
+            // already contains 「失礼いたします」 (e.g. sorry_disturb / thanks).
+            // The caller's explicit `playFarewell: false` still wins.
+            if (playFarewell && END_CALL_WITHOUT_FAREWELL.has(lastPlayedAudioKey)) {
+                console.log(
+                    `[end] suppressing farewell: last clip '${lastPlayedAudioKey}' already ` +
+                        `includes 「失礼いたします」`
+                );
+                playFarewell = false;
             }
             console.log(`[end] ending call: reason=${reason} playFarewell=${playFarewell}`);
             state = 'ENDED';
@@ -1258,7 +1346,7 @@ fastify.register(async (fastify) => {
 
             try {
                 realtimeWs = new WebSocket(
-                    'wss://api.openai.com/v1/realtime?model=gpt-realtime',
+                    'wss://api.openai.com/v1/realtime?model=gpt-realtime-2',
                     {
                         headers: {
                             Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -1298,6 +1386,9 @@ fastify.register(async (fastify) => {
                         modalities: ['text', 'audio'],
                         temperature: 0.8,
                         input_audio_transcription: { model: 'whisper-1' },
+                        // gpt-realtime-2 reasoning effort. 'low' balances
+                        // latency and cost; raise to 'medium' if quality slips.
+                        reasoning: { effort: 'low' },
                     },
                 };
                 realtimeWs.send(JSON.stringify(sessionUpdate));
@@ -1479,6 +1570,7 @@ fastify.register(async (fastify) => {
                         recentUserUtterances = [];
                         endReason = null;
                         realtimeOpened = false;
+                        lastPlayedAudioKey = null;
 
                         // Start the timeout poll. checkTimeouts handles the
                         // ENDED guard, but clear any stale interval just in
