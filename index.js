@@ -654,6 +654,14 @@ fastify.get('/', async (_req, reply) => {
     });
 });
 
+fastify.get('/health', async (request, reply) => {
+    return {
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+    };
+});
+
 fastify.all('/incoming-call', async (request, reply) => {
     const company = decodeURIComponent(request.query.company || 'unknown');
     const contact = decodeURIComponent(request.query.contact || 'unknown');
