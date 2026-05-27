@@ -663,12 +663,13 @@ fastify.get('/health', async (request, reply) => {
 });
 
 fastify.all('/incoming-call', async (request, reply) => {
-    const company = decodeURIComponent(request.query.company || 'unknown');
-    const contact = decodeURIComponent(request.query.contact || 'unknown');
-    const phone = decodeURIComponent(request.query.phone || 'unknown');
-    const agent_phone = decodeURIComponent(request.query.agent_phone || '');
-    const agent_name = decodeURIComponent(request.query.agent_name || '');
-    const tenant_id = decodeURIComponent(request.query.tenant_id || '');
+    const escXml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+    const company = escXml(decodeURIComponent(request.query.company || 'unknown'));
+    const contact = escXml(decodeURIComponent(request.query.contact || 'unknown'));
+    const phone = escXml(decodeURIComponent(request.query.phone || 'unknown'));
+    const agent_phone = escXml(decodeURIComponent(request.query.agent_phone || ''));
+    const agent_name = escXml(decodeURIComponent(request.query.agent_name || ''));
+    const tenant_id = escXml(decodeURIComponent(request.query.tenant_id || ''));
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
