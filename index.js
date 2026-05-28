@@ -530,7 +530,10 @@ const CLAUDE_SYSTEM_PROMPT = `あなたは営業電話の応対判断AIです。
 - 「お断りします」「興味ないです」「いりません」「ご遠慮します」
 → { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
 
-それ以外の想定外の質問：
+聞き取れない・意味をなさない発話（雑音、咳、もごもご、「あー」「えーと」のみ、語として成立しない音、文字起こしの失敗と思われるもの）：
+→ { "action": "reprompt" }
+
+意味は通じるが上記シナリオに無い質問・発言（こちらへの具体的な質問、雑談、反論など）：
 → { "action": "openai_realtime" }
 
 必ずJSONのみを返してください。説明文は不要です。`;
@@ -1166,6 +1169,38 @@ fastify.register(async (fastify) => {
         };
 
         // -----------------------------------------------------------------
+        // Re-prompt ("聞き返し"). Shared by two "couldn't understand" paths:
+        // an empty Whisper result, and Claude's `reprompt` decision for
+        // gibberish that did transcribe. Increments the shared miss counter,
+        // plays a rotating pardon clip, and ends the call once we've asked
+        // MAX_REPROMPTS times without getting through.
+        // Callers must `await fillerPromise` before calling this so the "はい"
+        // filler lands before the pardon.
+        // -----------------------------------------------------------------
+        const repromptOrEnd = async () => {
+            consecutiveEmpty++;
+            console.log(`[reprompt] miss ${consecutiveEmpty}/${MAX_REPROMPTS}`);
+            if (state === 'ENDED') return;
+
+            if (consecutiveEmpty > MAX_REPROMPTS) {
+                console.log('[reprompt] exhausted; ending call with farewell');
+                await endCallWithFarewell('silence_timeout');
+                return;
+            }
+
+            // Rotate the phrasing so a second ask doesn't sound like a recording.
+            const pardonFilename = PARDON_PATTERNS[pardonIndex % PARDON_PATTERNS.length];
+            pardonIndex++;
+            state = 'PLAYING';
+            disableVad('playing pardon');
+            await playAudio(pardonFilename);
+            if (state === 'ENDED') return;
+            state = 'LISTENING';
+            lastSpeechAt = Date.now();
+            enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after pardon');
+        };
+
+        // -----------------------------------------------------------------
         // After a user utterance: filler + Whisper + Claude + action
         // -----------------------------------------------------------------
         const handleUserUtterance = async (mulawAudio) => {
@@ -1204,41 +1239,18 @@ fastify.register(async (fastify) => {
             console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
 
             if (!transcript) {
-                consecutiveEmpty++;
-                console.log(
-                    `Empty transcript (consecutiveEmpty=${consecutiveEmpty}/${MAX_REPROMPTS})`
-                );
+                // Whisper heard nothing usable — re-prompt (or end if we've
+                // already asked too many times).
+                console.log('Empty transcript — re-prompting');
                 await fillerPromise;
                 if (state === 'ENDED') return;
-
-                // Couldn't make out the caller too many times in a row (noise,
-                // dead air, no human). Stop asking and close gracefully rather
-                // than looping "もう一度お願いします" forever.
-                if (consecutiveEmpty > MAX_REPROMPTS) {
-                    console.log('[reprompt] exhausted; ending call with farewell');
-                    await endCallWithFarewell('silence_timeout');
-                    return;
-                }
-
-                // Ask the caller to repeat, rotating the phrasing so the
-                // second ask doesn't sound like a recording.
-                const pardonFilename =
-                    PARDON_PATTERNS[pardonIndex % PARDON_PATTERNS.length];
-                pardonIndex++;
-                state = 'PLAYING';
-                disableVad('playing pardon');
-                await playAudio(pardonFilename);
-                if (state === 'ENDED') return;
-                state = 'LISTENING';
-                lastSpeechAt = Date.now();
-                enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after pardon');
+                await repromptOrEnd();
                 return;
             }
 
             console.log(`User said: "${transcript}"`);
             lastUserTranscript = transcript;
             lastSpeechAt = Date.now();
-            consecutiveEmpty = 0; // got real text — clear the re-prompt counter
             saveTranscript('user', transcript);
 
             // -----------------------------------------------------------------
@@ -1302,6 +1314,12 @@ fastify.register(async (fastify) => {
             // Filler must complete before we play the real response.
             await fillerPromise;
             if (state === 'ENDED') return;
+
+            // A usable decision means the caller got through — clear the
+            // re-prompt miss counter. `reprompt` is itself a miss, so skip it.
+            if (decision.action !== 'reprompt') {
+                consecutiveEmpty = 0;
+            }
 
             if (decision.action === 'play_audio' && decision.audio_key && AUDIO_FILES[decision.audio_key]) {
                 // B-1 — Loop detection on Claude's decisions. Record FIRST so
@@ -1377,6 +1395,10 @@ fastify.register(async (fastify) => {
                     lastSpeechAt = Date.now();
                     enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after response');
                 }
+            } else if (decision.action === 'reprompt') {
+                // Transcribed, but gibberish/unintelligible — ask to repeat
+                // instead of escalating to the live model.
+                await repromptOrEnd();
             } else if (decision.action === 'openai_realtime') {
                 await switchToRealtime();
             } else {
