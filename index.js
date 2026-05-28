@@ -364,6 +364,13 @@ async function loadPlaybook(tenantId) {
     };
     cfg.classifierPrompt = buildClassifierPrompt(cfg);
 
+    // Vocabulary hint for STT — biases gpt-4o-transcribe toward this tenant's
+    // expected phrases so homophones (e.g. 代表/対象) resolve correctly.
+    // Capped well under the model's ~244-token prompt budget.
+    const vocab = [...new Set(intents.flatMap((i) => (Array.isArray(i.triggers) ? i.triggers : [])))].join('、');
+    cfg.transcriptionPrompt =
+        `日本語の法人向け営業電話です。会社名は${pb.company_name}。想定される発言: ${vocab}`.slice(0, 240);
+
     playbookCache.set(tenantId, { cfg, loadedAt: Date.now() });
 
     // Warm the clip cache in the background so the first call isn't slow.
@@ -435,12 +442,15 @@ function mulawToWav(mulawBuffer) {
 // Whisper transcription
 // =====================================================================
 
-async function transcribeWhisper(mulawBuffer) {
+async function transcribeWhisper(mulawBuffer, prompt) {
     const wav = mulawToWav(mulawBuffer);
     const formData = new FormData();
     formData.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
-    formData.append('model', 'gpt-4o-mini-transcribe');
+    formData.append('model', 'gpt-4o-transcribe');
     formData.append('language', 'ja');
+    // Bias toward the tenant's expected vocabulary (company name + intent
+    // trigger phrases) so homophones like 代表/対象 resolve correctly.
+    if (prompt) formData.append('prompt', prompt);
 
     const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
         method: 'POST',
@@ -662,10 +672,12 @@ fastify.register(async (fastify) => {
         const CALL_START_GRACE_MS = 5000;  // ignore inbound audio for the first 5s (Twilio trial preamble)
         const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
         const HUMAN_PAUSE_MS = 600; // hold the filler clip for this long after silence-end so the caller's last word lands cleanly
+        const PREROLL_FRAMES = 15;       // ~300ms kept before VAD confirms speech, so soft onsets aren't clipped
         let speechActive = false;
         let speechFrames = 0;
         let silenceFrames = 0;
         let speechChunks = [];
+        let preRoll = [];                // rolling buffer of the most recent frames while listening
         let vadEnabled = false;
         let vadEnableTimer = null;
         let callStartTime = 0;
@@ -698,6 +710,7 @@ fastify.register(async (fastify) => {
             speechFrames = 0;
             silenceFrames = 0;
             speechChunks = [];
+            preRoll = [];
         };
 
         const disableVad = (reason) => {
@@ -1140,7 +1153,7 @@ fastify.register(async (fastify) => {
             // Start Whisper immediately so STT runs during the human-pause
             // window — the overall response latency stays roughly the same
             // even though the filler is delayed.
-            const whisperPromise = transcribeWhisper(mulawAudio).catch((err) => {
+            const whisperPromise = transcribeWhisper(mulawAudio, cfg.transcriptionPrompt).catch((err) => {
                 console.error('Whisper error:', err);
                 return null;
             });
@@ -1375,7 +1388,7 @@ fastify.register(async (fastify) => {
                                 // Twilio media streams are G.711 μ-law (8kHz).
                                 format: { type: 'audio/pcmu' },
                                 turn_detection: { type: 'server_vad' },
-                                transcription: { model: 'whisper-1' },
+                                transcription: { model: 'gpt-4o-transcribe' },
                             },
                             output: {
                                 format: { type: 'audio/pcmu' },
@@ -1505,12 +1518,15 @@ fastify.register(async (fastify) => {
                 silenceFrames = 0;
                 if (!speechActive && speechFrames >= SPEECH_START_FRAMES) {
                     speechActive = true;
-                    speechChunks = [];
+                    // Seed with the pre-roll (frames just before VAD tripped)
+                    // so a soft onset like "どう…" isn't clipped. The current
+                    // frame is appended below.
+                    speechChunks = preRoll.slice();
                     // Refresh silence clock as soon as we detect speech —
                     // we don't need to wait for the transcript to confirm
                     // the caller is engaged.
                     lastSpeechAt = Date.now();
-                    console.log(`[vad] speech start (rms=${rms.toFixed(0)})`);
+                    console.log(`[vad] speech start (rms=${rms.toFixed(0)}, preroll=${speechChunks.length}f)`);
                 }
             } else {
                 speechFrames = 0;
@@ -1529,6 +1545,10 @@ fastify.register(async (fastify) => {
                     }
                 }
             }
+
+            // Maintain the rolling pre-roll (every frame while listening).
+            preRoll.push(mulaw);
+            if (preRoll.length > PREROLL_FRAMES) preRoll.shift();
 
             if (speechActive) speechChunks.push(mulaw);
         };
