@@ -97,86 +97,14 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 // Audio assets
 // =====================================================================
 
-const AUDIO_BASE_URL =
-    'https://lgrnhlhhesjpcztxqnia.supabase.co/storage/v1/object/public/call-audio/';
+// Audio clips and the call script ("playbook") are loaded per-tenant from
+// Supabase at call start (see loadPlaybook). Only the storage bucket name and
+// a couple of process-wide constants live here now.
+const AUDIO_BUCKET = 'call-audio';
 
-const AUDIO_FILES = {
-    greeting: '01_greeting.mp3',
-    reason: '04_reason.mp3',
-    company: '05_company.mp3',
-    who: '06_who.mp3',
-    appointment: '07_appointment.mp3',
-    not_available: '08_not_available.mp3',
-    transfer_success: '09_transfer_success.mp3',
-    pitch_start: '10_pitch_start.mp3',
-    callback_request: '11_callback_request.mp3',
-    when_callback: '12_when_callback.mp3',
-    callback_confirm: '13_callback_confirm.mp3',
-    thanks: '14_thanks.mp3',
-    sorry_disturb: '15_sorry_disturb.mp3',
-    kashikomarimashita: '17_kashikomarimashita.mp3',
-    soudesuka: '18_soudesuka.mp3',
-    shoshomachi: '19_shoshomachi.mp3',
-    arigatou: '20_arigatou.mp3',
-    farewell: '21_farewell.mp3',
-};
+let haiPatternIndex = 0; // filler rotation index; reset on each new Twilio call
 
-// Filler clips played while we wait for STT + classifier. Rotated per
-// utterance so the agent does not always say the same thing.
-// 16c_hai.mp3 ("そうですね。") is kept in storage but excluded here because
-// it reads as agreement, which sounds wrong as a generic filler.
-const HAI_PATTERNS = [
-    '16a_hai.mp3',   // 「はい。」
-    '16b_hai.mp3',   // 「あっ、はい。」
-];
-let haiPatternIndex = 0; // reset on each new Twilio call (start event)
-
-// Re-prompt ("聞き返し") clips, played when VAD tripped on caller audio but
-// Whisper returned nothing intelligible. Rotated like the fillers so a second
-// ask doesn't sound robotic.
-const PARDON_PATTERNS = [
-    '22a_pardon.mp3', // 「恐れ入りますが、もう一度お願いできますでしょうか。」
-    '22b_pardon.mp3', // 「申し訳ございません、お電話が少し遠いようでして。もう一度お願いいたします。」
-];
 const MAX_REPROMPTS = 2; // ask to repeat this many times, then end the call
-
-// Transcript text persisted to Supabase when a clip is played
-const AUDIO_TEXTS = {
-    greeting: 'お世話になっております。株式会社SENTEと申します。',
-    reason: 'Uber Eatsの売上改善に関するご提案でございます。',
-    company: '株式会社SENTEと申します。',
-    who: '私、SENTEの営業担当と申します。',
-    appointment: 'アポイントはございませんが、少々お時間いただけますでしょうか。',
-    not_available: 'さようでございますか。いつ頃お戻りになりますでしょうか？',
-    transfer_success: 'ありがとうございます。少々お時間よろしいでしょうか？',
-    pitch_start: '実は、Uber Eatsを導入されている飲食店様の売上を改善するご提案でご連絡いたしました。',
-    callback_request: 'では、改めてご連絡いたします。',
-    when_callback: 'いつ頃お時間をいただけますでしょうか？',
-    callback_confirm: '承知いたしました。それでは改めてご連絡いたします。',
-    thanks: 'ありがとうございました。失礼いたします。',
-    sorry_disturb: 'お時間をいただきありがとうございました。失礼いたします。',
-    '16a_hai.mp3': 'はい。',
-    '16b_hai.mp3': 'あっ、はい。',
-    '16c_hai.mp3': 'そうですね。',
-    '22a_pardon.mp3': '恐れ入りますが、もう一度お願いできますでしょうか。',
-    '22b_pardon.mp3': '申し訳ございません、お電話が少し遠いようでして。もう一度お願いいたします。',
-    kashikomarimashita: 'かしこまりました。',
-    soudesuka: 'さようでございますか。',
-    shoshomachi: '少々お待ちくださいませ。',
-    arigatou: 'ありがとうございます。',
-    farewell: 'それでは失礼いたします。',
-    '21_farewell.mp3': 'それでは失礼いたします。',
-};
-
-// audio_key values that should terminate the call after playback
-const END_CALL_KEYS = new Set(['thanks', 'sorry_disturb']);
-
-// Closing clips whose recordings already contain 「失礼いたします」 — the
-// appended farewell clip is suppressed when one of these was the last
-// thing played, otherwise the caller hears 「失礼いたします」 twice.
-//   thanks:        「ありがとうございました。失礼いたします。」
-//   sorry_disturb: 「お時間をいただきありがとうございました。失礼いたします。」
-const END_CALL_WITHOUT_FAREWELL = new Set(['thanks', 'sorry_disturb']);
 
 // =====================================================================
 // Call-termination thresholds and patterns
@@ -192,8 +120,9 @@ const LOOP_DECISION_THRESHOLD = 3;               // same Claude audio_key N time
 const LOOP_UTTERANCE_THRESHOLD = 3;              // N highly-similar user utterances in a row
 const UTTERANCE_SIMILARITY = 0.8;                // ≥80% similar → counts as repeat
 
-// Voicemail detection — immediate hang-up, no farewell
-const VOICEMAIL_PATTERNS = [
+// Voicemail detection — immediate hang-up, no farewell. Used as a fallback
+// when a tenant's playbook leaves voicemail_patterns unset.
+const DEFAULT_VOICEMAIL_PATTERNS = [
     'ただいま電話に出ることができません',
     '録音させていただきます',
     'メッセージをどうぞ',
@@ -201,8 +130,9 @@ const VOICEMAIL_PATTERNS = [
     '留守番電話',
 ];
 
-// User explicit hang-up — play farewell then hang up, skip Claude
-const USER_HANGUP_PATTERNS = [
+// User explicit hang-up — play farewell then hang up, skip Claude. Fallback
+// when a tenant's playbook leaves hangup_patterns unset.
+const DEFAULT_HANGUP_PATTERNS = [
     '電話を切ります',
     '失礼します',
     'もう結構です',
@@ -238,21 +168,18 @@ function stringSimilarity(a, b) {
     return 1 - levenshteinDistance(a, b) / maxLen;
 }
 
-const audioCache = new Map(); // audio_key -> mulaw Buffer
+const audioCache = new Map(); // storage path -> mulaw Buffer
 
-async function fetchMp3(filename) {
-    const url = AUDIO_BASE_URL + filename;
-    console.log(`[fetch] GET ${url}`);
-    const res = await fetch(url);
-    if (!res.ok) {
-        throw new Error(`Fetch ${url} failed: ${res.status} ${res.statusText}`);
+// Download a clip from the (private) call-audio bucket using the service key.
+async function fetchClip(path) {
+    const { data, error } = await supabase.storage.from(AUDIO_BUCKET).download(path);
+    if (error || !data) {
+        throw new Error(`storage download failed for ${path}: ${error?.message || 'no data'}`);
     }
-    const buf = Buffer.from(await res.arrayBuffer());
-    console.log(
-        `[fetch] ${filename} -> ${buf.length} bytes, content-type=${res.headers.get('content-type') || 'n/a'}`
-    );
+    const buf = Buffer.from(await data.arrayBuffer());
+    console.log(`[fetch] ${path} -> ${buf.length} bytes`);
     if (buf.length === 0) {
-        throw new Error(`Fetched MP3 is empty: ${filename}`);
+        throw new Error(`Downloaded clip is empty: ${path}`);
     }
     return buf;
 }
@@ -347,40 +274,109 @@ function convertMp3ToMulaw(mp3Buffer, label = '') {
     });
 }
 
-async function getAudioBuffer(keyOrFilename) {
-    // Accept either an AUDIO_FILES key (e.g. "greeting") or a raw filename
-    // (e.g. "16a_hai.mp3"). Cache is keyed by filename so both paths share it.
-    const filename = AUDIO_FILES[keyOrFilename] || keyOrFilename;
-    if (audioCache.has(filename)) return audioCache.get(filename);
+// Resolve a clip (by its playbook key) to mulaw bytes, caching per storage
+// path so tenants never collide. Clips live at <audio_base_path>/<filename>.
+async function getAudioBuffer(cfg, key) {
+    const clip = cfg.clips.get(key);
+    if (!clip) throw new Error(`unknown clip key "${key}" for tenant ${cfg.tenantId}`);
+    const path = cfg.audioBasePath ? `${cfg.audioBasePath}/${clip.filename}` : clip.filename;
+    if (audioCache.has(path)) return audioCache.get(path);
 
-    const mp3 = await fetchMp3(filename);
-    const mulaw = await convertMp3ToMulaw(mp3, filename);
+    const mp3 = await fetchClip(path);
+    const mulaw = await convertMp3ToMulaw(mp3, path);
     if (mulaw.length === 0) {
-        throw new Error(`Converted mulaw is 0 bytes for ${filename}`);
+        throw new Error(`Converted mulaw is 0 bytes for ${path}`);
     }
-    audioCache.set(filename, mulaw);
-    const label =
-        keyOrFilename === filename
-            ? filename
-            : `${keyOrFilename} (${filename})`;
-    console.log(
-        `[preload] ${label}: mp3=${mp3.length} -> mulaw=${mulaw.length} bytes`
-    );
+    audioCache.set(path, mulaw);
+    console.log(`[clip] ${key} (${path}): mp3=${mp3.length} -> mulaw=${mulaw.length} bytes`);
     return mulaw;
 }
 
-// Preload everything in the background so first calls are responsive.
-(async () => {
-    const targets = [...Object.keys(AUDIO_FILES), ...HAI_PATTERNS, ...PARDON_PATTERNS];
-    console.log(`[preload] starting preload for ${targets.length} audio files`);
-    const results = await Promise.allSettled(targets.map((t) => getAudioBuffer(t)));
-    let ok = 0;
-    results.forEach((r, i) => {
-        if (r.status === 'fulfilled') ok++;
-        else console.error(`[preload] ✗ ${targets[i]} failed:`, r.reason?.message || r.reason);
+// --- Per-tenant playbook (script + clips + intents) ----------------------
+const PLAYBOOK_TTL_MS = 5 * 60 * 1000;
+const playbookCache = new Map(); // tenantId -> { cfg, loadedAt }
+
+// Build the Claude classifier prompt from a playbook's intents.
+function buildClassifierPrompt(cfg) {
+    const lines = cfg.intents.map((i) => {
+        const ex = Array.isArray(i.triggers) ? i.triggers.join(' / ') : '';
+        return `- ${i.name}: ${ex}`;
     });
-    console.log(`[preload] done: ${ok}/${targets.length} loaded`);
-})();
+    return `あなたは営業電話の応対判断AIです。${cfg.companyName}の担当者として、` +
+        `会話の直近の発言から最も当てはまる意図(intent)を1つだけ選んでください。\n\n` +
+        `【意図の一覧（name: 該当する発言の例）】\n${lines.join('\n')}\n\n` +
+        `判断のポイント:\n` +
+        `- 聞き取れない・意味をなさない発話は "reprompt"。\n` +
+        `- 意味は通じるが上記に当てはまらない発言は "openai_realtime"。\n` +
+        `- 戻り時間など日時情報があれば callback_info に原文のまま記録。\n\n` +
+        `必ず次のJSONのみを返してください（説明文は不要）:\n` +
+        `{ "intent": "<上記nameのいずれか>", "callback_info": "<日時情報があれば。無ければ省略>" }`;
+}
+
+async function loadPlaybook(tenantId) {
+    if (!tenantId) return null;
+    const cached = playbookCache.get(tenantId);
+    if (cached && Date.now() - cached.loadedAt < PLAYBOOK_TTL_MS) return cached.cfg;
+
+    const { data: pb, error: pbErr } = await supabase
+        .from('call_playbooks')
+        .select('*')
+        .eq('tenant_id', tenantId)
+        .eq('is_active', true)
+        .is('campaign_id', null)
+        .maybeSingle();
+    if (pbErr || !pb) {
+        console.error(
+            `[playbook] load failed for tenant ${tenantId}: ${pbErr?.message || 'no active playbook'}`
+        );
+        return null;
+    }
+
+    const [clipsRes, intentsRes] = await Promise.all([
+        supabase.from('audio_clips').select('*').eq('playbook_id', pb.id).eq('active', true).order('sort_order'),
+        supabase.from('call_intents').select('*').eq('playbook_id', pb.id).eq('active', true).order('sort_order'),
+    ]);
+
+    const clips = new Map();
+    const clipsByType = { greeting: [], response: [], filler: [], pardon: [], farewell: [] };
+    for (const c of clipsRes.data || []) {
+        clips.set(c.key, c);
+        if (clipsByType[c.clip_type]) clipsByType[c.clip_type].push(c);
+    }
+
+    const intents = intentsRes.data || [];
+    const cfg = {
+        tenantId,
+        playbookId: pb.id,
+        companyName: pb.company_name,
+        realtimeSystemMessage: pb.realtime_system_message,
+        voice: pb.voice || 'shimmer',
+        audioBasePath: (pb.audio_base_path || '').trim(),
+        voicemailPatterns: pb.voicemail_patterns?.length ? pb.voicemail_patterns : DEFAULT_VOICEMAIL_PATTERNS,
+        hangupPatterns: pb.hangup_patterns?.length ? pb.hangup_patterns : DEFAULT_HANGUP_PATTERNS,
+        clips,
+        greetingKey: clipsByType.greeting[0]?.key || null,
+        farewellKey: clipsByType.farewell[0]?.key || null,
+        fillerKeys: clipsByType.filler.map((c) => c.key),
+        pardonKeys: clipsByType.pardon.map((c) => c.key),
+        intents,
+        intentByName: new Map(intents.map((i) => [i.name, i])),
+    };
+    cfg.classifierPrompt = buildClassifierPrompt(cfg);
+
+    playbookCache.set(tenantId, { cfg, loadedAt: Date.now() });
+
+    // Warm the clip cache in the background so the first call isn't slow.
+    for (const key of cfg.clips.keys()) {
+        getAudioBuffer(cfg, key).catch((err) =>
+            console.error(`[playbook] warm ${key} failed: ${err.message}`)
+        );
+    }
+    console.log(
+        `[playbook] loaded tenant=${tenantId} clips=${cfg.clips.size} intents=${intents.length}`
+    );
+    return cfg;
+}
 
 // =====================================================================
 // Audio helpers (μ-law decode, VAD, WAV header)
@@ -464,81 +460,10 @@ async function transcribeWhisper(mulawBuffer) {
 // Claude intent classifier
 // =====================================================================
 
-const CLAUDE_SYSTEM_PROMPT = `あなたは営業電話の応対判断AIです。
-以下の会話履歴と直近の発言を見て、次に再生すべき音声を判断してください。
+// The classifier prompt is generated per-tenant from call_intents at call
+// start; see buildClassifierPrompt() / loadPlaybook().
 
-【判断基準】
-
-転送（transfer_success）：
-- 「お繋ぎします」「少々お待ち」「担当者に代わります」
-- 「はい、私が担当です」「私でよければ」
-- 「詳しく聞かせてください」「ぜひ聞かせてください」
-- 「興味があります」「聞いてみます」
-- 「社長に代わります」「担当に代わります」
-- 相手が前向きな反応・担当者本人が出た場合
-→ { "action": "play_audio", "audio_key": "transfer_success" }
-
-用件を聞かれた（reason）：
-- 「どのようなご用件」「何のご用件」「どういったご提案」
-→ { "action": "play_audio", "audio_key": "reason" }
-
-会社名を聞かれた（company）：
-- 「どちらの会社」「どこの会社」「会社名は」
-→ { "action": "play_audio", "audio_key": "company" }
-
-担当者名を聞かれた（who）：
-- 「どなた様」「お名前は」「担当者のお名前」
-→ { "action": "play_audio", "audio_key": "who" }
-
-アポの有無を聞かれた（appointment）：
-- 「アポイントは」「お約束は」「ご予約は」
-→ { "action": "play_audio", "audio_key": "appointment" }
-
-折り返し提案（callback_request）：
-- 「折り返しましょうか」「後ほど」「またかけ直して」
-→ { "action": "play_audio", "audio_key": "callback_request" }
-
-【終話パターン（必ず "end_call": true と "end_reason" を含めること）】
-
-担当者不在・戻り時間あり（callback_scheduled）：
-- 「夕方には戻ります」「16時頃戻ります」「明日には戻ります」「来週には戻る予定です」
-- 担当者は不在だが、戻り時間が明示されている場合
-→ { "action": "play_audio", "audio_key": "callback_request", "end_call": true, "end_reason": "callback_scheduled", "callback_info": "戻り時間の情報をそのまま記録" }
-
-担当者不在・戻り時間不明（not_available）：
-- 「担当者は本日不在」「外出中で戻り未定」
-- 「席を外しております」「会議中で長くなる」
-- 「只今不在」「いません」など、戻り時間が明示されていない場合
-→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "not_available" }
-
-検討不要（rejected）：
-- 「うちは間に合っています」「必要ありません」「結構です」「けっこうです」
-- 「導入予定ありません」「検討する予定はない」
-→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
-
-時間がない（rejected）：
-- 「今忙しいので」「時間がないんです」
-- 「会議中なので」「立て込んでまして」
-→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
-
-他社契約済み（rejected）：
-- 「すでに他社と契約しています」「他社にお願いしています」
-- 「別のところでやっています」
-→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
-
-断り全般（rejected）：
-- 「お断りします」「興味ないです」「いりません」「ご遠慮します」
-→ { "action": "play_audio", "audio_key": "sorry_disturb", "end_call": true, "end_reason": "rejected" }
-
-聞き取れない・意味をなさない発話（雑音、咳、もごもご、「あー」「えーと」のみ、語として成立しない音、文字起こしの失敗と思われるもの）：
-→ { "action": "reprompt" }
-
-意味は通じるが上記シナリオに無い質問・発言（こちらへの具体的な質問、雑談、反論など）：
-→ { "action": "openai_realtime" }
-
-必ずJSONのみを返してください。説明文は不要です。`;
-
-async function classifyWithClaude(transcript, ctx = {}) {
+async function classifyWithClaude(transcript, ctx = {}, prompt) {
     const contextLine = [
         ctx.company ? `架電先会社: ${ctx.company}` : null,
         ctx.contact ? `担当者: ${ctx.contact}` : null,
@@ -559,7 +484,7 @@ async function classifyWithClaude(transcript, ctx = {}) {
                 system: [
                     {
                         type: 'text',
-                        text: CLAUDE_SYSTEM_PROMPT,
+                        text: prompt,
                         cache_control: { type: 'ephemeral' },
                     },
                 ],
@@ -574,7 +499,7 @@ async function classifyWithClaude(transcript, ctx = {}) {
             const end = raw.lastIndexOf('}');
             if (start < 0 || end < 0) throw new Error('No JSON found');
             const parsed = JSON.parse(raw.slice(start, end + 1));
-            if (!parsed.action) throw new Error('Missing action');
+            if (!parsed.intent) throw new Error('Missing intent');
             return parsed;
         } catch (err) {
             const isOverloaded = err?.status === 529;
@@ -586,8 +511,7 @@ async function classifyWithClaude(transcript, ctx = {}) {
             }
             console.error('Claude classification error:', err);
             return {
-                action: 'openai_realtime',
-                audio_key: null,
+                intent: null,
                 reason: 'classifier_error',
             };
         }
@@ -705,10 +629,6 @@ fastify.all('/incoming-call', async (request, reply) => {
 // Per-call WebSocket handler
 // =====================================================================
 
-const REALTIME_SYSTEM_MESSAGE = `あなたはプロの営業アシスタントです。必ず日本語で話してください。
-Uber Eatsの売上改善の提案をしている株式会社SENTEの担当者です。
-簡潔に丁寧に対応してください。`;
-
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
         console.log('▶ Twilio client connected');
@@ -717,6 +637,8 @@ fastify.register(async (fastify) => {
         let streamSid = null;
         let callSid = null;
         let callParams = {};
+        // Per-tenant playbook (script + clips + intents), loaded at 'start'.
+        let cfg = null;
 
         // State machine
         // 'INITIAL' | 'PLAYING' | 'LISTENING' | 'PROCESSING' | 'REALTIME' | 'ENDED'
@@ -727,8 +649,8 @@ fastify.register(async (fastify) => {
         let lastUserTranscript = null;
 
         // Re-prompt tracking. consecutiveEmpty counts back-to-back utterances
-        // that Whisper couldn't transcribe; it resets the moment we get real
-        // text. pardonIndex rotates the phrasing across PARDON_PATTERNS.
+        // we couldn't act on; it resets the moment we get a usable one.
+        // pardonIndex rotates across the tenant's pardon clips.
         let consecutiveEmpty = 0;
         let pardonIndex = 0;
 
@@ -896,30 +818,30 @@ fastify.register(async (fastify) => {
         // -----------------------------------------------------------------
         // Playback (one key → cached mulaw → chunked → mark → await)
         // -----------------------------------------------------------------
-        const playAudio = async (keyOrFilename) => {
+        const playAudio = async (key) => {
             const token = ++markCounter;
             currentPlaybackToken = token;
 
-            const filename = AUDIO_FILES[keyOrFilename] || keyOrFilename;
-            const wasCached = audioCache.has(filename);
+            const clip = cfg?.clips.get(key);
+            if (!clip) {
+                console.error(`[playAudio] unknown clip "${key}" for tenant ${cfg?.tenantId}`);
+                return;
+            }
             const loadT0 = Date.now();
             let mulaw;
             try {
-                mulaw = await getAudioBuffer(keyOrFilename);
+                mulaw = await getAudioBuffer(cfg, key);
             } catch (err) {
-                console.error(`Failed to load ${keyOrFilename}:`, err);
+                console.error(`Failed to load ${key}:`, err.message);
                 return;
             }
             const loadMs = Date.now() - loadT0;
             if (currentPlaybackToken !== token) return; // Interrupted while loading
 
-            console.log(
-                `▶ Playing ${keyOrFilename} (${filename}) cache=${wasCached ? 'HIT' : 'MISS'} ` +
-                    `load=${loadMs}ms size=${mulaw.length}B`
-            );
+            console.log(`▶ Playing ${key} (${clip.filename}) load=${loadMs}ms size=${mulaw.length}B`);
             // Record what we just played so endCallWithFarewell can decide
             // whether to append the farewell clip or not.
-            lastPlayedAudioKey = keyOrFilename;
+            lastPlayedAudioKey = key;
             const chunkSize = 160; // 20ms at 8kHz mulaw
             for (let i = 0; i < mulaw.length; i += chunkSize) {
                 if (currentPlaybackToken !== token) return;
@@ -932,8 +854,8 @@ fastify.register(async (fastify) => {
                 sendMark(markName);
             });
 
-            console.log(`✓ Finished ${keyOrFilename}`);
-            saveTranscript('assistant', AUDIO_TEXTS[keyOrFilename] || '');
+            console.log(`✓ Finished ${key}`);
+            saveTranscript('assistant', clip.text || '');
         };
 
         // -----------------------------------------------------------------
@@ -942,7 +864,7 @@ fastify.register(async (fastify) => {
         const playGreeting = async () => {
             state = 'PLAYING';
             disableVad('playing greeting');
-            await playAudio('greeting');
+            if (cfg?.greetingKey) await playAudio(cfg.greetingKey);
             if (state !== 'PLAYING') return;
 
             state = 'LISTENING';
@@ -988,10 +910,12 @@ fastify.register(async (fastify) => {
                     `[transfer] agent ${agentPhone} already busy with another call; ` +
                         `falling back to callback flow`
                 );
-                try {
-                    await playAudio('callback_request');
-                } catch (err) {
-                    console.error('[transfer] callback_request playback failed:', err);
+                if (cfg?.clips.has('callback_request')) {
+                    try {
+                        await playAudio('callback_request');
+                    } catch (err) {
+                        console.error('[transfer] callback_request playback failed:', err);
+                    }
                 }
                 await endCallWithFarewell('callback_scheduled', { playFarewell: false });
                 return;
@@ -1036,7 +960,7 @@ fastify.register(async (fastify) => {
             // Suppress the appended farewell if the last clip we played
             // already contains 「失礼いたします」 (e.g. sorry_disturb / thanks).
             // The caller's explicit `playFarewell: false` still wins.
-            if (playFarewell && END_CALL_WITHOUT_FAREWELL.has(lastPlayedAudioKey)) {
+            if (playFarewell && cfg?.clips.get(lastPlayedAudioKey)?.suppress_farewell) {
                 console.log(
                     `[end] suppressing farewell: last clip '${lastPlayedAudioKey}' already ` +
                         `includes 「失礼いたします」`
@@ -1060,9 +984,9 @@ fastify.register(async (fastify) => {
             // bail when it changes.
             currentPlaybackToken = ++markCounter;
 
-            if (playFarewell) {
+            if (playFarewell && cfg?.farewellKey) {
                 try {
-                    await playAudio('farewell');
+                    await playAudio(cfg.farewellKey);
                 } catch (err) {
                     console.error('[end] farewell playback failed:', err);
                 }
@@ -1189,11 +1113,14 @@ fastify.register(async (fastify) => {
             }
 
             // Rotate the phrasing so a second ask doesn't sound like a recording.
-            const pardonFilename = PARDON_PATTERNS[pardonIndex % PARDON_PATTERNS.length];
-            pardonIndex++;
-            state = 'PLAYING';
-            disableVad('playing pardon');
-            await playAudio(pardonFilename);
+            const pardonKeys = cfg?.pardonKeys || [];
+            if (pardonKeys.length) {
+                const pardonKey = pardonKeys[pardonIndex % pardonKeys.length];
+                pardonIndex++;
+                state = 'PLAYING';
+                disableVad('playing pardon');
+                await playAudio(pardonKey);
+            }
             if (state === 'ENDED') return;
             state = 'LISTENING';
             lastSpeechAt = Date.now();
@@ -1222,17 +1149,18 @@ fastify.register(async (fastify) => {
             // the caller's last word does not get stepped on. Without this
             // pause the agent fires "はい" the instant VAD flips, which
             // sounds robotic and impatient.
-            // Rotate through HAI_PATTERNS so the agent does not sound robotic.
-            const fillerFilename = HAI_PATTERNS[haiPatternIndex % HAI_PATTERNS.length];
+            // Rotate through the tenant's filler clips so it doesn't sound robotic.
+            const fillerKeys = cfg?.fillerKeys || [];
+            const fillerKey = fillerKeys.length ? fillerKeys[haiPatternIndex % fillerKeys.length] : null;
             haiPatternIndex++;
             const fillerPromise = new Promise((resolve) =>
                 setTimeout(resolve, HUMAN_PAUSE_MS)
             ).then(() => {
-                if (state === 'ENDED') return;
-                return playAudio(fillerFilename);
+                if (state === 'ENDED' || !fillerKey) return;
+                return playAudio(fillerKey);
             }).catch((err) => console.error('Filler playback error:', err));
             console.log(
-                `[parallel] Whisper started; filler ${fillerFilename} scheduled in ${HUMAN_PAUSE_MS}ms`
+                `[parallel] Whisper started; filler ${fillerKey || '(none)'} scheduled in ${HUMAN_PAUSE_MS}ms`
             );
 
             const transcript = await whisperPromise;
@@ -1257,7 +1185,7 @@ fastify.register(async (fastify) => {
             // D — Voicemail detection. Hang up immediately without farewell so
             // we don't leave a goodbye recording on the prospect's voicemail.
             // -----------------------------------------------------------------
-            const voicemailHit = VOICEMAIL_PATTERNS.find((p) => transcript.includes(p));
+            const voicemailHit = cfg.voicemailPatterns.find((p) => transcript.includes(p));
             if (voicemailHit) {
                 console.log(`[voicemail] detected pattern "${voicemailHit}"; hanging up without farewell`);
                 await endCallWithFarewell('voicemail', { playFarewell: false });
@@ -1268,7 +1196,7 @@ fastify.register(async (fastify) => {
             // E — User-explicit hang-up keywords. Skip Claude entirely; just
             // play the farewell and close.
             // -----------------------------------------------------------------
-            const hangupHit = USER_HANGUP_PATTERNS.find((p) => transcript.includes(p));
+            const hangupHit = cfg.hangupPatterns.find((p) => transcript.includes(p));
             if (hangupHit) {
                 console.log(`[user_hangup] detected keyword "${hangupHit}"; playing farewell`);
                 // Let the filler "はい" land first so it doesn't get clipped.
@@ -1292,7 +1220,7 @@ fastify.register(async (fastify) => {
             const decision = await classifyWithClaude(transcript, {
                 company: callParams?.company,
                 contact: callParams?.contact,
-            });
+            }, cfg.classifierPrompt);
             console.log(
                 `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms):`,
                 decision
@@ -1315,95 +1243,86 @@ fastify.register(async (fastify) => {
             await fillerPromise;
             if (state === 'ENDED') return;
 
-            // A usable decision means the caller got through — clear the
-            // re-prompt miss counter. `reprompt` is itself a miss, so skip it.
-            if (decision.action !== 'reprompt') {
-                consecutiveEmpty = 0;
+            // The server owns the behaviour — Claude only returns the intent
+            // name. Look it up in the tenant's playbook.
+            const intent = cfg.intentByName.get(decision.intent);
+            if (!intent) {
+                console.log(`Unknown intent "${decision.intent}"; falling back to realtime`);
+                await switchToRealtime();
+                return;
             }
 
-            if (decision.action === 'play_audio' && decision.audio_key && AUDIO_FILES[decision.audio_key]) {
-                // B-1 — Loop detection on Claude's decisions. Record FIRST so
-                // we still play the current clip before ending; otherwise the
-                // last user message goes unanswered.
-                const looped = recordClaudeDecision(decision.audio_key);
+            // A usable decision means the caller got through — clear the
+            // re-prompt miss counter. `reprompt` is itself a miss, so skip it.
+            if (intent.action !== 'reprompt') consecutiveEmpty = 0;
 
-                state = 'PLAYING';
-                disableVad('playing response');
-                await playAudio(decision.audio_key);
-
-                if (decision.audio_key === 'transfer_success') {
-                    // Transfer flow skips farewell — the caller is about to
-                    // start talking to the human agent. handleTransfer writes
-                    // result='transferred' itself, so we don't call
-                    // endCallWithFarewell here.
-                    await handleTransfer();
-                    if (timeoutInterval) {
-                        clearInterval(timeoutInterval);
-                        timeoutInterval = null;
-                    }
-                    return;
-                }
-
-                // G — Persist callback_info when Claude attached scheduling
-                // context (e.g. "16時頃戻ります"). n8n's post-call analysis
-                // uses this to compute the next call date.
-                if (decision.callback_info && callSid) {
-                    try {
-                        const { error: cbErr } = await supabase
-                            .from('call_sessions')
-                            .update({ metadata: { callback_info: decision.callback_info } })
-                            .eq('call_sid', callSid);
-                        if (cbErr) {
-                            console.error('[callback_info] save failed:', cbErr);
-                        } else {
-                            console.log(`[callback_info] saved: ${decision.callback_info}`);
-                        }
-                    } catch (err) {
-                        console.error('[callback_info] threw:', err);
-                    }
-                }
-
-                // Loop ends after playback so the caller hears the response.
-                if (looped) {
-                    await endCallWithFarewell('loop_detected');
-                    return;
-                }
-
-                // F & G — Claude can mark a decision as end_call with an
-                // optional end_reason. Map to Supabase result enum.
-                if (decision.end_call) {
-                    const reason =
-                        decision.end_reason ||
-                        (decision.audio_key === 'callback_request'
-                            ? 'callback_scheduled'
-                            : 'rejected');
-                    await endCallWithFarewell(reason);
-                    return;
-                }
-
-                // Legacy safety net: if Claude returns sorry_disturb / thanks
-                // without end_call:true (older prompt behaviour), still end.
-                if (END_CALL_KEYS.has(decision.audio_key)) {
-                    await endCallWithFarewell('rejected');
-                    return;
-                }
-
-                if (state === 'PLAYING') {
-                    state = 'LISTENING';
-                    // Reset silence clock — assistant just finished talking,
-                    // give the caller a clean SILENCE_TIMEOUT_MS window.
-                    lastSpeechAt = Date.now();
-                    enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after response');
-                }
-            } else if (decision.action === 'reprompt') {
+            if (intent.action === 'reprompt') {
                 // Transcribed, but gibberish/unintelligible — ask to repeat
                 // instead of escalating to the live model.
                 await repromptOrEnd();
-            } else if (decision.action === 'openai_realtime') {
+                return;
+            }
+            if (intent.action === 'openai_realtime') {
                 await switchToRealtime();
-            } else {
-                console.log('Unknown decision, falling back to realtime');
+                return;
+            }
+
+            // action === 'play_audio'
+            if (!intent.audio_key || !cfg.clips.has(intent.audio_key)) {
+                console.error(`[intent] "${intent.name}" has no playable clip; falling back to realtime`);
                 await switchToRealtime();
+                return;
+            }
+
+            // B-1 — Loop detection on Claude's decisions. Record FIRST so we
+            // still play the current clip before ending.
+            const looped = recordClaudeDecision(intent.audio_key);
+
+            state = 'PLAYING';
+            disableVad('playing response');
+            await playAudio(intent.audio_key);
+
+            if (intent.is_transfer) {
+                // Transfer flow skips farewell — handleTransfer writes
+                // result='transferred' itself.
+                await handleTransfer();
+                if (timeoutInterval) {
+                    clearInterval(timeoutInterval);
+                    timeoutInterval = null;
+                }
+                return;
+            }
+
+            // Persist callback_info when the intent expects scheduling context
+            // (e.g. "16時頃戻ります"). n8n's post-call analysis uses it.
+            if (intent.wants_callback_info && decision.callback_info && callSid) {
+                try {
+                    const { error: cbErr } = await supabase
+                        .from('call_sessions')
+                        .update({ metadata: { callback_info: decision.callback_info } })
+                        .eq('call_sid', callSid);
+                    if (cbErr) console.error('[callback_info] save failed:', cbErr);
+                    else console.log(`[callback_info] saved: ${decision.callback_info}`);
+                } catch (err) {
+                    console.error('[callback_info] threw:', err);
+                }
+            }
+
+            if (looped) {
+                await endCallWithFarewell('loop_detected');
+                return;
+            }
+
+            if (intent.end_call) {
+                await endCallWithFarewell(intent.end_reason || 'rejected');
+                return;
+            }
+
+            if (state === 'PLAYING') {
+                state = 'LISTENING';
+                // Reset silence clock — assistant just finished talking.
+                lastSpeechAt = Date.now();
+                enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after response');
             }
         };
 
@@ -1446,7 +1365,7 @@ fastify.register(async (fastify) => {
                     type: 'session.update',
                     session: {
                         type: 'realtime',
-                        instructions: `${REALTIME_SYSTEM_MESSAGE}
+                        instructions: `${cfg.realtimeSystemMessage}
 
 【今回の架電情報】会社: ${company} / 担当者: ${contact}
 【直前のお客様の発言】${lastUserTranscript || '（未取得）'}`,
@@ -1460,7 +1379,7 @@ fastify.register(async (fastify) => {
                             },
                             output: {
                                 format: { type: 'audio/pcmu' },
-                                voice: 'shimmer',
+                                voice: cfg.voice,
                             },
                         },
                     },
@@ -1670,9 +1589,23 @@ fastify.register(async (fastify) => {
                             `Twilio: start ${streamSid} (VAD muted for first ${CALL_START_GRACE_MS}ms) params:`,
                             callParams
                         );
-                        playGreeting().catch((err) =>
-                            console.error('Greeting flow error:', err)
-                        );
+                        // Load the tenant's playbook, then greet. Without a
+                        // playbook there's nothing to say, so end gracefully.
+                        loadPlaybook(callParams.tenant_id)
+                            .then((loaded) => {
+                                if (!loaded) {
+                                    console.error(
+                                        `[start] no playbook for tenant ${callParams.tenant_id || '(none)'}; ending`
+                                    );
+                                    return endCallWithFarewell('error_limit');
+                                }
+                                cfg = loaded;
+                                return playGreeting();
+                            })
+                            .catch((err) => {
+                                console.error('[start] playbook load / greeting failed:', err);
+                                endCallWithFarewell('error_limit').catch(() => {});
+                            });
                         break;
                     case 'media':
                         processInboundFrame(data.media.payload);
