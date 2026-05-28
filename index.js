@@ -131,6 +131,15 @@ const HAI_PATTERNS = [
 ];
 let haiPatternIndex = 0; // reset on each new Twilio call (start event)
 
+// Re-prompt ("聞き返し") clips, played when VAD tripped on caller audio but
+// Whisper returned nothing intelligible. Rotated like the fillers so a second
+// ask doesn't sound robotic.
+const PARDON_PATTERNS = [
+    '22a_pardon.mp3', // 「恐れ入りますが、もう一度お願いできますでしょうか。」
+    '22b_pardon.mp3', // 「申し訳ございません、お電話が少し遠いようでして。もう一度お願いいたします。」
+];
+const MAX_REPROMPTS = 2; // ask to repeat this many times, then end the call
+
 // Transcript text persisted to Supabase when a clip is played
 const AUDIO_TEXTS = {
     greeting: 'お世話になっております。株式会社SENTEと申します。',
@@ -149,6 +158,8 @@ const AUDIO_TEXTS = {
     '16a_hai.mp3': 'はい。',
     '16b_hai.mp3': 'あっ、はい。',
     '16c_hai.mp3': 'そうですね。',
+    '22a_pardon.mp3': '恐れ入りますが、もう一度お願いできますでしょうか。',
+    '22b_pardon.mp3': '申し訳ございません、お電話が少し遠いようでして。もう一度お願いいたします。',
     kashikomarimashita: 'かしこまりました。',
     soudesuka: 'さようでございますか。',
     shoshomachi: '少々お待ちくださいませ。',
@@ -360,7 +371,7 @@ async function getAudioBuffer(keyOrFilename) {
 
 // Preload everything in the background so first calls are responsive.
 (async () => {
-    const targets = [...Object.keys(AUDIO_FILES), ...HAI_PATTERNS];
+    const targets = [...Object.keys(AUDIO_FILES), ...HAI_PATTERNS, ...PARDON_PATTERNS];
     console.log(`[preload] starting preload for ${targets.length} audio files`);
     const results = await Promise.allSettled(targets.map((t) => getAudioBuffer(t)));
     let ok = 0;
@@ -711,6 +722,12 @@ fastify.register(async (fastify) => {
         // Realtime fallback
         let realtimeWs = null;
         let lastUserTranscript = null;
+
+        // Re-prompt tracking. consecutiveEmpty counts back-to-back utterances
+        // that Whisper couldn't transcribe; it resets the moment we get real
+        // text. pardonIndex rotates the phrasing across PARDON_PATTERNS.
+        let consecutiveEmpty = 0;
+        let pardonIndex = 0;
 
         // VAD
         const VAD_RMS_THRESHOLD = 2000;
@@ -1187,18 +1204,41 @@ fastify.register(async (fastify) => {
             console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
 
             if (!transcript) {
-                console.log('Empty transcript, returning to LISTENING');
+                consecutiveEmpty++;
+                console.log(
+                    `Empty transcript (consecutiveEmpty=${consecutiveEmpty}/${MAX_REPROMPTS})`
+                );
                 await fillerPromise;
+                if (state === 'ENDED') return;
+
+                // Couldn't make out the caller too many times in a row (noise,
+                // dead air, no human). Stop asking and close gracefully rather
+                // than looping "もう一度お願いします" forever.
+                if (consecutiveEmpty > MAX_REPROMPTS) {
+                    console.log('[reprompt] exhausted; ending call with farewell');
+                    await endCallWithFarewell('silence_timeout');
+                    return;
+                }
+
+                // Ask the caller to repeat, rotating the phrasing so the
+                // second ask doesn't sound like a recording.
+                const pardonFilename =
+                    PARDON_PATTERNS[pardonIndex % PARDON_PATTERNS.length];
+                pardonIndex++;
+                state = 'PLAYING';
+                disableVad('playing pardon');
+                await playAudio(pardonFilename);
                 if (state === 'ENDED') return;
                 state = 'LISTENING';
                 lastSpeechAt = Date.now();
-                enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'empty transcript');
+                enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after pardon');
                 return;
             }
 
             console.log(`User said: "${transcript}"`);
             lastUserTranscript = transcript;
             lastSpeechAt = Date.now();
+            consecutiveEmpty = 0; // got real text — clear the re-prompt counter
             saveTranscript('user', transcript);
 
             // -----------------------------------------------------------------
@@ -1359,7 +1399,6 @@ fastify.register(async (fastify) => {
                     {
                         headers: {
                             Authorization: `Bearer ${OPENAI_API_KEY}`,
-                            'OpenAI-Beta': 'realtime=v1',
                         },
                     }
                 );
@@ -1384,20 +1423,24 @@ fastify.register(async (fastify) => {
                 const sessionUpdate = {
                     type: 'session.update',
                     session: {
-                        turn_detection: { type: 'server_vad' },
-                        input_audio_format: 'g711_ulaw',
-                        output_audio_format: 'g711_ulaw',
-                        voice: 'shimmer',
+                        type: 'realtime',
                         instructions: `${REALTIME_SYSTEM_MESSAGE}
 
 【今回の架電情報】会社: ${company} / 担当者: ${contact}
 【直前のお客様の発言】${lastUserTranscript || '（未取得）'}`,
-                        modalities: ['text', 'audio'],
-                        temperature: 0.8,
-                        input_audio_transcription: { model: 'whisper-1' },
-                        // gpt-realtime-2 reasoning effort. 'low' balances
-                        // latency and cost; raise to 'medium' if quality slips.
-                        reasoning: { effort: 'low' },
+                        output_modalities: ['audio'],
+                        audio: {
+                            input: {
+                                // Twilio media streams are G.711 μ-law (8kHz).
+                                format: { type: 'audio/pcmu' },
+                                turn_detection: { type: 'server_vad' },
+                                transcription: { model: 'whisper-1' },
+                            },
+                            output: {
+                                format: { type: 'audio/pcmu' },
+                                voice: 'shimmer',
+                            },
+                        },
                     },
                 };
                 realtimeWs.send(JSON.stringify(sessionUpdate));
@@ -1425,7 +1468,7 @@ fastify.register(async (fastify) => {
                 try {
                     const response = JSON.parse(data);
 
-                    if (response.type === 'response.audio.delta' && response.delta) {
+                    if (response.type === 'response.output_audio.delta' && response.delta) {
                         sendMedia(response.delta);
                         return;
                     }
@@ -1435,9 +1478,9 @@ fastify.register(async (fastify) => {
                         output.forEach((item) => {
                             if (item?.type === 'message' && item?.role === 'assistant') {
                                 item.content?.forEach((c) => {
-                                    if (c.type === 'audio' && c.transcript) {
+                                    if (c.type === 'output_audio' && c.transcript) {
                                         saveTranscript('assistant', c.transcript);
-                                    } else if (c.type === 'text' && c.text) {
+                                    } else if (c.type === 'output_text' && c.text) {
                                         saveTranscript('assistant', c.text);
                                     }
                                 });
