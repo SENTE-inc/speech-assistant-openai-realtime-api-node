@@ -663,9 +663,9 @@ const INTENT_TEMPLATE = [
         triggers: ['本日不在', '外出中で戻り未定', '只今不在', 'いません（戻り時間不明）'] },
     { name: 'rejected', audio_key: 'sorry_disturb', end_call: true, end_reason: 'rejected', sort_order: 9,
         triggers: ['必要ありません', '結構です', '間に合っています', 'すでに他社と契約', 'お断りします', '興味ないです', 'いりません'] },
-    { name: 'reprompt', audio_key: null, sort_order: 10,
+    { name: 'reprompt', action: 'reprompt', audio_key: null, sort_order: 10,
         triggers: ['雑音', '咳', 'もごもご', '語として成立しない音', '文字起こしの失敗'] },
-    { name: 'openai_realtime', audio_key: null, sort_order: 11,
+    { name: 'openai_realtime', action: 'openai_realtime', audio_key: null, sort_order: 11,
         triggers: ['意味は通じるが上記に無い質問・発言', '雑談', '反論'] },
 ];
 
@@ -742,7 +742,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
     if (clipErr) return reply.code(500).send({ error: `clips insert failed: ${clipErr.message}` });
 
     const intentRows = INTENT_TEMPLATE.map((i) => ({
-        playbook_id: playbookId, tenant_id, name: i.name, action: 'play_audio',
+        playbook_id: playbookId, tenant_id, name: i.name, action: i.action || 'play_audio',
         audio_key: i.audio_key, triggers: i.triggers, is_transfer: !!i.is_transfer,
         end_call: !!i.end_call, end_reason: i.end_reason ?? null,
         wants_callback_info: !!i.wants_callback_info, sort_order: i.sort_order, active: true,
