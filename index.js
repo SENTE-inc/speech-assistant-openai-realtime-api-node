@@ -610,6 +610,174 @@ fastify.get('/health', async (request, reply) => {
     };
 });
 
+// =====================================================================
+// Tenant playbook provisioning (self-serve onboarding)
+// ---------------------------------------------------------------------
+// Receives a tenant's script texts from the dashboard, (re)creates the
+// playbook + clips + intents, then synthesizes each clip with OpenAI TTS
+// and uploads it to the call-audio bucket. The per-tenant script only
+// varies the clip TEXT and a couple of playbook fields — the structure
+// (clip keys/types/filenames and the intent set) is fixed here so the
+// dashboard form stays simple. Protected by a shared secret header.
+// =====================================================================
+
+const PROVISION_SECRET = process.env.PROVISION_SECRET || '';
+const TTS_MODEL = process.env.TTS_MODEL || 'gpt-4o-mini-tts';
+
+// Structural template. `key` is the contract with the dashboard setup form,
+// which supplies the text for each key. Mirrors the proven demo/sente layout.
+const CLIP_TEMPLATE = [
+    { key: 'greeting',         clip_type: 'greeting', filename: '01_greeting.mp3',         sort_order: 1 },
+    { key: 'reason',           clip_type: 'response', filename: '04_reason.mp3',           sort_order: 2 },
+    { key: 'company',          clip_type: 'response', filename: '05_company.mp3',          sort_order: 3 },
+    { key: 'who',              clip_type: 'response', filename: '06_who.mp3',              sort_order: 4 },
+    { key: 'appointment',      clip_type: 'response', filename: '07_appointment.mp3',      sort_order: 5 },
+    { key: 'transfer_success', clip_type: 'response', filename: '09_transfer_success.mp3', sort_order: 6 },
+    { key: 'callback_request', clip_type: 'response', filename: '11_callback_request.mp3', sort_order: 7 },
+    { key: 'sorry_disturb',    clip_type: 'response', filename: '15_sorry_disturb.mp3',    sort_order: 8, suppress_farewell: true },
+    { key: '16a_hai',          clip_type: 'filler',   filename: '16a_hai.mp3',             sort_order: 9 },
+    { key: '16b_hai',          clip_type: 'filler',   filename: '16b_hai.mp3',             sort_order: 10 },
+    { key: '22a_pardon',       clip_type: 'pardon',   filename: '22a_pardon.mp3',          sort_order: 11 },
+    { key: '22b_pardon',       clip_type: 'pardon',   filename: '22b_pardon.mp3',          sort_order: 12 },
+    { key: 'farewell',         clip_type: 'farewell', filename: '21_farewell.mp3',         sort_order: 13 },
+];
+
+// Intent set + trigger phrases. Company-independent, so it's fixed here and
+// not exposed in the dashboard form. audio_key references CLIP_TEMPLATE keys.
+const INTENT_TEMPLATE = [
+    { name: 'transfer', audio_key: 'transfer_success', is_transfer: true, sort_order: 1,
+        triggers: ['お繋ぎします', '少々お待ち', '担当者に代わります', '私が担当です', '代表です', '私が代表です', '社長です', '興味があります', '詳しく聞かせてください', '担当に代わります', '前向きな反応・担当者本人が出た場合'] },
+    { name: 'reason', audio_key: 'reason', sort_order: 2,
+        triggers: ['どのようなご用件', '何のご用件', 'どういったご提案'] },
+    { name: 'company', audio_key: 'company', sort_order: 3,
+        triggers: ['どちらの会社', 'どこの会社', '会社名は'] },
+    { name: 'who', audio_key: 'who', sort_order: 4,
+        triggers: ['どなた様', 'お名前は', '担当者のお名前'] },
+    { name: 'appointment', audio_key: 'appointment', sort_order: 5,
+        triggers: ['アポイントは', 'お約束は', 'ご予約は'] },
+    { name: 'callback_request', audio_key: 'callback_request', sort_order: 6,
+        triggers: ['折り返しましょうか', '後ほど', 'またかけ直して'] },
+    { name: 'callback_scheduled', audio_key: 'callback_request', end_call: true, end_reason: 'callback_scheduled', wants_callback_info: true, sort_order: 7,
+        triggers: ['夕方には戻ります', '16時頃戻ります', '明日には戻ります', '担当者は不在だが戻り時間が明示されている'] },
+    { name: 'not_available', audio_key: 'sorry_disturb', end_call: true, end_reason: 'not_available', sort_order: 8,
+        triggers: ['本日不在', '外出中で戻り未定', '只今不在', 'いません（戻り時間不明）'] },
+    { name: 'rejected', audio_key: 'sorry_disturb', end_call: true, end_reason: 'rejected', sort_order: 9,
+        triggers: ['必要ありません', '結構です', '間に合っています', 'すでに他社と契約', 'お断りします', '興味ないです', 'いりません'] },
+    { name: 'reprompt', audio_key: null, sort_order: 10,
+        triggers: ['雑音', '咳', 'もごもご', '語として成立しない音', '文字起こしの失敗'] },
+    { name: 'openai_realtime', audio_key: null, sort_order: 11,
+        triggers: ['意味は通じるが上記に無い質問・発言', '雑談', '反論'] },
+];
+
+// Synthesize a single clip with OpenAI TTS, returning MP3 bytes.
+async function synthesizeClip(text, voice) {
+    const res = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: TTS_MODEL, voice, input: text, response_format: 'mp3' }),
+    });
+    if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`TTS ${res.status}: ${detail.slice(0, 200)}`);
+    }
+    return Buffer.from(await res.arrayBuffer());
+}
+
+fastify.post('/provision-playbook', async (request, reply) => {
+    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+        return reply.code(401).send({ error: 'unauthorized' });
+    }
+
+    const body = request.body || {};
+    const tenant_id = (body.tenant_id || '').trim();
+    const company_name = (body.company_name || '').trim();
+    const voice = (body.voice || 'shimmer').trim();
+    const clipTexts = body.clip_texts && typeof body.clip_texts === 'object' ? body.clip_texts : {};
+    if (!tenant_id || !company_name) {
+        return reply.code(400).send({ error: 'tenant_id and company_name are required' });
+    }
+
+    // Resolve the tenant (and its slug, used as the storage folder).
+    const { data: tenant, error: tErr } = await supabase
+        .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
+    if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
+    const base = (tenant.slug || '').trim();
+
+    const realtimeSystemMessage =
+        (typeof body.realtime_system_message === 'string' && body.realtime_system_message.trim()) ||
+        `あなたはプロの営業アシスタントです。必ず日本語で話してください。\n${company_name}の担当者です。\n簡潔に丁寧に対応してください。`;
+
+    // Find the tenant's active default playbook; update-in-place if it exists,
+    // otherwise create one. Either way we rebuild its clips and intents.
+    const { data: existing } = await supabase
+        .from('call_playbooks').select('id')
+        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true).maybeSingle();
+
+    let playbookId;
+    if (existing) {
+        playbookId = existing.id;
+        const { error: upErr } = await supabase.from('call_playbooks').update({
+            company_name, voice, audio_base_path: base,
+            realtime_system_message: realtimeSystemMessage, updated_at: new Date().toISOString(),
+        }).eq('id', playbookId);
+        if (upErr) return reply.code(500).send({ error: `playbook update failed: ${upErr.message}` });
+        await supabase.from('audio_clips').delete().eq('playbook_id', playbookId);
+        await supabase.from('call_intents').delete().eq('playbook_id', playbookId);
+    } else {
+        const { data: created, error: insErr } = await supabase.from('call_playbooks').insert({
+            tenant_id, name: 'default', company_name, voice, audio_base_path: base,
+            realtime_system_message: realtimeSystemMessage, is_active: true,
+        }).select('id').single();
+        if (insErr) return reply.code(500).send({ error: `playbook insert failed: ${insErr.message}` });
+        playbookId = created.id;
+    }
+
+    // Build and insert clip + intent rows from the templates.
+    const clipRows = CLIP_TEMPLATE.map((c) => ({
+        playbook_id: playbookId, tenant_id, key: c.key, clip_type: c.clip_type,
+        filename: c.filename, text: String(clipTexts[c.key] ?? '').trim(), source: 'tts',
+        suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
+    }));
+    const { error: clipErr } = await supabase.from('audio_clips').insert(clipRows);
+    if (clipErr) return reply.code(500).send({ error: `clips insert failed: ${clipErr.message}` });
+
+    const intentRows = INTENT_TEMPLATE.map((i) => ({
+        playbook_id: playbookId, tenant_id, name: i.name, action: 'play_audio',
+        audio_key: i.audio_key, triggers: i.triggers, is_transfer: !!i.is_transfer,
+        end_call: !!i.end_call, end_reason: i.end_reason ?? null,
+        wants_callback_info: !!i.wants_callback_info, sort_order: i.sort_order, active: true,
+    }));
+    const { error: intErr } = await supabase.from('call_intents').insert(intentRows);
+    if (intErr) return reply.code(500).send({ error: `intents insert failed: ${intErr.message}` });
+
+    // Synthesize each clip with text and upload it. Empty-text clips are skipped.
+    const results = [];
+    for (const c of clipRows) {
+        if (!c.text) { results.push({ key: c.key, status: 'skipped_no_text' }); continue; }
+        const path = base ? `${base}/${c.filename}` : c.filename;
+        try {
+            const buf = await synthesizeClip(c.text, voice);
+            const { error: upErr } = await supabase.storage
+                .from(AUDIO_BUCKET).upload(path, buf, { contentType: 'audio/mpeg', upsert: true });
+            if (upErr) throw new Error(upErr.message);
+            results.push({ key: c.key, status: 'ok', bytes: buf.length });
+        } catch (err) {
+            results.push({ key: c.key, status: 'failed', error: err.message });
+        }
+    }
+
+    // Bust the per-tenant playbook cache and this tenant's clip audio cache so
+    // the next call picks up the new script immediately.
+    playbookCache.delete(tenant_id);
+    for (const key of [...audioCache.keys()]) {
+        if (key === `${base}` || key.startsWith(`${base}/`)) audioCache.delete(key);
+    }
+
+    const failed = results.filter((r) => r.status === 'failed');
+    console.log(`[provision] tenant=${tenant_id} playbook=${playbookId} clips=${clipRows.length} failed=${failed.length}`);
+    return reply.send({ ok: failed.length === 0, playbook_id: playbookId, results });
+});
+
 fastify.all('/incoming-call', async (request, reply) => {
     const escXml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
     const company = escXml(decodeURIComponent(request.query.company || 'unknown'));
