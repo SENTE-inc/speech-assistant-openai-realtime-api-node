@@ -20,6 +20,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Blob } from 'node:buffer';
+import crypto from 'node:crypto';
 
 dotenv.config();
 
@@ -776,6 +777,149 @@ fastify.post('/provision-playbook', async (request, reply) => {
     const failed = results.filter((r) => r.status === 'failed');
     console.log(`[provision] tenant=${tenant_id} playbook=${playbookId} clips=${clipRows.length} failed=${failed.length}`);
     return reply.send({ ok: failed.length === 0, playbook_id: playbookId, results });
+});
+
+// =====================================================================
+// Call recording intake (Twilio RecordingStatusCallback)
+// ---------------------------------------------------------------------
+// The kick-call workflow starts every outbound call with Record=true +
+// RecordingChannels=dual, pointing RecordingStatusCallback here. On
+// "completed" we pull the dual-channel MP3 from Twilio, store it in the
+// private call-recordings bucket under the owning tenant's folder, write
+// a call_recordings row with the tenant's retention window, and only
+// then delete Twilio's copy. Auth is Twilio's own request signature.
+// =====================================================================
+
+const RECORDING_BUCKET = 'call-recordings';
+const DEFAULT_RECORDING_RETENTION_DAYS = 30;
+
+// Verify X-Twilio-Signature: HMAC-SHA1 over the callback URL plus the POST
+// params concatenated in key order, base64-encoded with the auth token.
+function isValidTwilioSignature(url, params, signature) {
+    if (!signature || !TWILIO_AUTH_TOKEN) return false;
+    const data = url + Object.keys(params).sort().map((k) => k + params[k]).join('');
+    const expected = crypto.createHmac('sha1', TWILIO_AUTH_TOKEN).update(Buffer.from(data, 'utf-8')).digest();
+    const given = Buffer.from(signature, 'base64');
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+// Delete recordings past their retention window: storage object first, then
+// the metadata row. Runs opportunistically after each intake and via the
+// secret-protected endpoint below (Railway sleeps, so no in-process timer).
+async function purgeExpiredRecordings() {
+    const { data: expired, error } = await supabase
+        .from('call_recordings')
+        .select('id, storage_path')
+        .lt('expires_at', new Date().toISOString())
+        .limit(100);
+    if (error) {
+        console.error('[recording] purge query failed:', error.message);
+        return { purged: 0 };
+    }
+    if (!expired?.length) return { purged: 0 };
+    const { error: rmErr } = await supabase.storage
+        .from(RECORDING_BUCKET)
+        .remove(expired.map((r) => r.storage_path));
+    if (rmErr) {
+        console.error('[recording] purge storage remove failed:', rmErr.message);
+        return { purged: 0 };
+    }
+    const { error: delErr } = await supabase
+        .from('call_recordings')
+        .delete()
+        .in('id', expired.map((r) => r.id));
+    if (delErr) console.error('[recording] purge row delete failed:', delErr.message);
+    console.log(`[recording] purged ${expired.length} expired recording(s)`);
+    return { purged: expired.length };
+}
+
+fastify.post('/recording-status', async (request, reply) => {
+    const params = request.body || {};
+    const url = `https://${request.headers.host}/recording-status`;
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        console.error('[recording] rejected callback with bad signature');
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+
+    const { CallSid, RecordingSid, RecordingUrl, RecordingStatus, RecordingDuration } = params;
+    console.log(`[recording] status=${RecordingStatus} call=${CallSid} sid=${RecordingSid}`);
+    if (RecordingStatus !== 'completed') return reply.send({ ok: true });
+
+    try {
+        // Owning session → tenant. The kick-call WF creates the session right
+        // after dialing, so it exists long before the recording completes.
+        const { data: session } = await supabase
+            .from('call_sessions')
+            .select('id, tenant_id')
+            .eq('call_sid', CallSid)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (!session?.tenant_id) {
+            // Leave Twilio's copy in place so the recording isn't lost.
+            console.error(`[recording] no session/tenant for call=${CallSid}, leaving recording on Twilio`);
+            return reply.send({ ok: false, reason: 'session not found' });
+        }
+
+        // Dual-channel MP3: one side of the conversation per channel.
+        const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+        const dl = await fetch(`${RecordingUrl}.mp3`, { headers: { Authorization: `Basic ${auth}` } });
+        if (!dl.ok) throw new Error(`recording download failed: ${dl.status}`);
+        const mp3 = Buffer.from(await dl.arrayBuffer());
+        if (mp3.length === 0) throw new Error('recording download was empty');
+
+        const storagePath = `${session.tenant_id}/${CallSid}.mp3`;
+        const { error: upErr } = await supabase.storage
+            .from(RECORDING_BUCKET)
+            .upload(storagePath, mp3, { contentType: 'audio/mpeg', upsert: true });
+        if (upErr) throw new Error(`storage upload failed: ${upErr.message}`);
+
+        // Retention is per tenant; null means keep forever.
+        const { data: tenant } = await supabase
+            .from('tenants')
+            .select('recording_retention_days')
+            .eq('id', session.tenant_id)
+            .single();
+        const days = tenant ? tenant.recording_retention_days : DEFAULT_RECORDING_RETENTION_DAYS;
+        const expiresAt = days == null ? null : new Date(Date.now() + days * 86_400_000).toISOString();
+
+        const { error: insErr } = await supabase.from('call_recordings').upsert({
+            tenant_id: session.tenant_id,
+            session_id: session.id,
+            call_sid: CallSid,
+            recording_sid: RecordingSid,
+            storage_path: storagePath,
+            duration_seconds: RecordingDuration ? parseInt(RecordingDuration, 10) : null,
+            expires_at: expiresAt,
+        }, { onConflict: 'call_sid' });
+        if (insErr) throw new Error(`call_recordings upsert failed: ${insErr.message}`);
+
+        // Only after our copy is safe do we delete Twilio's.
+        const delRes = await fetch(
+            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${RecordingSid}.json`,
+            { method: 'DELETE', headers: { Authorization: `Basic ${auth}` } },
+        );
+        if (!delRes.ok && delRes.status !== 404) {
+            console.error(`[recording] Twilio delete failed: ${delRes.status} (copy saved at ${storagePath})`);
+        }
+
+        console.log(`✓ [recording] saved ${storagePath} (${mp3.length} bytes, expires=${expiresAt || 'never'})`);
+        purgeExpiredRecordings().catch((e) => console.error('[recording] purge error:', e));
+        return reply.send({ ok: true });
+    } catch (err) {
+        // The recording stays on Twilio (we delete only after success), so a
+        // failed intake loses nothing — it can be re-fetched later.
+        console.error('[recording] intake failed:', err);
+        return reply.code(500).send({ error: String(err.message || err) });
+    }
+});
+
+// Manual/cron purge trigger, protected like /provision-playbook.
+fastify.post('/purge-recordings', async (request, reply) => {
+    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+        return reply.code(403).send({ error: 'forbidden' });
+    }
+    return reply.send(await purgeExpiredRecordings());
 });
 
 fastify.all('/incoming-call', async (request, reply) => {
