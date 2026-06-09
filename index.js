@@ -20,6 +20,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Blob } from 'node:buffer';
+import crypto from 'node:crypto';
 
 dotenv.config();
 
@@ -87,6 +88,15 @@ if (!OPENAI_API_KEY) {
 }
 if (!ANTHROPIC_API_KEY) {
     console.error('Missing ANTHROPIC_API_KEY');
+    process.exit(1);
+}
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.error('Missing SUPABASE_URL / SUPABASE_SERVICE_KEY');
+    process.exit(1);
+}
+if (!TWILIO_AUTH_TOKEN) {
+    // Required for webhook signature verification and recording intake.
+    console.error('Missing TWILIO_AUTH_TOKEN');
     process.exit(1);
 }
 
@@ -778,7 +788,189 @@ fastify.post('/provision-playbook', async (request, reply) => {
     return reply.send({ ok: failed.length === 0, playbook_id: playbookId, results });
 });
 
+// =====================================================================
+// Call recording intake (Twilio RecordingStatusCallback)
+// ---------------------------------------------------------------------
+// The kick-call workflow starts every outbound call with Record=true +
+// RecordingChannels=dual, pointing RecordingStatusCallback here. On
+// "completed" we pull the dual-channel MP3 from Twilio, store it in the
+// private call-recordings bucket under the owning tenant's folder, write
+// a call_recordings row with the tenant's retention window, and only
+// then delete Twilio's copy. Auth is Twilio's own request signature.
+// =====================================================================
+
+const RECORDING_BUCKET = 'call-recordings';
+const DEFAULT_RECORDING_RETENTION_DAYS = 30;
+
+// Verify X-Twilio-Signature: HMAC-SHA1 over the callback URL plus the POST
+// params concatenated in key order, base64-encoded with the auth token.
+function isValidTwilioSignature(url, params, signature) {
+    if (!signature || !TWILIO_AUTH_TOKEN) return false;
+    const data = url + Object.keys(params).sort().map((k) => k + params[k]).join('');
+    const expected = crypto.createHmac('sha1', TWILIO_AUTH_TOKEN).update(Buffer.from(data, 'utf-8')).digest();
+    const given = Buffer.from(signature, 'base64');
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+// Delete recordings past their retention window: storage object first, then
+// the metadata row. Runs opportunistically after each intake and via the
+// secret-protected endpoint below (Railway sleeps, so no in-process timer).
+async function purgeExpiredRecordings() {
+    const { data: expired, error } = await supabase
+        .from('call_recordings')
+        .select('id, storage_path')
+        .lt('expires_at', new Date().toISOString())
+        .limit(100);
+    if (error) {
+        console.error('[recording] purge query failed:', error.message);
+        return { purged: 0 };
+    }
+    if (!expired?.length) return { purged: 0 };
+    const { error: rmErr } = await supabase.storage
+        .from(RECORDING_BUCKET)
+        .remove(expired.map((r) => r.storage_path));
+    if (rmErr) {
+        console.error('[recording] purge storage remove failed:', rmErr.message);
+        return { purged: 0 };
+    }
+    const { error: delErr } = await supabase
+        .from('call_recordings')
+        .delete()
+        .in('id', expired.map((r) => r.id));
+    if (delErr) console.error('[recording] purge row delete failed:', delErr.message);
+    console.log(`[recording] purged ${expired.length} expired recording(s)`);
+    return { purged: expired.length };
+}
+
+fastify.post('/recording-status', async (request, reply) => {
+    const params = request.body || {};
+    const url = `https://${request.headers.host}/recording-status`;
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        console.error('[recording] rejected callback with bad signature');
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+
+    const { CallSid, RecordingSid, RecordingUrl, RecordingStatus, RecordingDuration } = params;
+    console.log(`[recording] status=${RecordingStatus} call=${CallSid} sid=${RecordingSid}`);
+    if (RecordingStatus !== 'completed') return reply.send({ ok: true });
+
+    try {
+        // Owning session → tenant. The kick-call WF creates the session right
+        // after dialing, so it exists long before the recording completes.
+        const { data: session } = await supabase
+            .from('call_sessions')
+            .select('id, tenant_id')
+            .eq('call_sid', CallSid)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (!session?.tenant_id) {
+            // Leave Twilio's copy in place so the recording isn't lost.
+            console.error(`[recording] no session/tenant for call=${CallSid}, leaving recording on Twilio`);
+            return reply.send({ ok: false, reason: 'session not found' });
+        }
+
+        // Dual-channel MP3: one side of the conversation per channel.
+        const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+        const dl = await fetch(`${RecordingUrl}.mp3`, { headers: { Authorization: `Basic ${auth}` } });
+        if (!dl.ok) throw new Error(`recording download failed: ${dl.status}`);
+        const mp3 = Buffer.from(await dl.arrayBuffer());
+        if (mp3.length === 0) throw new Error('recording download was empty');
+
+        const storagePath = `${session.tenant_id}/${CallSid}.mp3`;
+        const { error: upErr } = await supabase.storage
+            .from(RECORDING_BUCKET)
+            .upload(storagePath, mp3, { contentType: 'audio/mpeg', upsert: true });
+        if (upErr) throw new Error(`storage upload failed: ${upErr.message}`);
+
+        // Retention is per tenant; a missing row or NULL column falls back
+        // to the default window.
+        const { data: tenant } = await supabase
+            .from('tenants')
+            .select('recording_retention_days')
+            .eq('id', session.tenant_id)
+            .single();
+        const days = tenant?.recording_retention_days ?? DEFAULT_RECORDING_RETENTION_DAYS;
+        const expiresAt = new Date(Date.now() + days * 86_400_000).toISOString();
+
+        const { error: insErr } = await supabase.from('call_recordings').upsert({
+            tenant_id: session.tenant_id,
+            session_id: session.id,
+            call_sid: CallSid,
+            recording_sid: RecordingSid,
+            storage_path: storagePath,
+            duration_seconds: RecordingDuration ? parseInt(RecordingDuration, 10) : null,
+            expires_at: expiresAt,
+        }, { onConflict: 'call_sid' });
+        if (insErr) throw new Error(`call_recordings upsert failed: ${insErr.message}`);
+
+        // Only after our copy is safe do we delete Twilio's.
+        const delRes = await fetch(
+            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${RecordingSid}.json`,
+            { method: 'DELETE', headers: { Authorization: `Basic ${auth}` } },
+        );
+        if (!delRes.ok && delRes.status !== 404) {
+            console.error(`[recording] Twilio delete failed: ${delRes.status} (copy saved at ${storagePath})`);
+        }
+
+        console.log(`✓ [recording] saved ${storagePath} (${mp3.length} bytes, expires=${expiresAt || 'never'})`);
+        purgeExpiredRecordings().catch((e) => console.error('[recording] purge error:', e));
+        return reply.send({ ok: true });
+    } catch (err) {
+        // The recording stays on Twilio (we delete only after success), so a
+        // failed intake loses nothing — it can be re-fetched later.
+        console.error('[recording] intake failed:', err);
+        return reply.code(500).send({ error: String(err.message || err) });
+    }
+});
+
+// Manual/cron purge trigger, protected like /provision-playbook.
+fastify.post('/purge-recordings', async (request, reply) => {
+    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+        return reply.code(403).send({ error: 'forbidden' });
+    }
+    return reply.send(await purgeExpiredRecordings());
+});
+
+// ---------------------------------------------------------------------
+// Short-lived tokens bridging /incoming-call → /media-stream. The media
+// WS upgrade carries no X-Twilio-Signature, so the signed TwiML embeds a
+// one-time token via <Stream><Parameter>; Twilio echoes it back in the
+// 'start' event's customParameters, where we verify and consume it.
+// ---------------------------------------------------------------------
+const STREAM_TOKEN_TTL_MS = 5 * 60 * 1000;
+const streamTokens = new Map(); // token -> expiry epoch ms
+
+function issueStreamToken() {
+    // Opportunistic sweep so the map can't grow unbounded.
+    const now = Date.now();
+    for (const [t, exp] of streamTokens) {
+        if (exp < now) streamTokens.delete(t);
+    }
+    const token = crypto.randomBytes(16).toString('hex');
+    streamTokens.set(token, now + STREAM_TOKEN_TTL_MS);
+    return token;
+}
+
+function consumeStreamToken(token) {
+    if (!token) return false;
+    const exp = streamTokens.get(token);
+    if (exp === undefined) return false;
+    streamTokens.delete(token); // single use
+    return exp >= Date.now();
+}
+
 fastify.all('/incoming-call', async (request, reply) => {
+    // Same Twilio-signature gate as /recording-status. The kick-call WF
+    // passes call params in the query string, which Twilio includes in the
+    // signed URL; POST body params (if any) are appended per the spec.
+    const url = `https://${request.headers.host}${request.raw.url}`;
+    const params = request.method === 'POST' ? (request.body || {}) : {};
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        console.error('[incoming-call] rejected request with bad signature');
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+
     const escXml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
     const company = escXml(decodeURIComponent(request.query.company || 'unknown'));
     const contact = escXml(decodeURIComponent(request.query.contact || 'unknown'));
@@ -797,6 +989,7 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="agent_phone" value="${agent_phone}" />
             <Parameter name="agent_name" value="${agent_name}" />
             <Parameter name="tenant_id" value="${tenant_id}" />
+            <Parameter name="stream_token" value="${issueStreamToken()}" />
         </Stream>
     </Connect>
 </Response>`;
@@ -934,7 +1127,9 @@ fastify.register(async (fastify) => {
                 .from('call_sessions')
                 .select('id')
                 .eq('call_sid', callSid)
-                .single()
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle()
                 .then(({ data, error }) => {
                     console.log(
                         `[saveTranscript] session lookup callSid=${callSid} ` +
@@ -1736,9 +1931,18 @@ fastify.register(async (fastify) => {
                             '[start event] full data.start payload:',
                             JSON.stringify(data.start, null, 2)
                         );
+                        callParams = data.start.customParameters || {};
+                        // The WS upgrade itself is unauthenticated; only the
+                        // one-time token minted by /incoming-call (which IS
+                        // Twilio-signature-checked) proves this stream is ours.
+                        if (!consumeStreamToken(callParams.stream_token)) {
+                            console.error('[start event] invalid or expired stream_token; closing WS');
+                            connection.close();
+                            break;
+                        }
+                        delete callParams.stream_token;
                         streamSid = data.start.streamSid;
                         callSid = data.start.callSid || null;
-                        callParams = data.start.customParameters || {};
                         callParams.callSid = callSid;
                         callStartTime = Date.now();
                         vadEnabled = false;
@@ -1822,6 +2026,12 @@ fastify.register(async (fastify) => {
             console.log(`Twilio WS closed (endReason=${endReason || 'n/a'})`);
             state = 'ENDED';
             currentPlaybackToken = null;
+            // Release any playback awaiting a mark — Twilio will never send
+            // marks after the socket closes, and a stuck `await playAudio()`
+            // would otherwise hang endCallWithFarewell forever and skip the
+            // call_sessions result save.
+            for (const resolve of pendingMarks.values()) resolve();
+            pendingMarks.clear();
             disableVad('connection closed');
             if (timeoutInterval) {
                 clearInterval(timeoutInterval);
