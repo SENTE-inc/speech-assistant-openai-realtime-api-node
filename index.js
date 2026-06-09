@@ -874,14 +874,15 @@ fastify.post('/recording-status', async (request, reply) => {
             .upload(storagePath, mp3, { contentType: 'audio/mpeg', upsert: true });
         if (upErr) throw new Error(`storage upload failed: ${upErr.message}`);
 
-        // Retention is per tenant; null means keep forever.
+        // Retention is per tenant; a missing row or NULL column falls back
+        // to the default window.
         const { data: tenant } = await supabase
             .from('tenants')
             .select('recording_retention_days')
             .eq('id', session.tenant_id)
             .single();
-        const days = tenant ? tenant.recording_retention_days : DEFAULT_RECORDING_RETENTION_DAYS;
-        const expiresAt = days == null ? null : new Date(Date.now() + days * 86_400_000).toISOString();
+        const days = tenant?.recording_retention_days ?? DEFAULT_RECORDING_RETENTION_DAYS;
+        const expiresAt = new Date(Date.now() + days * 86_400_000).toISOString();
 
         const { error: insErr } = await supabase.from('call_recordings').upsert({
             tenant_id: session.tenant_id,
