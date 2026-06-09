@@ -1078,7 +1078,9 @@ fastify.register(async (fastify) => {
                 .from('call_sessions')
                 .select('id')
                 .eq('call_sid', callSid)
-                .single()
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle()
                 .then(({ data, error }) => {
                     console.log(
                         `[saveTranscript] session lookup callSid=${callSid} ` +
@@ -1966,6 +1968,12 @@ fastify.register(async (fastify) => {
             console.log(`Twilio WS closed (endReason=${endReason || 'n/a'})`);
             state = 'ENDED';
             currentPlaybackToken = null;
+            // Release any playback awaiting a mark — Twilio will never send
+            // marks after the socket closes, and a stuck `await playAudio()`
+            // would otherwise hang endCallWithFarewell forever and skip the
+            // call_sessions result save.
+            for (const resolve of pendingMarks.values()) resolve();
+            pendingMarks.clear();
             disableVad('connection closed');
             if (timeoutInterval) {
                 clearInterval(timeoutInterval);
