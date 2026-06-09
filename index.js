@@ -923,7 +923,45 @@ fastify.post('/purge-recordings', async (request, reply) => {
     return reply.send(await purgeExpiredRecordings());
 });
 
+// ---------------------------------------------------------------------
+// Short-lived tokens bridging /incoming-call → /media-stream. The media
+// WS upgrade carries no X-Twilio-Signature, so the signed TwiML embeds a
+// one-time token via <Stream><Parameter>; Twilio echoes it back in the
+// 'start' event's customParameters, where we verify and consume it.
+// ---------------------------------------------------------------------
+const STREAM_TOKEN_TTL_MS = 5 * 60 * 1000;
+const streamTokens = new Map(); // token -> expiry epoch ms
+
+function issueStreamToken() {
+    // Opportunistic sweep so the map can't grow unbounded.
+    const now = Date.now();
+    for (const [t, exp] of streamTokens) {
+        if (exp < now) streamTokens.delete(t);
+    }
+    const token = crypto.randomBytes(16).toString('hex');
+    streamTokens.set(token, now + STREAM_TOKEN_TTL_MS);
+    return token;
+}
+
+function consumeStreamToken(token) {
+    if (!token) return false;
+    const exp = streamTokens.get(token);
+    if (exp === undefined) return false;
+    streamTokens.delete(token); // single use
+    return exp >= Date.now();
+}
+
 fastify.all('/incoming-call', async (request, reply) => {
+    // Same Twilio-signature gate as /recording-status. The kick-call WF
+    // passes call params in the query string, which Twilio includes in the
+    // signed URL; POST body params (if any) are appended per the spec.
+    const url = `https://${request.headers.host}${request.raw.url}`;
+    const params = request.method === 'POST' ? (request.body || {}) : {};
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        console.error('[incoming-call] rejected request with bad signature');
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+
     const escXml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
     const company = escXml(decodeURIComponent(request.query.company || 'unknown'));
     const contact = escXml(decodeURIComponent(request.query.contact || 'unknown'));
@@ -942,6 +980,7 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="agent_phone" value="${agent_phone}" />
             <Parameter name="agent_name" value="${agent_name}" />
             <Parameter name="tenant_id" value="${tenant_id}" />
+            <Parameter name="stream_token" value="${issueStreamToken()}" />
         </Stream>
     </Connect>
 </Response>`;
@@ -1883,9 +1922,18 @@ fastify.register(async (fastify) => {
                             '[start event] full data.start payload:',
                             JSON.stringify(data.start, null, 2)
                         );
+                        callParams = data.start.customParameters || {};
+                        // The WS upgrade itself is unauthenticated; only the
+                        // one-time token minted by /incoming-call (which IS
+                        // Twilio-signature-checked) proves this stream is ours.
+                        if (!consumeStreamToken(callParams.stream_token)) {
+                            console.error('[start event] invalid or expired stream_token; closing WS');
+                            connection.close();
+                            break;
+                        }
+                        delete callParams.stream_token;
                         streamSid = data.start.streamSid;
                         callSid = data.start.callSid || null;
-                        callParams = data.start.customParameters || {};
                         callParams.callSid = callSid;
                         callStartTime = Date.now();
                         vadEnabled = false;
