@@ -90,6 +90,15 @@ if (!ANTHROPIC_API_KEY) {
     console.error('Missing ANTHROPIC_API_KEY');
     process.exit(1);
 }
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.error('Missing SUPABASE_URL / SUPABASE_SERVICE_KEY');
+    process.exit(1);
+}
+if (!TWILIO_AUTH_TOKEN) {
+    // Required for webhook signature verification and recording intake.
+    console.error('Missing TWILIO_AUTH_TOKEN');
+    process.exit(1);
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
