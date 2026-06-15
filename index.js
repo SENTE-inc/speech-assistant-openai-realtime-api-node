@@ -959,6 +959,34 @@ function consumeStreamToken(token) {
     streamTokens.delete(token); // single use
     return exp >= Date.now();
 }
+// Sample line spoken when previewing a voice in the dashboard. Short, neutral
+// sales greeting so the agent can judge tone without supplying their own text.
+const PREVIEW_SAMPLE_TEXT = 'お世話になっております。本日はお時間をいただきありがとうございます。';
+
+// Synthesize a one-off sample with OpenAI TTS so the dashboard can let agents
+// audition a voice before saving. Mirrors /provision-playbook's secret guard
+// and TTS call, but returns the MP3 bytes directly — nothing is stored.
+fastify.post('/preview-voice', async (request, reply) => {
+    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+        return reply.code(401).send({ error: 'unauthorized' });
+    }
+
+    const body = request.body || {};
+    const voice = (body.voice || 'shimmer').trim();
+    // Cap the text so a stray long input can't run up TTS cost; fall back to
+    // the built-in sample when none is supplied.
+    const text = (typeof body.text === 'string' && body.text.trim())
+        ? body.text.trim().slice(0, 300)
+        : PREVIEW_SAMPLE_TEXT;
+
+    try {
+        const buf = await synthesizeClip(text, voice);
+        return reply.type('audio/mpeg').send(buf);
+    } catch (err) {
+        console.error(`[preview-voice] voice=${voice} failed: ${err.message}`);
+        return reply.code(502).send({ error: `tts failed: ${err.message}` });
+    }
+});
 
 fastify.all('/incoming-call', async (request, reply) => {
     // Same Twilio-signature gate as /recording-status. The kick-call WF
