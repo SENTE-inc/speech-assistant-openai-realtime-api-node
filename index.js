@@ -932,6 +932,149 @@ fastify.post('/purge-recordings', async (request, reply) => {
     return reply.send(await purgeExpiredRecordings());
 });
 
+// =====================================================================
+// Outbound dialing (POST /kick-call) — moved from the n8n "Kick Call" WF
+// =====================================================================
+// SaaS backlog #2: the dashboard POSTs here instead of having n8n dial Twilio
+// directly, so per-tenant concurrency control + Twilio rate-limiting live
+// server-side and n8n's execution-concurrency cap is no longer the dialing
+// bottleneck (the old "架電中"-stuck root cause). Reuses the existing Twilio +
+// Supabase env — no new secrets, and it removes the hardcoded service key and
+// Twilio creds that used to sit inline in the n8n nodes. Same x-provision-secret
+// gate as /provision-playbook and /purge-recordings. This route waking the
+// container is itself the warm-up: by the time Twilio rings and connects back
+// to /incoming-call, the app is hot — so a persistent warmer is unnecessary.
+
+const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || '+18312734595';
+const TWILIO_STATUS_CALLBACK_URL =
+    process.env.TWILIO_STATUS_CALLBACK_URL ||
+    'https://sente-inc.app.n8n.cloud/webhook/twilio-status-callback';
+// Per-tenant ceiling on simultaneous in-flight calls (runaway backstop; tunable).
+const MAX_CONCURRENT_PER_TENANT = parseInt(process.env.MAX_CONCURRENT_PER_TENANT || '5', 10);
+const DIAL_SPACING_MS = parseInt(process.env.DIAL_SPACING_MS || '1100', 10); // Twilio ≈1 CPS/number
+
+async function placeOutboundCall(baseUrl, contact, ctx) {
+    const qs = new URLSearchParams({
+        company: contact.company_name || '',
+        contact: contact.contact_name || '',
+        phone: contact.phone_number,
+        agent_phone: ctx.agent_phone || '',
+        agent_name: ctx.agent_name || '',
+        tenant_id: ctx.tenant_id || '',
+    });
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    const form = new URLSearchParams({
+        To: contact.phone_number,
+        From: TWILIO_FROM_NUMBER,
+        Url: `${baseUrl}/incoming-call?${qs.toString()}`,
+        StatusCallback: TWILIO_STATUS_CALLBACK_URL,
+        StatusCallbackMethod: 'POST',
+        Record: 'true',
+        RecordingChannels: 'dual',
+        RecordingStatusCallback: `${baseUrl}/recording-status`,
+        RecordingStatusCallbackMethod: 'POST',
+    });
+    const res = await fetch(
+        `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
+        {
+            method: 'POST',
+            headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: form,
+        },
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Twilio calls.create ${res.status}: ${JSON.stringify(data)}`);
+    const callSid = data.sid;
+
+    // Session row first — /recording-status and the call flow look it up by call_sid.
+    const { error: sErr } = await supabase.from('call_sessions').insert({
+        phone_number: contact.phone_number,
+        company_name: contact.company_name || '',
+        contact_name: contact.contact_name || '',
+        call_sid: callSid,
+        status: 'calling',
+        script_phase: 'greeting',
+        tenant_id: ctx.tenant_id,
+    });
+    if (sErr) console.error('[kick-call] session insert failed:', sErr.message);
+
+    // Mark the contact so the next kick won't redial it.
+    const { error: cErr } = await supabase.from('contacts')
+        .update({ status: '架電中', last_called_at: new Date().toISOString() })
+        .eq('id', contact.id);
+    if (cErr) console.error('[kick-call] contact update failed:', cErr.message);
+
+    return callSid;
+}
+
+fastify.post('/kick-call', async (request, reply) => {
+    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+        return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const body = request.body || {};
+    const tenant_id = (body.tenant_id || '').trim();
+    if (!tenant_id) return reply.code(400).send({ error: 'tenant_id is required' });
+
+    const requested = Math.max(1, parseInt(body.concurrent_count ?? 1, 10) || 1);
+    const ctx = {
+        tenant_id,
+        agent_phone: body.agent_phone || '',
+        agent_name: body.agent_name || '',
+    };
+    const baseUrl = `https://${request.headers.host}`;
+
+    // Per-tenant concurrency: never exceed MAX_CONCURRENT_PER_TENANT in flight.
+    // In-flight is approximated by contacts still in '架電中' for this tenant
+    // (the StatusCallback handler moves them to a terminal status when done).
+    const { count: inFlight } = await supabase
+        .from('contacts')
+        .select('id', { count: 'exact', head: true })
+        .eq('tenant_id', tenant_id)
+        .eq('status', '架電中');
+    const slots = Math.max(0, MAX_CONCURRENT_PER_TENANT - (inFlight || 0));
+    const want = Math.min(requested, slots);
+    if (want <= 0) {
+        return reply.send({ ok: true, dialed: 0, reason: 'tenant at concurrency cap', in_flight: inFlight || 0 });
+    }
+
+    const { data: contacts, error } = await supabase
+        .from('contacts')
+        .select('id, company_name, contact_name, phone_number')
+        .eq('tenant_id', tenant_id)
+        .eq('status', '未架電')
+        .order('priority', { ascending: true })
+        .order('created_at', { ascending: true })
+        .limit(want);
+    if (error) return reply.code(500).send({ error: `contacts query failed: ${error.message}` });
+    if (!contacts || contacts.length === 0) {
+        return reply.send({ ok: true, dialed: 0, reason: 'no 未架電 contacts' });
+    }
+
+    const calls = [], errors = [];
+    for (let i = 0; i < contacts.length; i++) {
+        const c = contacts[i];
+        if (!c.phone_number) continue;
+        try {
+            const sid = await placeOutboundCall(baseUrl, c, ctx);
+            calls.push({ contact_id: c.id, call_sid: sid });
+            console.log(`[kick-call] dialed ${c.phone_number} (tenant=${tenant_id}, sid=${sid})`);
+        } catch (e) {
+            console.error(`[kick-call] dial failed for contact ${c.id}:`, e);
+            errors.push({ contact_id: c.id, error: String(e.message || e) });
+        }
+        // Stay under Twilio's ~1 call/sec per-number limit.
+        if (i < contacts.length - 1) await new Promise((r) => setTimeout(r, DIAL_SPACING_MS));
+    }
+    return reply.send({
+        ok: true,
+        dialed: calls.length,
+        failed: errors.length,
+        calls,
+        errors,
+        in_flight_before: inFlight || 0,
+    });
+});
+
 // ---------------------------------------------------------------------
 // Short-lived tokens bridging /incoming-call → /media-stream. The media
 // WS upgrade carries no X-Twilio-Signature, so the signed TwiML embeds a
