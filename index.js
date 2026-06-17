@@ -316,6 +316,9 @@ function buildClassifierPrompt(cfg) {
         `会話の直近の発言から最も当てはまる意図(intent)を1つだけ選んでください。\n\n` +
         `【意図の一覧（name: 該当する発言の例）】\n${lines.join('\n')}\n\n` +
         `判断のポイント:\n` +
+        `- transfer（取次）は最も慎重に判断する。相手が「自分が担当者／責任者だ」と明確に名乗った、担当者本人が電話口に出て前向きに話を聞く姿勢を示した、または「お繋ぎします／代わります」と取り次ぎを明言した場合のみ選ぶ。単なる相槌・あいさつ・聞き返し（例:「はい」だけ／「すいません」／「お待たせ」／「もしもし」）や曖昧な発話では絶対に transfer を選ばない。\n` +
+        `- 担当者がいない・不在を示す発言（「いません」「不在」「外出中」「席を外している」等）は not_available（戻り時間が明示されていれば callback_scheduled）。transfer ではない。\n` +
+        `- transfer かどうか確信が持てない場合は transfer を選ばない（聞き取れていなければ reprompt、意味は通じるが当てはまらなければ openai_realtime）。\n` +
         `- 聞き取れない・意味をなさない発話は "reprompt"。\n` +
         `- 意味は通じるが上記に当てはまらない発言は "openai_realtime"。\n` +
         `- 戻り時間など日時情報があれば callback_info に原文のまま記録。\n\n` +
@@ -656,7 +659,7 @@ const CLIP_TEMPLATE = [
 // not exposed in the dashboard form. audio_key references CLIP_TEMPLATE keys.
 const INTENT_TEMPLATE = [
     { name: 'transfer', audio_key: 'transfer_success', is_transfer: true, sort_order: 1,
-        triggers: ['お繋ぎします', '少々お待ち', '担当者に代わります', '私が担当です', '代表です', '私が代表です', '社長です', '興味があります', '詳しく聞かせてください', '担当に代わります', '前向きな反応・担当者本人が出た場合'] },
+        triggers: ['お繋ぎします', '少々お待ち', '担当者に代わります', '私が担当です', '代表です', '私が代表です', '社長です', '興味があります', '詳しく聞かせてください', '担当に代わります'] },
     { name: 'reason', audio_key: 'reason', sort_order: 2,
         triggers: ['どのようなご用件', '何のご用件', 'どういったご提案'] },
     { name: 'company', audio_key: 'company', sort_order: 3,
