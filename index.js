@@ -380,7 +380,12 @@ async function loadPlaybook(tenantId) {
     // Vocabulary hint for STT — biases gpt-4o-transcribe toward this tenant's
     // expected phrases so homophones (e.g. 代表/対象) resolve correctly.
     // Capped well under the model's ~244-token prompt budget.
-    const vocab = [...new Set(intents.flatMap((i) => (Array.isArray(i.triggers) ? i.triggers : [])))].join('、');
+    // Sample a couple of triggers per intent (not all of them) so the hint
+    // stays balanced across outcomes. Otherwise the transfer intent's long
+    // trigger list dominates and is then truncated at 240 chars, which both
+    // biases STT toward transfer phrases and drops the 不在/断り/折り返し
+    // keywords entirely — exactly the words we most need disambiguated.
+    const vocab = [...new Set(intents.flatMap((i) => (Array.isArray(i.triggers) ? i.triggers.slice(0, 2) : [])))].join('、');
     cfg.transcriptionPrompt =
         `日本語の法人向け営業電話です。会社名は${pb.company_name}。想定される発言: ${vocab}`.slice(0, 240);
 
