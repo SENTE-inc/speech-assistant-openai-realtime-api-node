@@ -946,9 +946,9 @@ fastify.post('/purge-recordings', async (request, reply) => {
 // to /incoming-call, the app is hot — so a persistent warmer is unnecessary.
 
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || '+18312734595';
-const TWILIO_STATUS_CALLBACK_URL =
-    process.env.TWILIO_STATUS_CALLBACK_URL ||
-    'https://sente-inc.app.n8n.cloud/webhook/twilio-status-callback';
+// Call-status callbacks now go to this server's own /call-status (was the n8n
+// OB handler). Set TWILIO_STATUS_CALLBACK_URL only to override the default.
+const TWILIO_STATUS_CALLBACK_URL = process.env.TWILIO_STATUS_CALLBACK_URL || '';
 // Per-tenant ceiling on simultaneous in-flight calls (runaway backstop; tunable).
 const MAX_CONCURRENT_PER_TENANT = parseInt(process.env.MAX_CONCURRENT_PER_TENANT || '5', 10);
 const DIAL_SPACING_MS = parseInt(process.env.DIAL_SPACING_MS || '1100', 10); // Twilio ≈1 CPS/number
@@ -967,7 +967,7 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         To: contact.phone_number,
         From: TWILIO_FROM_NUMBER,
         Url: `${baseUrl}/incoming-call?${qs.toString()}`,
-        StatusCallback: TWILIO_STATUS_CALLBACK_URL,
+        StatusCallback: TWILIO_STATUS_CALLBACK_URL || `${baseUrl}/call-status`,
         StatusCallbackMethod: 'POST',
         Record: 'true',
         RecordingChannels: 'dual',
@@ -1073,6 +1073,152 @@ fastify.post('/kick-call', async (request, reply) => {
         errors,
         in_flight_before: inFlight || 0,
     });
+});
+
+// =====================================================================
+// Call-status handler (POST /call-status) — moved from the n8n
+// "OB_Twilio StatusCallback Handler" WF
+// =====================================================================
+// Twilio posts the final call status here when a call ends. The old n8n chain
+// made the contact's 架電中→terminal reset the LAST step, behind transcript
+// fetch + Claude classification — so any failure there left the contact stuck
+// at 架電中 forever. Here the reset is done FIRST and unconditionally; Claude
+// enrichment (memo/next_call_date) is a best-effort follow-up that can fail
+// without stranding the contact. Removes the last hardcoded sb_secret from n8n.
+// Twilio-signature gated, like /recording-status.
+
+const CALL_STATUS_LABELS = {
+    completed: '架電済', 'no-answer': '不在', busy: '話し中', failed: '失敗', canceled: 'キャンセル',
+};
+// The session's rich result (set during the call) → contact label.
+const RESULT_STATUS_MAP = {
+    transferred: '取次済', completed: '架電済', callback_scheduled: '折り返し予定',
+    not_available: '不在', rejected: '断り', voicemail: '留守電',
+    silence_timeout: '無音切断', duration_timeout: '時間切れ',
+    loop_detected: 'ループ', error_limit: 'エラー',
+    'no-answer': '不在', busy: '話し中', failed: '失敗', canceled: 'キャンセル',
+};
+function priorityForResult(result) {
+    if (result === 'transferred' || result === 'callback_scheduled') return '高';
+    if (result === 'rejected' || result === 'voicemail') return '低';
+    return '中';
+}
+
+fastify.post('/call-status', async (request, reply) => {
+    const params = request.body || {};
+    const url = `https://${request.headers.host}/call-status`;
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        console.error('[call-status] rejected callback with bad signature');
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+
+    const callStatus = params.CallStatus || '';
+    const callSid = params.CallSid || '';
+    const duration = params.CallDuration ? parseInt(params.CallDuration, 10) : null;
+
+    // Twilio fires StatusCallback for terminal statuses only; ignore anything else.
+    if (!(callStatus in CALL_STATUS_LABELS)) {
+        return reply.send({ ok: true, ignored: callStatus });
+    }
+
+    try {
+        // (a) Stamp the session as ended — but never clobber a 'transferred' result.
+        await supabase.from('call_sessions')
+            .update({ result: callStatus, status: 'completed', ended_at: new Date().toISOString(), duration_seconds: duration })
+            .eq('call_sid', callSid)
+            .or('result.is.null,result.neq.transferred');
+
+        // (b) Resolve the owning session (tenant/contact/result).
+        const { data: session } = await supabase.from('call_sessions')
+            .select('id, company_name, contact_name, result, phone_number, tenant_id, metadata')
+            .eq('call_sid', callSid)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (!session) {
+            console.error(`[call-status] no session for call=${callSid}`);
+            return reply.send({ ok: false, reason: 'session not found' });
+        }
+
+        const result = session.result;
+        const contactStatus = RESULT_STATUS_MAP[result] || CALL_STATUS_LABELS[callStatus] || '不明';
+        const priority = priorityForResult(result);
+
+        // (c) CRITICAL reset — always move the contact off 架電中, even if the
+        // Claude enrichment below fails. This is the fix for the stuck-架電中 bug.
+        const { error: cErr } = await supabase.from('contacts')
+            .update({ status: contactStatus, priority, call_duration_seconds: duration, updated_at: new Date().toISOString() })
+            .eq('phone_number', session.phone_number)
+            .eq('tenant_id', session.tenant_id);
+        if (cErr) console.error('[call-status] contact reset failed:', cErr.message);
+        else console.log(`[call-status] contact ${session.phone_number} → ${contactStatus} (result=${result}, call=${callSid})`);
+
+        // (d) Best-effort enrichment: summarize the conversation for memo/next_call_date.
+        try {
+            const { data: transcripts } = await supabase.from('call_transcripts')
+                .select('role, content')
+                .eq('session_id', session.id)
+                .order('timestamp', { ascending: true });
+            const log = (transcripts && transcripts.length)
+                ? transcripts.map((t) => `${t.role}: ${t.content}`).join('\n')
+                : '(会話ログなし)';
+            const today = new Date().toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' });
+            const callbackInfo = JSON.stringify(session.metadata?.callback_info || null);
+            const prompt =
+`以下は営業電話の会話ログです。分析してJSON形式のみで返答してください。
+
+今日の日付：${today}
+会社名：${session.company_name || ''}
+担当者名：${session.contact_name || ''}
+通話結果：${result || ''}
+コールバック情報：${callbackInfo}
+
+会話ログ：
+${log}
+
+通話結果(result)の意味：
+- transferred: 担当者に転送成功（最高評価）
+- completed: 通話成立（中間評価）
+- callback_scheduled: 戻り時間あり、再架電希望
+- not_available: 担当者不在（戻り時間不明）
+- rejected: 断られた
+- voicemail: 留守番電話
+- silence_timeout / duration_timeout: タイムアウト
+- loop_detected / error_limit: 異常終了
+- no-answer / busy / failed / canceled: Twilio標準
+
+以下のJSONのみを返してください（他のテキスト不要）：
+{
+  "memo": "通話内容の要約（100文字以内、結果に応じた次回のヒントも含める）",
+  "priority": "高/中/低",
+  "next_call_date": "次回架電日（YYYY-MM-DD形式）。callback_scheduledの場合はコールバック情報から推測。rejectedは空文字。それ以外は3営業日後"
+}`;
+            const resp = await anthropic.messages.create({
+                model: 'claude-sonnet-4-6',
+                max_tokens: 1024,
+                messages: [{ role: 'user', content: prompt }],
+            });
+            const text = resp.content.find((b) => b.type === 'text')?.text || '';
+            let memo = '', nextCallDate = null;
+            try {
+                const parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```/g, '').trim());
+                memo = parsed.memo || '';
+                nextCallDate = parsed.next_call_date || null;
+            } catch { memo = text.substring(0, 100); }
+
+            await supabase.from('contacts')
+                .update({ memo, next_call_date: nextCallDate || null })
+                .eq('phone_number', session.phone_number)
+                .eq('tenant_id', session.tenant_id);
+        } catch (e) {
+            console.error('[call-status] enrichment failed (contact already reset):', e);
+        }
+
+        return reply.send({ ok: true, contact_status: contactStatus, result });
+    } catch (err) {
+        console.error('[call-status] failed:', err);
+        return reply.code(500).send({ error: String(err.message || err) });
+    }
 });
 
 // ---------------------------------------------------------------------
