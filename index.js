@@ -547,6 +547,58 @@ async function classifyWithClaude(transcript, ctx = {}, prompt) {
 }
 
 // =====================================================================
+// Deterministic transfer guard (review finding #12)
+// =====================================================================
+// The classifier prompt already says "only transfer on explicit evidence",
+// but that is prompt-only and can mis-fire on naked filler ("はい" / "お待たせ"
+// / "すいません" / "もしもし"). This is a hard, code-side gate applied right
+// before we actually hand the call to a human: it rejects very short /
+// filler-only utterances and requires explicit transfer-request OR
+// responsible-person evidence in the transcript. Conservative by design — when
+// in doubt it returns false so we reprompt instead of wrongly transferring.
+
+// Naked filler / acknowledgements that must NEVER, on their own, trigger a
+// transfer. Compared after stripping punctuation/whitespace.
+const TRANSFER_FILLER_ONLY = new Set([
+    'はい', 'はいはい', 'ええ', 'うん', 'もしもし', 'おまたせ', 'お待たせ',
+    'おまたせしました', 'お待たせしました', 'すいません', 'すみません',
+    'どうも', 'はいもしもし', 'はいどうも', 'えっと', 'あの', 'はーい',
+]);
+
+// Phrases that DO constitute explicit transfer / responsible-person evidence.
+// Kept in sync with the transfer intent triggers in INTENT_TEMPLATE plus the
+// "I am the person in charge" forms.
+const TRANSFER_EVIDENCE_PATTERNS = [
+    'お繋ぎ', 'おつなぎ', 'お繋ぎします', 'お繋ぎいたします',
+    '代わります', '代わり', '替わります', '担当に代わ', '担当者に代わ',
+    '担当です', '担当の', '私が担当', '責任者', '私が責任者',
+    '代表です', '私が代表', '代表の', '社長です', '社長の',
+    '本人です', '私です', '私が', '詳しく聞かせて', '詳しく聞きたい',
+    '興味があります', '興味あります', '聞かせてください', '聞きます',
+];
+
+function normalizeForTransferGuard(s) {
+    return (s || '')
+        .replace(/[\s、。，．！？!?・…ー「」『』（）()【】〜~]/g, '')
+        .trim();
+}
+
+// Returns true only when the transcript carries explicit transfer evidence and
+// is not just filler. Used as a hard gate before handleTransfer().
+function hasSufficientTransferEvidence(transcript) {
+    const norm = normalizeForTransferGuard(transcript);
+    // Too short to be a meaningful "put me through / I'm the person" statement.
+    if (norm.length < 4) return false;
+    // Pure filler / acknowledgement — never a transfer on its own.
+    if (TRANSFER_FILLER_ONLY.has(norm)) return false;
+    // Require at least one explicit evidence phrase in the ORIGINAL transcript
+    // (so punctuation inside a phrase doesn't matter much, but we keep the
+    // original to allow natural matching).
+    const hay = transcript || '';
+    return TRANSFER_EVIDENCE_PATTERNS.some((p) => hay.includes(p));
+}
+
+// =====================================================================
 // Twilio REST: hand off the live call to a human agent
 // =====================================================================
 
@@ -614,17 +666,17 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
+// Public liveness endpoints. Kept intentionally minimal — no architecture
+// details, build info, env, or tenant data — so they leak nothing to an
+// unauthenticated caller while still serving uptime checks / load balancers.
 fastify.get('/', async (_req, reply) => {
-    reply.send({
-        message: 'Twilio Media Stream Server (hybrid: recordings + realtime fallback)',
-    });
+    reply.send({ status: 'ok' });
 });
 
-fastify.get('/health', async (request, reply) => {
+fastify.get('/health', async (_request, reply) => {
     return {
         status: 'ok',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
+        uptime: Math.round(process.uptime()),
     };
 });
 
@@ -641,6 +693,19 @@ fastify.get('/health', async (request, reply) => {
 
 const PROVISION_SECRET = process.env.PROVISION_SECRET || '';
 const TTS_MODEL = process.env.TTS_MODEL || 'gpt-4o-mini-tts';
+
+// Constant-time verification of the x-provision-secret header. Fails closed
+// when PROVISION_SECRET is unset/empty. Both sides are SHA-256-hashed to a
+// fixed length before timingSafeEqual so the comparison is always over
+// equal-length buffers (never throws) and never leaks the secret's length.
+function verifyProvisionSecret(req) {
+    if (!PROVISION_SECRET) return false; // fail closed if not configured
+    const provided = req.headers['x-provision-secret'];
+    if (typeof provided !== 'string' || provided.length === 0) return false;
+    const a = crypto.createHash('sha256').update(provided, 'utf-8').digest();
+    const b = crypto.createHash('sha256').update(PROVISION_SECRET, 'utf-8').digest();
+    return crypto.timingSafeEqual(a, b);
+}
 
 // Structural template. `key` is the contract with the dashboard setup form,
 // which supplies the text for each key. Mirrors the proven demo/sente layout.
@@ -702,11 +767,14 @@ async function synthesizeClip(text, voice) {
 }
 
 fastify.post('/provision-playbook', async (request, reply) => {
-    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+    if (!verifyProvisionSecret(request)) {
         return reply.code(401).send({ error: 'unauthorized' });
     }
 
     const body = request.body || {};
+    // TODO(security): bind to per-tenant principal; do not trust body tenant_id
+    // from a shared secret. Anyone holding PROVISION_SECRET can act on any
+    // tenant_id today — a per-tenant JWT/principal is the proper fix.
     const tenant_id = (body.tenant_id || '').trim();
     const company_name = (body.company_name || '').trim();
     const voice = (body.voice || 'shimmer').trim();
@@ -858,7 +926,7 @@ fastify.post('/recording-status', async (request, reply) => {
         return reply.code(403).send({ error: 'invalid signature' });
     }
 
-    const { CallSid, RecordingSid, RecordingUrl, RecordingStatus, RecordingDuration } = params;
+    const { CallSid, RecordingSid, RecordingStatus, RecordingDuration } = params;
     console.log(`[recording] status=${RecordingStatus} call=${CallSid} sid=${RecordingSid}`);
     if (RecordingStatus !== 'completed') return reply.send({ ok: true });
 
@@ -879,8 +947,18 @@ fastify.post('/recording-status', async (request, reply) => {
         }
 
         // Dual-channel MP3: one side of the conversation per channel.
+        // SSRF guard: construct the download URL from trusted ids
+        // (TWILIO_ACCOUNT_SID + the validated RecordingSid) rather than
+        // trusting the webhook-supplied RecordingUrl, which an attacker could
+        // point elsewhere. The Twilio signature is already verified above; this
+        // makes the fetch target non-spoofable regardless.
+        if (!RecordingSid || !/^RE[0-9a-fA-F]{32}$/.test(RecordingSid)) {
+            throw new Error(`invalid RecordingSid: ${RecordingSid}`);
+        }
         const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
-        const dl = await fetch(`${RecordingUrl}.mp3`, { headers: { Authorization: `Basic ${auth}` } });
+        const recordingUrl =
+            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${RecordingSid}.mp3`;
+        const dl = await fetch(recordingUrl, { headers: { Authorization: `Basic ${auth}` } });
         if (!dl.ok) throw new Error(`recording download failed: ${dl.status}`);
         const mp3 = Buffer.from(await dl.arrayBuffer());
         if (mp3.length === 0) throw new Error('recording download was empty');
@@ -934,7 +1012,7 @@ fastify.post('/recording-status', async (request, reply) => {
 
 // Manual/cron purge trigger, protected like /provision-playbook.
 fastify.post('/purge-recordings', async (request, reply) => {
-    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+    if (!verifyProvisionSecret(request)) {
         return reply.code(403).send({ error: 'forbidden' });
     }
     return reply.send(await purgeExpiredRecordings());
@@ -982,44 +1060,66 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         RecordingStatusCallback: `${baseUrl}/recording-status`,
         RecordingStatusCallbackMethod: 'POST',
     });
-    const res = await fetch(
-        `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
-        {
-            method: 'POST',
-            headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: form,
-        },
-    );
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`Twilio calls.create ${res.status}: ${JSON.stringify(data)}`);
-    const callSid = data.sid;
 
-    // Session row first — /recording-status and the call flow look it up by call_sid.
-    const { error: sErr } = await supabase.from('call_sessions').insert({
+    // Make the local session durable BEFORE dialing so a fast status/recording
+    // callback can never hit "session not found". We create the row with a
+    // synthetic provisional call_sid (no Twilio sid yet), then patch in the
+    // real sid once Twilio returns. If the dial fails the provisional row is
+    // deleted, so callbacks never see a stranded pending session.
+    const provisionalSid = `pending-${crypto.randomBytes(12).toString('hex')}`;
+    const { data: sessionRow, error: sInsErr } = await supabase.from('call_sessions').insert({
         phone_number: contact.phone_number,
         company_name: contact.company_name || '',
         contact_name: contact.contact_name || '',
-        call_sid: callSid,
-        status: 'calling',
+        call_sid: provisionalSid,
+        status: 'pending',
         script_phase: 'greeting',
         tenant_id: ctx.tenant_id,
-    });
-    if (sErr) console.error('[kick-call] session insert failed:', sErr.message);
+    }).select('id').single();
+    if (sInsErr) {
+        // If we can't create the session row we must not dial — a dial without
+        // a durable session would strand the recording/status callbacks.
+        throw new Error(`session pre-insert failed: ${sInsErr.message}`);
+    }
 
-    // Mark the contact so the next kick won't redial it.
-    const { error: cErr } = await supabase.from('contacts')
-        .update({ status: '架電中', last_called_at: new Date().toISOString() })
-        .eq('id', contact.id);
-    if (cErr) console.error('[kick-call] contact update failed:', cErr.message);
+    let callSid;
+    try {
+        const res = await fetch(
+            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
+            {
+                method: 'POST',
+                headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: form,
+            },
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(`Twilio calls.create ${res.status}: ${JSON.stringify(data)}`);
+        callSid = data.sid;
+    } catch (e) {
+        // Dial failed — discard the provisional session so it can't be picked
+        // up by a stray callback, then propagate so the caller reverts the
+        // contact claim.
+        await supabase.from('call_sessions').delete().eq('id', sessionRow.id);
+        throw e;
+    }
+
+    // Patch the real Twilio sid + calling status into the pre-created row.
+    const { error: sPatchErr } = await supabase.from('call_sessions')
+        .update({ call_sid: callSid, status: 'calling' })
+        .eq('id', sessionRow.id);
+    if (sPatchErr) console.error('[kick-call] session call_sid patch failed:', sPatchErr.message);
 
     return callSid;
 }
 
 fastify.post('/kick-call', async (request, reply) => {
-    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+    if (!verifyProvisionSecret(request)) {
         return reply.code(401).send({ error: 'unauthorized' });
     }
     const body = request.body || {};
+    // TODO(security): bind to per-tenant principal; do not trust body tenant_id
+    // from a shared secret. Anyone holding PROVISION_SECRET can dial on behalf
+    // of any tenant today — a per-tenant JWT/principal is the proper fix.
     const tenant_id = (body.tenant_id || '').trim();
     if (!tenant_id) return reply.code(400).send({ error: 'tenant_id is required' });
 
@@ -1045,17 +1145,49 @@ fastify.post('/kick-call', async (request, reply) => {
         return reply.send({ ok: true, dialed: 0, reason: 'tenant at concurrency cap', in_flight: inFlight || 0 });
     }
 
-    const { data: contacts, error } = await supabase
+    // Pick candidate 未架電 contacts ordered by priority/age. We over-select a
+    // little (want * 2, capped) so that if a concurrent kick claims some rows
+    // out from under us we still have alternates to fill our slots.
+    const CANDIDATE_OVERSELECT = Math.min(want * 2, want + 20);
+    const { data: candidates, error } = await supabase
         .from('contacts')
         .select('id, company_name, contact_name, phone_number')
         .eq('tenant_id', tenant_id)
         .eq('status', '未架電')
         .order('priority', { ascending: true })
         .order('created_at', { ascending: true })
-        .limit(want);
+        .limit(CANDIDATE_OVERSELECT);
     if (error) return reply.code(500).send({ error: `contacts query failed: ${error.message}` });
-    if (!contacts || contacts.length === 0) {
+    if (!candidates || candidates.length === 0) {
         return reply.send({ ok: true, dialed: 0, reason: 'no 未架電 contacts' });
+    }
+
+    // Atomically CLAIM up to `want` contacts before dialing: conditional update
+    // 未架電 -> 架電中 returning only the rows we actually won. Concurrent kicks
+    // racing on the same rows will each only get the subset they flipped, so we
+    // can never dial the same contact twice or exceed the cap. (A Postgres RPC
+    // with FOR UPDATE SKIP LOCKED would be even tighter, see
+    // scripts/sql/claim_contacts.sql, but this conditional-update claim is
+    // race-safe with the current schema and needs no migration.)
+    const candidateIds = candidates
+        .filter((c) => c.phone_number)
+        .slice(0, want)
+        .map((c) => c.id);
+    if (candidateIds.length === 0) {
+        return reply.send({ ok: true, dialed: 0, reason: 'no dialable 未架電 contacts' });
+    }
+    const nowIso = new Date().toISOString();
+    const { data: claimed, error: claimErr } = await supabase
+        .from('contacts')
+        .update({ status: '架電中', last_called_at: nowIso, updated_at: nowIso })
+        .eq('tenant_id', tenant_id)
+        .eq('status', '未架電')
+        .in('id', candidateIds)
+        .select('id, company_name, contact_name, phone_number');
+    if (claimErr) return reply.code(500).send({ error: `contact claim failed: ${claimErr.message}` });
+    const contacts = claimed || [];
+    if (contacts.length === 0) {
+        return reply.send({ ok: true, dialed: 0, reason: 'all candidates claimed by a concurrent kick' });
     }
 
     const calls = [], errors = [];
@@ -1069,6 +1201,15 @@ fastify.post('/kick-call', async (request, reply) => {
         } catch (e) {
             console.error(`[kick-call] dial failed for contact ${c.id}:`, e);
             errors.push({ contact_id: c.id, error: String(e.message || e) });
+            // Dial (or session pre-insert) failed for a claimed contact —
+            // revert it to 未架電 so it isn't stranded at 架電中.
+            const { error: revErr } = await supabase
+                .from('contacts')
+                .update({ status: '未架電', updated_at: new Date().toISOString() })
+                .eq('id', c.id)
+                .eq('tenant_id', tenant_id)
+                .eq('status', '架電中');
+            if (revErr) console.error(`[kick-call] revert claim failed for contact ${c.id}:`, revErr.message);
         }
         // Stay under Twilio's ~1 call/sec per-number limit.
         if (i < contacts.length - 1) await new Promise((r) => setTimeout(r, DIAL_SPACING_MS));
@@ -1130,13 +1271,28 @@ fastify.post('/call-status', async (request, reply) => {
     }
 
     try {
-        // (a) Stamp the session as ended — but never clobber a 'transferred' result.
+        // (a) Stamp the session as ended. CRITICAL: only write the Twilio
+        // CallStatus into `result` when the session has NO in-call result yet
+        // (result IS NULL). The in-call flow sets rich semantic results —
+        // transferred / callback_scheduled / not_available / rejected /
+        // voicemail / silence_timeout / duration_timeout / loop_detected /
+        // error_limit — and Twilio's terminal "completed" must NEVER clobber
+        // them (that's the bug that reset 取次済/折り返し予定/etc. back to
+        // 架電済). status/ended_at/duration are always stamped; only `result`
+        // is conditional.
         await supabase.from('call_sessions')
-            .update({ result: callStatus, status: 'completed', ended_at: new Date().toISOString(), duration_seconds: duration })
+            .update({ status: 'completed', ended_at: new Date().toISOString(), duration_seconds: duration })
+            .eq('call_sid', callSid);
+        // Fill result ONLY if still null (i.e. the call never reached the
+        // in-call classifier — no-answer / busy / failed / etc.).
+        await supabase.from('call_sessions')
+            .update({ result: callStatus })
             .eq('call_sid', callSid)
-            .or('result.is.null,result.neq.transferred');
+            .is('result', null);
 
-        // (b) Resolve the owning session (tenant/contact/result).
+        // (b) Resolve the owning session (tenant/contact/result) — read back the
+        // PRESERVED result so the contact's terminal label is derived from the
+        // rich in-call result, not blindly from Twilio's CallStatus.
         const { data: session } = await supabase.from('call_sessions')
             .select('id, company_name, contact_name, result, phone_number, tenant_id, metadata')
             .eq('call_sid', callSid)
@@ -1148,8 +1304,14 @@ fastify.post('/call-status', async (request, reply) => {
             return reply.send({ ok: false, reason: 'session not found' });
         }
 
+        // Derive the contact's terminal status from the PRESERVED session
+        // result first (rich, set in-call), then fall back to the Twilio
+        // CallStatus label only when there is no in-call result. Either way
+        // the contact is moved off 架電中 (the reset-first guarantee).
         const result = session.result;
-        const contactStatus = RESULT_STATUS_MAP[result] || CALL_STATUS_LABELS[callStatus] || '不明';
+        const contactStatus = RESULT_STATUS_MAP[result]
+            || CALL_STATUS_LABELS[callStatus]
+            || '不明';
         const priority = priorityForResult(result);
 
         // (c) CRITICAL reset — always move the contact off 架電中, even if the
@@ -1238,6 +1400,14 @@ ${log}
 const STREAM_TOKEN_TTL_MS = 5 * 60 * 1000;
 const streamTokens = new Map(); // token -> expiry epoch ms
 
+// A media-stream WS is only authenticated once it sends a valid 'start' with a
+// good one-time stream_token. Until then it's "unauthenticated": we bound how
+// long such a socket may idle (pre-auth timeout) and how many may exist at once
+// so an attacker can't open sockets and sit on them to exhaust resources.
+const WS_PREAUTH_TIMEOUT_MS = parseInt(process.env.WS_PREAUTH_TIMEOUT_MS || '5000', 10);
+const MAX_UNAUTH_WS = parseInt(process.env.MAX_UNAUTH_WS || '50', 10);
+let unauthWsCount = 0;
+
 function issueStreamToken() {
     // Opportunistic sweep so the map can't grow unbounded.
     const now = Date.now();
@@ -1264,7 +1434,7 @@ const PREVIEW_SAMPLE_TEXT = 'お世話になっております。本日はお時
 // audition a voice before saving. Mirrors /provision-playbook's secret guard
 // and TTS call, but returns the MP3 bytes directly — nothing is stored.
 fastify.post('/preview-voice', async (request, reply) => {
-    if (!PROVISION_SECRET || request.headers['x-provision-secret'] !== PROVISION_SECRET) {
+    if (!verifyProvisionSecret(request)) {
         return reply.code(401).send({ error: 'unauthorized' });
     }
 
@@ -1328,6 +1498,45 @@ fastify.all('/incoming-call', async (request, reply) => {
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
         console.log('▶ Twilio client connected');
+
+        // --- Pre-auth gate (review finding #6) ---------------------------
+        // The WS upgrade itself carries no Twilio signature; a socket is only
+        // trusted once it sends a valid 'start' with a good one-time
+        // stream_token. Cap concurrent unauthenticated sockets and close any
+        // that don't authenticate within WS_PREAUTH_TIMEOUT_MS so an attacker
+        // can't connect and idle to exhaust resources.
+        let authenticated = false;
+        if (unauthWsCount >= MAX_UNAUTH_WS) {
+            console.error(
+                `[media-stream] too many unauthenticated sockets (${unauthWsCount} ≥ ${MAX_UNAUTH_WS}); refusing`
+            );
+            try { connection.close(); } catch (_) {}
+            return;
+        }
+        unauthWsCount++;
+        let preAuthTimer = setTimeout(() => {
+            preAuthTimer = null;
+            if (!authenticated) {
+                console.error(
+                    `[media-stream] no valid start within ${WS_PREAUTH_TIMEOUT_MS}ms; closing unauthenticated socket`
+                );
+                try { connection.close(); } catch (_) {}
+            }
+        }, WS_PREAUTH_TIMEOUT_MS);
+        const clearPreAuth = () => {
+            if (preAuthTimer) {
+                clearTimeout(preAuthTimer);
+                preAuthTimer = null;
+            }
+        };
+        // Decrement the unauthenticated-socket counter exactly once per socket,
+        // whether the socket authenticated, was rejected, or just closed.
+        let slotReleased = false;
+        const releaseUnauthSlot = () => {
+            if (slotReleased) return;
+            slotReleased = true;
+            if (unauthWsCount > 0) unauthWsCount--;
+        };
 
         // Identity
         let streamSid = null;
@@ -1464,7 +1673,7 @@ fastify.register(async (fastify) => {
                         console.error('[saveTranscript] Session lookup failed:', error);
                         return;
                     }
-                    supabase
+                    return supabase
                         .from('call_transcripts')
                         .insert({
                             session_id: data.id,
@@ -1483,6 +1692,12 @@ fastify.register(async (fastify) => {
                                 );
                             }
                         });
+                })
+                // Terminal catch: saveTranscript is fire-and-forget, so without
+                // this a thrown/rejected query would surface as an unhandled
+                // promise rejection and could crash the process.
+                .catch((err) => {
+                    console.error(`[saveTranscript] unexpected error callSid=${callSid}:`, err);
                 });
         };
 
@@ -1550,8 +1765,31 @@ fastify.register(async (fastify) => {
             }
 
             const markName = `mark-${token}`;
+            // Await the Twilio mark, but never hang forever if the mark never
+            // arrives (socket stalled / Twilio dropped it). Time out after the
+            // clip's playback duration (8kHz mulaw = 1 byte/sample → ms =
+            // bytes/8) plus a generous margin, then resolve and continue so the
+            // call can still end/advance instead of wedging on this await.
+            const clipDurationMs = Math.ceil(mulaw.length / 8);
+            const markTimeoutMs = clipDurationMs + 5000;
             await new Promise((resolve) => {
-                pendingMarks.set(markName, resolve);
+                let done = false;
+                const finish = () => {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
+                    pendingMarks.delete(markName);
+                    resolve();
+                };
+                const timer = setTimeout(() => {
+                    if (done) return;
+                    console.warn(
+                        `[playAudio] mark "${markName}" timed out after ${markTimeoutMs}ms ` +
+                            `(clip=${key}); continuing without it`
+                    );
+                    finish();
+                }, markTimeoutMs);
+                pendingMarks.set(markName, finish);
                 sendMark(markName);
             });
 
@@ -1975,6 +2213,25 @@ fastify.register(async (fastify) => {
                 return;
             }
 
+            // ---------------------------------------------------------------
+            // DETERMINISTIC TRANSFER GUARD (finding #12). Even if Claude said
+            // "transfer", refuse to hand off on naked filler / acknowledgements
+            // or when there's no explicit transfer-request / responsible-person
+            // evidence in the transcript. Reprompt instead — far cheaper to ask
+            // again than to wrongly connect a human to a non-decision-maker.
+            // (classifier_error already ends the call above, so a classifier
+            // failure never reaches here as a transfer = defaults to NON-
+            // transfer.)
+            // ---------------------------------------------------------------
+            if (intent.is_transfer && !hasSufficientTransferEvidence(transcript)) {
+                console.log(
+                    `[transfer-guard] blocked transfer on insufficient evidence ` +
+                        `(transcript="${transcript}"); reprompting instead`
+                );
+                await repromptOrEnd();
+                return;
+            }
+
             // B-1 — Loop detection on Claude's decisions. Record FIRST so we
             // still play the current clip before ending.
             const looped = recordClaudeDecision(intent.audio_key);
@@ -2050,7 +2307,18 @@ fastify.register(async (fastify) => {
                 return;
             }
 
-            realtimeWs.on('open', () => {
+            const rtWs = realtimeWs; // capture so handlers can detect teardown
+
+            rtWs.on('open', () => {
+                // Guard: if the call ended (or this socket was torn down /
+                // replaced) while we were still CONNECTING, don't start
+                // streaming into a dead call — just drop the upstream.
+                if (state === 'ENDED' || realtimeWs !== rtWs) {
+                    console.log('[realtime] opened after call end/teardown; closing upstream');
+                    try { rtWs.removeAllListeners(); } catch (_) {}
+                    try { rtWs.terminate(); } catch (_) {}
+                    return;
+                }
                 realtimeOpened = true;
                 console.log('Realtime WS opened');
                 const company =
@@ -2085,12 +2353,12 @@ fastify.register(async (fastify) => {
                         },
                     },
                 };
-                realtimeWs.send(JSON.stringify(sessionUpdate));
+                rtWs.send(JSON.stringify(sessionUpdate));
 
                 // Seed conversation with the most recent user message so
                 // Realtime answers it immediately.
                 if (lastUserTranscript) {
-                    realtimeWs.send(
+                    rtWs.send(
                         JSON.stringify({
                             type: 'conversation.item.create',
                             item: {
@@ -2102,11 +2370,14 @@ fastify.register(async (fastify) => {
                             },
                         })
                     );
-                    realtimeWs.send(JSON.stringify({ type: 'response.create' }));
+                    rtWs.send(JSON.stringify({ type: 'response.create' }));
                 }
             });
 
-            realtimeWs.on('message', (data) => {
+            rtWs.on('message', (data) => {
+                // Guard: ignore anything that arrives after the call ended or
+                // this socket was torn down/replaced.
+                if (state === 'ENDED' || realtimeWs !== rtWs) return;
                 try {
                     const response = JSON.parse(data);
 
@@ -2152,8 +2423,10 @@ fastify.register(async (fastify) => {
             // before we ever saw 'open', treat it as a connection failure
             // and end the call gracefully instead of leaving the caller in
             // silence. Post-open errors/close are non-fatal (logged only).
-            realtimeWs.on('error', (err) => {
+            rtWs.on('error', (err) => {
                 console.error('Realtime WS error:', err);
+                // Ignore errors from a torn-down/replaced socket.
+                if (realtimeWs !== rtWs) return;
                 if (!realtimeOpened && state === 'REALTIME') {
                     console.log('[realtime] never opened; treating as connection failure');
                     endCallWithFarewell('error_limit').catch((e) =>
@@ -2161,8 +2434,10 @@ fastify.register(async (fastify) => {
                     );
                 }
             });
-            realtimeWs.on('close', () => {
+            rtWs.on('close', () => {
                 console.log('Realtime WS closed');
+                // Ignore close from a torn-down/replaced socket.
+                if (realtimeWs !== rtWs) return;
                 if (!realtimeOpened && state === 'REALTIME') {
                     console.log('[realtime] closed before open; treating as connection failure');
                     endCallWithFarewell('error_limit').catch((e) =>
@@ -2252,9 +2527,12 @@ fastify.register(async (fastify) => {
                         console.log('Twilio: connected');
                         break;
                     case 'start':
+                        // SECURITY/PII: never log the full data.start payload —
+                        // customParameters carries the one-time stream_token (a
+                        // bearer credential) plus phone/company/contact/tenant
+                        // (PII). Log only non-sensitive identifiers.
                         console.log(
-                            '[start event] full data.start payload:',
-                            JSON.stringify(data.start, null, 2)
+                            `[start event] streamSid=${data.start.streamSid} callSid=${data.start.callSid ?? '(none)'}`
                         );
                         callParams = data.start.customParameters || {};
                         // The WS upgrade itself is unauthenticated; only the
@@ -2262,9 +2540,16 @@ fastify.register(async (fastify) => {
                         // Twilio-signature-checked) proves this stream is ours.
                         if (!consumeStreamToken(callParams.stream_token)) {
                             console.error('[start event] invalid or expired stream_token; closing WS');
+                            releaseUnauthSlot();
+                            clearPreAuth();
                             connection.close();
                             break;
                         }
+                        // Authenticated: stop counting this socket against the
+                        // unauthenticated cap and cancel the pre-auth timeout.
+                        authenticated = true;
+                        releaseUnauthSlot();
+                        clearPreAuth();
                         delete callParams.stream_token;
                         streamSid = data.start.streamSid;
                         callSid = data.start.callSid || null;
@@ -2302,9 +2587,15 @@ fastify.register(async (fastify) => {
                                     `Available keys on data.start: ${Object.keys(data.start).join(', ')}`
                             );
                         }
+                        // Minimal, redacted identifiers only — no stream_token,
+                        // no phone/company/contact PII.
+                        const redactPhone = (p) =>
+                            p && p.length > 4 ? `***${p.slice(-4)}` : (p ? '***' : '');
                         console.log(
-                            `Twilio: start ${streamSid} (VAD muted for first ${CALL_START_GRACE_MS}ms) params:`,
-                            callParams
+                            `Twilio: start ${streamSid} (VAD muted for first ${CALL_START_GRACE_MS}ms) ` +
+                                `tenant=${callParams.tenant_id || '(none)'} ` +
+                                `phone=${redactPhone(callParams.phone)} ` +
+                                `agent=${redactPhone(callParams.agent_phone)}`
                         );
                         // Load the tenant's playbook, then greet. Without a
                         // playbook there's nothing to say, so end gracefully.
@@ -2351,6 +2642,10 @@ fastify.register(async (fastify) => {
             console.log(`Twilio WS closed (endReason=${endReason || 'n/a'})`);
             state = 'ENDED';
             currentPlaybackToken = null;
+            // If the socket closed before authenticating, free its unauth slot
+            // and cancel the pre-auth timer.
+            releaseUnauthSlot();
+            clearPreAuth();
             // Release any playback awaiting a mark — Twilio will never send
             // marks after the socket closes, and a stuck `await playAudio()`
             // would otherwise hang endCallWithFarewell forever and skip the
@@ -2362,8 +2657,29 @@ fastify.register(async (fastify) => {
                 clearInterval(timeoutInterval);
                 timeoutInterval = null;
             }
-            if (realtimeWs?.readyState === WebSocket.OPEN) realtimeWs.close();
+            // Tear down the Realtime WS regardless of state. Finding #9: a
+            // CONNECTING socket (not yet OPEN) would otherwise open *after* the
+            // Twilio call ended and leak — keep streaming media into a dead
+            // call. terminate() handles CONNECTING; removing listeners stops
+            // the open/message/error/close handlers firing post-teardown.
+            teardownRealtime();
         });
+
+        // Forcefully drop the Realtime upstream and stop its handlers running
+        // after the call has ended. Safe to call multiple times.
+        function teardownRealtime() {
+            const ws = realtimeWs;
+            if (!ws) return;
+            realtimeWs = null;
+            try { ws.removeAllListeners(); } catch (_) {}
+            try {
+                // terminate() works for both CONNECTING and OPEN; close() is a
+                // no-op while CONNECTING, so prefer terminate to avoid a leak.
+                ws.terminate();
+            } catch (_) {
+                try { ws.close(); } catch (_) {}
+            }
+        }
 
         connection.on('error', (err) => {
             console.error('Twilio WS error:', err);
