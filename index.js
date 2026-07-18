@@ -799,9 +799,16 @@ fastify.post('/provision-playbook', async (request, reply) => {
         .from('call_playbooks').select('id')
         .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true).maybeSingle();
 
+    // Preserve any clip a tenant recorded in their own voice (source='recorded')
+    // across a regenerate: keep that flag and DON'T re-synthesize/overwrite the
+    // stored audio. TTS clips are rebuilt from the submitted text as usual.
+    const priorSource = {};
     let playbookId;
     if (existing) {
         playbookId = existing.id;
+        const { data: priorClips } = await supabase
+            .from('audio_clips').select('key, source').eq('playbook_id', playbookId);
+        for (const pc of priorClips || []) priorSource[pc.key] = pc.source;
         const { error: upErr } = await supabase.from('call_playbooks').update({
             company_name, voice, audio_base_path: base,
             realtime_system_message: realtimeSystemMessage, updated_at: new Date().toISOString(),
@@ -821,7 +828,8 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // Build and insert clip + intent rows from the templates.
     const clipRows = CLIP_TEMPLATE.map((c) => ({
         playbook_id: playbookId, tenant_id, key: c.key, clip_type: c.clip_type,
-        filename: c.filename, text: String(clipTexts[c.key] ?? '').trim(), source: 'tts',
+        filename: c.filename, text: String(clipTexts[c.key] ?? '').trim(),
+        source: priorSource[c.key] === 'recorded' ? 'recorded' : 'tts',
         suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
     }));
     const { error: clipErr } = await supabase.from('audio_clips').insert(clipRows);
@@ -839,6 +847,8 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // Synthesize each clip with text and upload it. Empty-text clips are skipped.
     const results = [];
     for (const c of clipRows) {
+        // Keep a tenant's own recording — never synthesize over 肉声.
+        if (c.source === 'recorded') { results.push({ key: c.key, status: 'kept_recorded' }); continue; }
         if (!c.text) { results.push({ key: c.key, status: 'skipped_no_text' }); continue; }
         const path = base ? `${base}/${c.filename}` : c.filename;
         try {
@@ -1452,6 +1462,122 @@ fastify.post('/preview-voice', async (request, reply) => {
     } catch (err) {
         console.error(`[preview-voice] voice=${voice} failed: ${err.message}`);
         return reply.code(502).send({ error: `tts failed: ${err.message}` });
+    }
+});
+
+// =====================================================================
+// Per-clip human voice (肉声) upload / delete / preview
+// ---------------------------------------------------------------------
+// Lets the dashboard replace a single clip's TTS with a staff member's own
+// recording (source='recorded'), preview what's stored, or revert to TTS.
+// Same shared-secret gate as /provision-playbook. The clip's storage
+// FILENAME is unchanged (call-time fetches by filename; ffmpeg decodes by
+// content), so the call path is untouched — only the bytes + the source
+// flag change. On delete we re-synthesize TTS from the clip's current text
+// so a revert never leaves the clip silent.
+// =====================================================================
+
+// Decoded upload cap. Kept well under Vercel's ~4.5MB request-body limit once
+// base64-inflated (×4/3): a single-utterance clip is normally < 1MB anyway.
+const MAX_CLIP_UPLOAD_BYTES = 3 * 1024 * 1024;
+
+// Drop cached audio + playbook for a tenant so the next call reloads them.
+function bustTenantAudio(tenantId, base) {
+    playbookCache.delete(tenantId);
+    for (const k of [...audioCache.keys()]) {
+        if (k === `${base}` || k.startsWith(`${base}/`)) audioCache.delete(k);
+    }
+}
+
+fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, reply) => {
+    if (!verifyProvisionSecret(request)) {
+        return reply.code(401).send({ error: 'unauthorized' });
+    }
+
+    const body = request.body || {};
+    // TODO(security): same shared-secret caveat as /provision-playbook — anyone
+    // holding PROVISION_SECRET can act on any tenant_id until per-tenant auth.
+    const action = (body.action || '').trim();
+    const tenant_id = (body.tenant_id || '').trim();
+    const key = (body.key || '').trim();
+    if (!tenant_id || !key || !['upload', 'delete', 'preview'].includes(action)) {
+        return reply.code(400).send({ error: 'action(upload|delete|preview), tenant_id and key are required' });
+    }
+
+    // Resolve tenant slug (storage folder) + the active default playbook + clip.
+    const { data: tenant, error: tErr } = await supabase
+        .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
+    if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
+    const base = (tenant.slug || '').trim();
+
+    const { data: pb, error: pbErr } = await supabase
+        .from('call_playbooks').select('id, voice')
+        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true).maybeSingle();
+    if (pbErr || !pb) return reply.code(409).send({ error: '先に「録音を生成」してください' });
+
+    const { data: clip, error: clipErr } = await supabase
+        .from('audio_clips').select('id, filename, text, source')
+        .eq('playbook_id', pb.id).eq('key', key).maybeSingle();
+    if (clipErr || !clip) return reply.code(404).send({ error: `clip "${key}" not found` });
+
+    const path = base ? `${base}/${clip.filename}` : clip.filename;
+
+    try {
+        if (action === 'preview') {
+            const { data: signed, error: sErr } = await supabase.storage
+                .from(AUDIO_BUCKET).createSignedUrl(path, 300);
+            if (sErr || !signed?.signedUrl) return reply.code(404).send({ error: '音声がまだありません' });
+            return reply.send({ ok: true, key, source: clip.source, signed_url: signed.signedUrl });
+        }
+
+        if (action === 'upload') {
+            const b64 = typeof body.audio_base64 === 'string' ? body.audio_base64 : '';
+            if (!b64) return reply.code(400).send({ error: 'audio_base64 is required' });
+            const buf = Buffer.from(b64, 'base64');
+            if (buf.length === 0) return reply.code(400).send({ error: 'empty audio' });
+            if (buf.length > MAX_CLIP_UPLOAD_BYTES) {
+                return reply.code(413).send({ error: 'ファイルが大きすぎます（上限3MB）' });
+            }
+            const contentType = (typeof body.content_type === 'string' && body.content_type.startsWith('audio/'))
+                ? body.content_type : 'audio/mpeg';
+            const { error: upErr } = await supabase.storage
+                .from(AUDIO_BUCKET).upload(path, buf, { contentType, upsert: true });
+            if (upErr) throw new Error(upErr.message);
+            const { error: updErr } = await supabase.from('audio_clips')
+                .update({ source: 'recorded', updated_at: new Date().toISOString() })
+                .eq('playbook_id', pb.id).eq('key', key);
+            if (updErr) throw new Error(updErr.message);
+            bustTenantAudio(tenant_id, base);
+            const { data: signed } = await supabase.storage
+                .from(AUDIO_BUCKET).createSignedUrl(path, 300);
+            console.log(`[clip-audio] upload tenant=${tenant_id} key=${key} bytes=${buf.length}`);
+            return reply.send({ ok: true, key, source: 'recorded', bytes: buf.length, signed_url: signed?.signedUrl ?? null });
+        }
+
+        // action === 'delete' — revert to TTS, re-synthesizing from the text so
+        // the clip is never left silent.
+        const text = String(clip.text ?? '').trim();
+        if (!text) {
+            await supabase.from('audio_clips')
+                .update({ source: 'tts', updated_at: new Date().toISOString() })
+                .eq('playbook_id', pb.id).eq('key', key);
+            bustTenantAudio(tenant_id, base);
+            return reply.send({ ok: true, key, source: 'tts', resynthesized: false });
+        }
+        const buf = await synthesizeClip(text, pb.voice || 'shimmer');
+        const { error: upErr } = await supabase.storage
+            .from(AUDIO_BUCKET).upload(path, buf, { contentType: 'audio/mpeg', upsert: true });
+        if (upErr) throw new Error(upErr.message);
+        const { error: updErr } = await supabase.from('audio_clips')
+            .update({ source: 'tts', updated_at: new Date().toISOString() })
+            .eq('playbook_id', pb.id).eq('key', key);
+        if (updErr) throw new Error(updErr.message);
+        bustTenantAudio(tenant_id, base);
+        console.log(`[clip-audio] delete/revert tenant=${tenant_id} key=${key} bytes=${buf.length}`);
+        return reply.send({ ok: true, key, source: 'tts', resynthesized: true, bytes: buf.length });
+    } catch (err) {
+        console.error('[clip-audio] handler threw:', err);
+        return reply.code(500).send({ error: err.message || 'clip-audio failed' });
     }
 });
 
