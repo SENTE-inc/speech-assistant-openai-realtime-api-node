@@ -779,6 +779,9 @@ fastify.post('/provision-playbook', async (request, reply) => {
     const company_name = (body.company_name || '').trim();
     const voice = (body.voice || 'shimmer').trim();
     const clipTexts = body.clip_texts && typeof body.clip_texts === 'object' ? body.clip_texts : {};
+    // synthesize=false => 台本だけ作成: build the structure with NO TTS (no cost).
+    // The tenant then fills each clip by recording or per-clip AI generation.
+    const synthesize = body.synthesize !== false;
     if (!tenant_id || !company_name) {
         return reply.code(400).send({ error: 'tenant_id and company_name are required' });
     }
@@ -830,6 +833,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
         playbook_id: playbookId, tenant_id, key: c.key, clip_type: c.clip_type,
         filename: c.filename, text: String(clipTexts[c.key] ?? '').trim(),
         source: priorSource[c.key] === 'recorded' ? 'recorded' : 'tts',
+        audio_ready: priorSource[c.key] === 'recorded',
         suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
     }));
     const { error: clipErr } = await supabase.from('audio_clips').insert(clipRows);
@@ -844,11 +848,16 @@ fastify.post('/provision-playbook', async (request, reply) => {
     const { error: intErr } = await supabase.from('call_intents').insert(intentRows);
     if (intErr) return reply.code(500).send({ error: `intents insert failed: ${intErr.message}` });
 
-    // Synthesize each clip with text and upload it. Empty-text clips are skipped.
+    // Synthesize each clip with text and upload it — unless this is a
+    // structure-only build (synthesize=false = 台本だけ作成), in which case the
+    // clips start with no audio and the tenant fills each one by recording or
+    // per-clip AI generation. Recorded clips are always kept as-is.
     const results = [];
+    const readyKeys = [];
     for (const c of clipRows) {
         // Keep a tenant's own recording — never synthesize over 肉声.
         if (c.source === 'recorded') { results.push({ key: c.key, status: 'kept_recorded' }); continue; }
+        if (!synthesize) { results.push({ key: c.key, status: 'no_audio' }); continue; }
         if (!c.text) { results.push({ key: c.key, status: 'skipped_no_text' }); continue; }
         const path = base ? `${base}/${c.filename}` : c.filename;
         try {
@@ -857,9 +866,15 @@ fastify.post('/provision-playbook', async (request, reply) => {
                 .from(AUDIO_BUCKET).upload(path, buf, { contentType: 'audio/mpeg', upsert: true });
             if (upErr) throw new Error(upErr.message);
             results.push({ key: c.key, status: 'ok', bytes: buf.length });
+            readyKeys.push(c.key);
         } catch (err) {
             results.push({ key: c.key, status: 'failed', error: err.message });
         }
+    }
+    // Flag successfully synthesized clips as having audio.
+    if (readyKeys.length) {
+        await supabase.from('audio_clips').update({ audio_ready: true })
+            .eq('playbook_id', playbookId).in('key', readyKeys);
     }
 
     // Bust the per-tenant playbook cache and this tenant's clip audio cache so
@@ -1500,8 +1515,8 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
     const action = (body.action || '').trim();
     const tenant_id = (body.tenant_id || '').trim();
     const key = (body.key || '').trim();
-    if (!tenant_id || !key || !['upload', 'delete', 'preview'].includes(action)) {
-        return reply.code(400).send({ error: 'action(upload|delete|preview), tenant_id and key are required' });
+    if (!tenant_id || !key || !['upload', 'delete', 'synthesize', 'preview'].includes(action)) {
+        return reply.code(400).send({ error: 'action(upload|delete|synthesize|preview), tenant_id and key are required' });
     }
 
     // Resolve tenant slug (storage folder) + the active default playbook + clip.
@@ -1513,7 +1528,7 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
     const { data: pb, error: pbErr } = await supabase
         .from('call_playbooks').select('id, voice')
         .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true).maybeSingle();
-    if (pbErr || !pb) return reply.code(409).send({ error: '先に「録音を生成」してください' });
+    if (pbErr || !pb) return reply.code(409).send({ error: '先に台本を作成してください' });
 
     const { data: clip, error: clipErr } = await supabase
         .from('audio_clips').select('id, filename, text, source')
@@ -1544,37 +1559,41 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
                 .from(AUDIO_BUCKET).upload(path, buf, { contentType, upsert: true });
             if (upErr) throw new Error(upErr.message);
             const { error: updErr } = await supabase.from('audio_clips')
-                .update({ source: 'recorded', updated_at: new Date().toISOString() })
+                .update({ source: 'recorded', audio_ready: true, updated_at: new Date().toISOString() })
                 .eq('playbook_id', pb.id).eq('key', key);
             if (updErr) throw new Error(updErr.message);
             bustTenantAudio(tenant_id, base);
             const { data: signed } = await supabase.storage
                 .from(AUDIO_BUCKET).createSignedUrl(path, 300);
             console.log(`[clip-audio] upload tenant=${tenant_id} key=${key} bytes=${buf.length}`);
-            return reply.send({ ok: true, key, source: 'recorded', bytes: buf.length, signed_url: signed?.signedUrl ?? null });
+            return reply.send({ ok: true, key, source: 'recorded', audio_ready: true, bytes: buf.length, signed_url: signed?.signedUrl ?? null });
         }
 
-        // action === 'delete' — revert to TTS, re-synthesizing from the text so
-        // the clip is never left silent.
+        // action === 'delete' (revert 肉声 → AI) or 'synthesize' (generate AI for
+        // a clip): both (re)synthesize TTS from the clip's text. 'delete' on an
+        // empty-text clip just clears it to no-audio; 'synthesize' needs text.
         const text = String(clip.text ?? '').trim();
         if (!text) {
+            if (action === 'synthesize') {
+                return reply.code(400).send({ error: 'テキストが空のためAI音声を生成できません' });
+            }
             await supabase.from('audio_clips')
-                .update({ source: 'tts', updated_at: new Date().toISOString() })
+                .update({ source: 'tts', audio_ready: false, updated_at: new Date().toISOString() })
                 .eq('playbook_id', pb.id).eq('key', key);
             bustTenantAudio(tenant_id, base);
-            return reply.send({ ok: true, key, source: 'tts', resynthesized: false });
+            return reply.send({ ok: true, key, source: 'tts', audio_ready: false, resynthesized: false });
         }
         const buf = await synthesizeClip(text, pb.voice || 'shimmer');
         const { error: upErr } = await supabase.storage
             .from(AUDIO_BUCKET).upload(path, buf, { contentType: 'audio/mpeg', upsert: true });
         if (upErr) throw new Error(upErr.message);
         const { error: updErr } = await supabase.from('audio_clips')
-            .update({ source: 'tts', updated_at: new Date().toISOString() })
+            .update({ source: 'tts', audio_ready: true, updated_at: new Date().toISOString() })
             .eq('playbook_id', pb.id).eq('key', key);
         if (updErr) throw new Error(updErr.message);
         bustTenantAudio(tenant_id, base);
-        console.log(`[clip-audio] delete/revert tenant=${tenant_id} key=${key} bytes=${buf.length}`);
-        return reply.send({ ok: true, key, source: 'tts', resynthesized: true, bytes: buf.length });
+        console.log(`[clip-audio] ${action} tenant=${tenant_id} key=${key} bytes=${buf.length}`);
+        return reply.send({ ok: true, key, source: 'tts', audio_ready: true, resynthesized: true, bytes: buf.length });
     } catch (err) {
         console.error('[clip-audio] handler threw:', err);
         return reply.code(500).send({ error: err.message || 'clip-audio failed' });
