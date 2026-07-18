@@ -805,13 +805,13 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // Preserve any clip a tenant recorded in their own voice (source='recorded')
     // across a regenerate: keep that flag and DON'T re-synthesize/overwrite the
     // stored audio. TTS clips are rebuilt from the submitted text as usual.
-    const priorSource = {};
+    const priorByKey = {};
     let playbookId;
     if (existing) {
         playbookId = existing.id;
         const { data: priorClips } = await supabase
-            .from('audio_clips').select('key, source').eq('playbook_id', playbookId);
-        for (const pc of priorClips || []) priorSource[pc.key] = pc.source;
+            .from('audio_clips').select('key, source, recorded_filename').eq('playbook_id', playbookId);
+        for (const pc of priorClips || []) priorByKey[pc.key] = pc;
         const { error: upErr } = await supabase.from('call_playbooks').update({
             company_name, voice, audio_base_path: base,
             realtime_system_message: realtimeSystemMessage, updated_at: new Date().toISOString(),
@@ -832,8 +832,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
     const clipRows = CLIP_TEMPLATE.map((c) => ({
         playbook_id: playbookId, tenant_id, key: c.key, clip_type: c.clip_type,
         filename: c.filename, text: String(clipTexts[c.key] ?? '').trim(),
-        source: priorSource[c.key] === 'recorded' ? 'recorded' : 'tts',
-        audio_ready: priorSource[c.key] === 'recorded',
+        source: priorByKey[c.key]?.source === 'recorded' ? 'recorded' : 'tts',
+        audio_ready: priorByKey[c.key]?.source === 'recorded',
+        recorded_filename: priorByKey[c.key]?.source === 'recorded'
+            ? (priorByKey[c.key]?.recorded_filename ?? null) : null,
         suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
     }));
     const { error: clipErr } = await supabase.from('audio_clips').insert(clipRows);
@@ -856,7 +858,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
     const readyKeys = [];
     for (const c of clipRows) {
         // Keep a tenant's own recording — never synthesize over 肉声.
-        if (c.source === 'recorded') { results.push({ key: c.key, status: 'kept_recorded' }); continue; }
+        if (c.source === 'recorded') { results.push({ key: c.key, status: 'kept_recorded', recorded_filename: c.recorded_filename ?? null }); continue; }
         if (!synthesize) { results.push({ key: c.key, status: 'no_audio' }); continue; }
         if (!c.text) { results.push({ key: c.key, status: 'skipped_no_text' }); continue; }
         const path = base ? `${base}/${c.filename}` : c.filename;
@@ -1555,18 +1557,20 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
             }
             const contentType = (typeof body.content_type === 'string' && body.content_type.startsWith('audio/'))
                 ? body.content_type : 'audio/mpeg';
+            const originalName = typeof body.original_filename === 'string'
+                ? (body.original_filename.trim().slice(0, 200) || null) : null;
             const { error: upErr } = await supabase.storage
                 .from(AUDIO_BUCKET).upload(path, buf, { contentType, upsert: true });
             if (upErr) throw new Error(upErr.message);
             const { error: updErr } = await supabase.from('audio_clips')
-                .update({ source: 'recorded', audio_ready: true, updated_at: new Date().toISOString() })
+                .update({ source: 'recorded', audio_ready: true, recorded_filename: originalName, updated_at: new Date().toISOString() })
                 .eq('playbook_id', pb.id).eq('key', key);
             if (updErr) throw new Error(updErr.message);
             bustTenantAudio(tenant_id, base);
             const { data: signed } = await supabase.storage
                 .from(AUDIO_BUCKET).createSignedUrl(path, 300);
             console.log(`[clip-audio] upload tenant=${tenant_id} key=${key} bytes=${buf.length}`);
-            return reply.send({ ok: true, key, source: 'recorded', audio_ready: true, bytes: buf.length, signed_url: signed?.signedUrl ?? null });
+            return reply.send({ ok: true, key, source: 'recorded', audio_ready: true, recorded_filename: originalName, bytes: buf.length, signed_url: signed?.signedUrl ?? null });
         }
 
         // action === 'delete' (revert 肉声 → AI) or 'synthesize' (generate AI for
@@ -1578,7 +1582,7 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
                 return reply.code(400).send({ error: 'テキストが空のためAI音声を生成できません' });
             }
             await supabase.from('audio_clips')
-                .update({ source: 'tts', audio_ready: false, updated_at: new Date().toISOString() })
+                .update({ source: 'tts', audio_ready: false, recorded_filename: null, updated_at: new Date().toISOString() })
                 .eq('playbook_id', pb.id).eq('key', key);
             bustTenantAudio(tenant_id, base);
             return reply.send({ ok: true, key, source: 'tts', audio_ready: false, resynthesized: false });
@@ -1588,12 +1592,12 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
             .from(AUDIO_BUCKET).upload(path, buf, { contentType: 'audio/mpeg', upsert: true });
         if (upErr) throw new Error(upErr.message);
         const { error: updErr } = await supabase.from('audio_clips')
-            .update({ source: 'tts', audio_ready: true, updated_at: new Date().toISOString() })
+            .update({ source: 'tts', audio_ready: true, recorded_filename: null, updated_at: new Date().toISOString() })
             .eq('playbook_id', pb.id).eq('key', key);
         if (updErr) throw new Error(updErr.message);
         bustTenantAudio(tenant_id, base);
         console.log(`[clip-audio] ${action} tenant=${tenant_id} key=${key} bytes=${buf.length}`);
-        return reply.send({ ok: true, key, source: 'tts', audio_ready: true, resynthesized: true, bytes: buf.length });
+        return reply.send({ ok: true, key, source: 'tts', audio_ready: true, recorded_filename: null, resynthesized: true, bytes: buf.length });
     } catch (err) {
         console.error('[clip-audio] handler threw:', err);
         return reply.code(500).send({ error: err.message || 'clip-audio failed' });
