@@ -337,6 +337,11 @@ async function loadPlaybook(tenantId) {
         .eq('tenant_id', tenantId)
         .eq('is_active', true)
         .is('campaign_id', null)
+        // The tenant default (owner_user_id NULL) is what the call path uses.
+        // Per-operator voice sets (owner set) are selected by operator in
+        // Phase 2; pinning to NULL here keeps this .maybeSingle() single-row
+        // once per-operator playbooks exist so live calling never breaks.
+        .is('owner_user_id', null)
         .maybeSingle();
     if (pbErr || !pb) {
         console.error(
@@ -776,6 +781,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // from a shared secret. Anyone holding PROVISION_SECRET can act on any
     // tenant_id today — a per-tenant JWT/principal is the proper fix.
     const tenant_id = (body.tenant_id || '').trim();
+    // owner_user_id null => tenant default set (legacy/admin-managed); a uuid =>
+    // that operator's own voice set. The dashboard route resolves & authorizes
+    // the owner server-side (client forced to self); we trust it here.
+    const owner_user_id = (body.owner_user_id || '').trim() || null;
     const company_name = (body.company_name || '').trim();
     const voice = (body.voice || 'shimmer').trim();
     const clipTexts = body.clip_texts && typeof body.clip_texts === 'object' ? body.clip_texts : {};
@@ -790,7 +799,9 @@ fastify.post('/provision-playbook', async (request, reply) => {
     const { data: tenant, error: tErr } = await supabase
         .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
     if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
-    const base = (tenant.slug || '').trim();
+    const slug = (tenant.slug || '').trim();
+    // Per-operator sets live under <slug>/<owner>/ so storage separates cleanly.
+    const base = owner_user_id ? `${slug}/${owner_user_id}` : slug;
 
     const realtimeSystemMessage =
         (typeof body.realtime_system_message === 'string' && body.realtime_system_message.trim()) ||
@@ -798,9 +809,13 @@ fastify.post('/provision-playbook', async (request, reply) => {
 
     // Find the tenant's active default playbook; update-in-place if it exists,
     // otherwise create one. Either way we rebuild its clips and intents.
-    const { data: existing } = await supabase
+    let existingQuery = supabase
         .from('call_playbooks').select('id')
-        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true).maybeSingle();
+        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true);
+    existingQuery = owner_user_id
+        ? existingQuery.eq('owner_user_id', owner_user_id)
+        : existingQuery.is('owner_user_id', null);
+    const { data: existing } = await existingQuery.maybeSingle();
 
     // Preserve any clip a tenant recorded in their own voice (source='recorded')
     // across a regenerate: keep that flag and DON'T re-synthesize/overwrite the
@@ -821,7 +836,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
         await supabase.from('call_intents').delete().eq('playbook_id', playbookId);
     } else {
         const { data: created, error: insErr } = await supabase.from('call_playbooks').insert({
-            tenant_id, name: 'default', company_name, voice, audio_base_path: base,
+            tenant_id, owner_user_id, name: 'default', company_name, voice, audio_base_path: base,
             realtime_system_message: realtimeSystemMessage, is_active: true,
         }).select('id').single();
         if (insErr) return reply.code(500).send({ error: `playbook insert failed: ${insErr.message}` });
@@ -1516,6 +1531,9 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
     // holding PROVISION_SECRET can act on any tenant_id until per-tenant auth.
     const action = (body.action || '').trim();
     const tenant_id = (body.tenant_id || '').trim();
+    // owner_user_id null => tenant default set; a uuid => that operator's set.
+    // Authorized/forced server-side by the dashboard route (client = self).
+    const owner_user_id = (body.owner_user_id || '').trim() || null;
     const key = (body.key || '').trim();
     if (!tenant_id || !key || !['upload', 'delete', 'synthesize', 'preview'].includes(action)) {
         return reply.code(400).send({ error: 'action(upload|delete|synthesize|preview), tenant_id and key are required' });
@@ -1525,11 +1543,16 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
     const { data: tenant, error: tErr } = await supabase
         .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
     if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
-    const base = (tenant.slug || '').trim();
+    const slug = (tenant.slug || '').trim();
+    const base = owner_user_id ? `${slug}/${owner_user_id}` : slug;
 
-    const { data: pb, error: pbErr } = await supabase
+    let pbQuery = supabase
         .from('call_playbooks').select('id, voice')
-        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true).maybeSingle();
+        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true);
+    pbQuery = owner_user_id
+        ? pbQuery.eq('owner_user_id', owner_user_id)
+        : pbQuery.is('owner_user_id', null);
+    const { data: pb, error: pbErr } = await pbQuery.maybeSingle();
     if (pbErr || !pb) return reply.code(409).send({ error: '先に台本を作成してください' });
 
     const { data: clip, error: clipErr } = await supabase
