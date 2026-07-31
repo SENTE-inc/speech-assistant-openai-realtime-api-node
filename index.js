@@ -1173,6 +1173,39 @@ fastify.post('/kick-call', async (request, reply) => {
     };
     const baseUrl = `https://${request.headers.host}`;
 
+    // 🔴 D1 ゲート（Tom 決定 2026-07-19 / 実装 2026-07-31）＝声セットが未完成なら
+    // 架電しない。フォールバックもしない。
+    // 理由＝音声ファイルが無いクリップは playAudio がエラーログを出して再生を
+    // スキップするだけなので、ゲートが無いと「つながるのに何も喋らない電話」が
+    // 営業先に飛ぶ（無言電話）。発信の口はここだけなので、最後の砦はここに置く。
+    // 判定対象は通話路 loadPlaybook と同じ声セット＝campaign_id IS NULL /
+    // owner_user_id IS NULL / is_active（Phase 2 で架電者ごとの set に切り替える）。
+    const { data: gatePb, error: gatePbErr } = await supabase
+        .from('call_playbooks').select('id')
+        .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null)
+        .eq('is_active', true).maybeSingle();
+    if (gatePbErr) return reply.code(500).send({ error: `playbook lookup failed: ${gatePbErr.message}` });
+    if (!gatePb) {
+        console.log(`[kick-call] blocked tenant=${tenant_id} reason=no_playbook`);
+        return reply.send({ ok: true, dialed: 0, reason: '台本がありません（Voice Setup で台本と音声を設定してください）' });
+    }
+    const { data: gateClips, error: gateClipErr } = await supabase
+        .from('audio_clips').select('audio_ready')
+        .eq('playbook_id', gatePb.id).eq('active', true);
+    if (gateClipErr) return reply.code(500).send({ error: `clip audio check failed: ${gateClipErr.message}` });
+    const missingAudio = (gateClips || []).filter((c) => !c.audio_ready).length;
+    if (!gateClips || gateClips.length === 0) {
+        console.log(`[kick-call] blocked tenant=${tenant_id} reason=no_clips`);
+        return reply.send({ ok: true, dialed: 0, reason: 'セリフが1件もありません（Voice Setup で台本を作ってください）' });
+    }
+    if (missingAudio > 0) {
+        console.log(`[kick-call] blocked tenant=${tenant_id} reason=missing_audio count=${missingAudio}`);
+        return reply.send({
+            ok: true, dialed: 0, missing_audio: missingAudio,
+            reason: `音声が未設定のセリフが ${missingAudio} 件あるため架電できません（Voice Setup で録音またはAI音声を設定してください）`,
+        });
+    }
+
     // Per-tenant concurrency: never exceed MAX_CONCURRENT_PER_TENANT in flight.
     // In-flight is approximated by contacts still in '架電中' for this tenant
     // (the StatusCallback handler moves them to a terminal status when done).
