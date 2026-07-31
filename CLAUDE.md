@@ -13,8 +13,8 @@
 - **日本の電話番号は Twilio の Regulatory Bundle（本人確認書類）が通らないと取れない。**番号が無いのは実装の欠陥ではない。
 
 ## 🔴 リポの状態
-- remote＝`git@github.com:SENTE-inc/speech-assistant-openai-realtime-api-node.git`。**現在のブランチは `main` ではない**（`feat/operator-voice-sets` 等）。push 先を確認してから push する。
-- 同じリポの **worktree が別ディレクトリにある**（`~/speech-assistant-...-voicepreview-wt`）。片方で切ったブランチはもう片方でチェックアウトできない。
+- remote＝`git@github.com:SENTE-inc/speech-assistant-openai-realtime-api-node.git`。**ブランチは `main`**（2026-07-31 実測・作業ツリーはクリーン）。⚠過去に `feat/operator-voice-sets` 等で作業していた時期があるので、**push 前に `git branch --show-current` を確認する**習慣は残す。
+- 🗑**worktree は無い**（2026-07-31 実測＝`git worktree list` は本体1つだけ。`~/speech-assistant-...-voicepreview-wt` は 2026-07-27 の棚卸しで撤去済）。**再び worktree を切ったら「片方で切ったブランチはもう片方でチェックアウトできない」に注意。**
 - 秘匿値はリポに無い（`.env.example` のみ）。**本番の値は Railway の環境変数**＝ローカルの `.env` を正だと思わない。
 
 ## 🔴 語彙
