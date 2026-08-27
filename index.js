@@ -382,7 +382,7 @@ async function loadPlaybook(tenantId) {
     };
     cfg.classifierPrompt = buildClassifierPrompt(cfg);
 
-    // Vocabulary hint for STT — biases gpt-4o-transcribe toward this tenant's
+    // Vocabulary hint for STT — biases gpt-transcribe toward this tenant's
     // expected phrases so homophones (e.g. 代表/対象) resolve correctly.
     // Capped well under the model's ~244-token prompt budget.
     // Sample a couple of triggers per intent (not all of them) so the hint
@@ -469,7 +469,8 @@ async function transcribeWhisper(mulawBuffer, prompt) {
     const wav = mulawToWav(mulawBuffer);
     const formData = new FormData();
     formData.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
-    formData.append('model', 'gpt-4o-transcribe');
+    // 2026-08-27: gpt-4o-transcribe → gpt-transcribe（ファイル文字起こしの現行推奨・2026-07-28）
+    formData.append('model', 'gpt-transcribe');
     formData.append('language', 'ja');
     // Bias toward the tenant's expected vocabulary (company name + intent
     // trigger phrases) so homophones like 代表/対象 resolve correctly.
@@ -2549,7 +2550,9 @@ fastify.register(async (fastify) => {
                                 // Twilio media streams are G.711 μ-law (8kHz).
                                 format: { type: 'audio/pcmu' },
                                 turn_detection: { type: 'server_vad' },
-                                transcription: { model: 'gpt-4o-transcribe' },
+                                // 🔴 Realtime セッション内は gpt-transcribe でなく gpt-live-transcribe が現行推奨
+                                //    （ファイル文字起こし側とはモデルが別＝上の formData と揃えない）
+                                transcription: { model: 'gpt-live-transcribe' },
                             },
                             output: {
                                 format: { type: 'audio/pcmu' },
