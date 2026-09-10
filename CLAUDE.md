@@ -17,8 +17,9 @@
 - remote＝`git@github.com:SENTE-inc/speech-assistant-openai-realtime-api-node.git`。**push 前に `git branch --show-current` を確認する**＝`feat/operator-voice-sets` のような作業ブランチに居ることがある。
 - 🗑**worktree は無い**（2026-07-31 実測＝`git worktree list` は本体1つだけ。`~/speech-assistant-...-voicepreview-wt` は 2026-07-27 の棚卸しで撤去済）。**再び worktree を切ったら「片方で切ったブランチはもう片方でチェックアウトできない」に注意。**
 - 秘匿値はリポに無い（`.env.example` のみ）。**本番の値は Railway の環境変数**＝ローカルの `.env` を正だと思わない。
-- 🔴🔴 **env の名前は、コードが読む側で確かめる。**発信の From は **`TWILIO_FROM_NUMBER`**（`index.js`）だが、**Railway に在る変数は `TWILIO_PHONE_NUMBER`＝別名でどこからも読まれていない。**∴ 既定のハードコード**米国番号 `+1 831-273-4595` で発信し続けている**（🔬2026-09-10 実測）。**「Railway に番号の env が在る」を根拠に From が正しいと判断しない。**
-- ⚠ **番号の `VoiceUrl` は発信に効かない**＝`placeOutboundCall` が Twilio に `Url` を毎回明示して渡すため。`VoiceUrl` が効くのは**折り返しの着信**だけ（050 は現在 未設定＝折り返しても繋がらない）。
+- 🔴🔴 **env の名前は、コードが読む側で確かめる。**発信の From は **`TWILIO_FROM_NUMBER`**（`index.js`）＝**2026-09-10 に `+815017857330`（050）を設定**。それまでは未設定で、既定のハードコード**米国番号 `+1 831-273-4595`** で発信していた。⚠ **Railway には別名の `TWILIO_PHONE_NUMBER` も残っているが、どこからも読まれていない**＝「Railway に番号の env が在る」を根拠に From が正しいと判断しない。⚠ **From はログに出ない**＝効いたかは **env の在否＋デプロイ成功＋コードが読む名前**の3点で判定する。
+- ⚠ **番号の `VoiceUrl` は発信に効かない**＝`placeOutboundCall` が Twilio に `Url` を毎回明示して渡すため。`VoiceUrl` が効くのは**折り返しの着信**だけ（050 は現在 未設定）。
+- 🔴🔴 **`VoiceUrl` を `/incoming-call` に向けない。**`/incoming-call` は**発信専用の入口**で、`tenant_id` を query string でしか受け取らない。折り返しの着信には query が無いので `loadPlaybook('')` が `null` → `endCallWithFarewell('error_limit')`＝**かけてきた相手を「それでは失礼いたします」で切る。**着信は取次の作り直し（`~/sente/sente_aivoice_canonical.md` §3-2）の側で設計する。⚠ **米国番号 `+1 831-273-4595` は既にこの形で `/incoming-call` に向いている**（そちらに折り返す人はいないので実害は未観測）。
 
 ## 🔴 語彙
 - UI 上の呼び名は「**録音**」。コード内の概念名と客向けの表示が食い違うので、Tom や客に説明する時は UI の語で話す。
