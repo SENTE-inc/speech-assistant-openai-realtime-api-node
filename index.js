@@ -304,7 +304,30 @@ async function getAudioBuffer(cfg, key) {
 
 // --- Per-tenant playbook (script + clips + intents) ----------------------
 const PLAYBOOK_TTL_MS = 5 * 60 * 1000;
-const playbookCache = new Map(); // tenantId -> { cfg, loadedAt }
+const playbookCache = new Map(); // `${tenantId}:${operatorId}` -> { cfg, loadedAt }
+
+// Drop every cached playbook of a tenant (tenant default and each operator's set).
+function bustPlaybookCache(tenantId) {
+    for (const key of [...playbookCache.keys()]) {
+        if (key === tenantId || key.startsWith(`${tenantId}:`)) playbookCache.delete(key);
+    }
+}
+
+// 声セットの選び方（作る順番の2番目・家 §3-3）＝その会社の担当 CM の声セットがあればそれ、
+// 無ければテナントの既定。「AI が話していた声の本人につながる」ための前提。
+async function resolvePlaybookRow(tenantId, operatorId) {
+    const base = () => supabase
+        .from('call_playbooks')
+        .select('*')
+        .eq('tenant_id', tenantId)
+        .eq('is_active', true)
+        .is('campaign_id', null);
+    if (operatorId) {
+        const own = await base().eq('owner_user_id', operatorId).maybeSingle();
+        if (own.error || own.data) return own;
+    }
+    return base().is('owner_user_id', null).maybeSingle();
+}
 
 // Build the Claude classifier prompt from a playbook's intents.
 function buildClassifierPrompt(cfg) {
@@ -326,23 +349,13 @@ function buildClassifierPrompt(cfg) {
         `{ "intent": "<上記nameのいずれか>", "callback_info": "<日時情報があれば。無ければ省略>" }`;
 }
 
-async function loadPlaybook(tenantId) {
+async function loadPlaybook(tenantId, operatorId = null) {
     if (!tenantId) return null;
-    const cached = playbookCache.get(tenantId);
+    const cacheKey = `${tenantId}:${operatorId || ''}`;
+    const cached = playbookCache.get(cacheKey);
     if (cached && Date.now() - cached.loadedAt < PLAYBOOK_TTL_MS) return cached.cfg;
 
-    const { data: pb, error: pbErr } = await supabase
-        .from('call_playbooks')
-        .select('*')
-        .eq('tenant_id', tenantId)
-        .eq('is_active', true)
-        .is('campaign_id', null)
-        // The tenant default (owner_user_id NULL) is what the call path uses.
-        // Per-operator voice sets (owner set) are selected by operator in
-        // Phase 2; pinning to NULL here keeps this .maybeSingle() single-row
-        // once per-operator playbooks exist so live calling never breaks.
-        .is('owner_user_id', null)
-        .maybeSingle();
+    const { data: pb, error: pbErr } = await resolvePlaybookRow(tenantId, operatorId);
     if (pbErr || !pb) {
         console.error(
             `[playbook] load failed for tenant ${tenantId}: ${pbErr?.message || 'no active playbook'}`
@@ -394,7 +407,7 @@ async function loadPlaybook(tenantId) {
     cfg.transcriptionPrompt =
         `日本語の法人向け営業電話です。会社名は${pb.company_name}。想定される発言: ${vocab}`.slice(0, 240);
 
-    playbookCache.set(tenantId, { cfg, loadedAt: Date.now() });
+    playbookCache.set(cacheKey, { cfg, loadedAt: Date.now() });
 
     // Warm the clip cache in the background so the first call isn't slow.
     for (const key of cfg.clips.keys()) {
@@ -632,6 +645,159 @@ async function transferCall(callSid, agentPhone) {
         throw new Error(`Twilio transfer failed: ${res.status} ${text}`);
     }
     console.log(`✓ Call transferred to ${agentPhone} (callSid=${callSid})`);
+}
+
+// =====================================================================
+// 取次＝保留音 → 空いている CM のブラウザ（作る順番の2番目・家 §3-2）
+// =====================================================================
+// 相手の通話は <Enqueue>（保留音）に移し、CM のブラウザ（Twilio Voice SDK）へ
+// 別の1本を鳴らして <Dial><Queue> でつなぐ。10秒出なければその CM を離席にして次の人へ。
+// 誰もいなければ「改めてご連絡いたします」の録音を流して切り、要再架電を付ける。
+const HOLD_MUSIC_URL = process.env.HOLD_MUSIC_URL
+    || 'http://com.twilio.sounds.music.s3.amazonaws.com/MARKOVICHAMP-Borghestral.mp3';
+const AGENT_RING_TIMEOUT_S = parseInt(process.env.AGENT_RING_TIMEOUT_S || '10', 10);
+const PER_OPERATOR_CONCURRENCY = parseInt(process.env.PER_OPERATOR_CONCURRENCY || '3', 10);
+const HANDOFF_TTL_MS = 15 * 60 * 1000;
+const handoffs = new Map(); // prospect callSid -> { tenantId, projectId, agentId, agentCallSid, excluded, baseUrl, clipPath, createdAt }
+
+// ブラウザ側の識別子（ダッシュボードの /api/voice-token と同じ規則）。英数字だけにする。
+const agentIdentity = (userId) => `cm_${String(userId).replace(/[^0-9a-zA-Z]/g, '')}`;
+const queueName = (callSid) => `h-${callSid}`;
+const xmlEsc = (s) => String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+
+function registerHandoff(callSid, h) {
+    const now = Date.now();
+    for (const [sid, v] of handoffs) {
+        if (now - v.createdAt > HANDOFF_TTL_MS) handoffs.delete(sid);
+    }
+    handoffs.set(callSid, { ...h, createdAt: now });
+}
+
+function forgetHandoff(callSid) {
+    handoffs.delete(callSid);
+}
+
+async function twilioApi(path, form) {
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+        throw new Error('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not configured');
+    }
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}${path}`, {
+        method: form ? 'POST' : 'GET',
+        headers: {
+            Authorization: `Basic ${auth}`,
+            ...(form ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
+        },
+        body: form ? new URLSearchParams(form) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Twilio ${path} ${res.status}: ${JSON.stringify(data)}`);
+    return data;
+}
+
+const updateLiveCall = (callSid, twiml) => twilioApi(`/Calls/${callSid}.json`, { Twiml: twiml });
+
+const enqueueTwiml = (baseUrl, callSid) =>
+    `<Response><Enqueue waitUrl="${xmlEsc(`${baseUrl}/hold-music`)}" waitUrlMethod="POST">${queueName(callSid)}</Enqueue></Response>`;
+
+async function claimAgent(projectId, preferred, exclude) {
+    const { data, error } = await supabase.rpc('claim_agent_for_handoff', {
+        p_project: projectId,
+        p_preferred: preferred || null,
+        p_exclude: exclude || [],
+    });
+    if (error) throw new Error(error.message);
+    return data || null;
+}
+
+async function setAgentState(userId, callState) {
+    if (!userId) return;
+    const { error } = await supabase.rpc('set_agent_state', { p_user: userId, p_state: callState });
+    if (error) console.error(`[handoff] set_agent_state(${callState}) failed:`, error.message);
+}
+
+// Ring the claimed CM's browser. When they answer, /agent-bridge joins them to the queue.
+async function dialAgent(prospectSid, agentId) {
+    const h = handoffs.get(prospectSid);
+    if (!h) throw new Error('handoff not found');
+    const qs = new URLSearchParams({ prospect: prospectSid });
+    h.agentId = agentId;
+    const call = await twilioApi('/Calls.json', {
+        To: `client:${agentIdentity(agentId)}`,
+        From: TWILIO_FROM_NUMBER,
+        Url: `${h.baseUrl}/agent-bridge?${qs}`,
+        Timeout: String(AGENT_RING_TIMEOUT_S),
+        StatusCallback: `${h.baseUrl}/agent-status?${qs}`,
+        StatusCallbackMethod: 'POST',
+    });
+    h.agentCallSid = call.sid;
+    console.log(`[handoff] ringing CM ${agentId} for ${prospectSid} (agent leg ${call.sid})`);
+}
+
+// Nobody can take the call: play 「改めてご連絡いたします」 to the waiting caller, hang up,
+// and leave 要再架電 (the call-status handler reads result=overflow_recall).
+async function finishOverflow(prospectSid) {
+    const h = handoffs.get(prospectSid);
+    let twiml = '<Response><Hangup/></Response>';
+    if (h?.clipPath) {
+        const { data } = await supabase.storage.from(AUDIO_BUCKET).createSignedUrl(h.clipPath, 300);
+        if (data?.signedUrl) twiml = `<Response><Play>${xmlEsc(data.signedUrl)}</Play><Hangup/></Response>`;
+    }
+    const { error } = await supabase
+        .from('call_sessions')
+        .update({ result: 'overflow_recall' })
+        .eq('call_sid', prospectSid);
+    if (error) console.error('[handoff] overflow result update failed:', error.message);
+    try {
+        await updateLiveCall(prospectSid, twiml);
+    } catch (err) {
+        console.error('[handoff] could not end the waiting caller:', err);
+    }
+    forgetHandoff(prospectSid);
+}
+
+// The CM did not pick up (or the leg failed): mark them 離席 (10秒ルール) and try the next
+// free CM in the same project while the caller is still waiting.
+async function onAgentLegFailed(prospectSid, { markAway, agentId } = {}) {
+    const h = handoffs.get(prospectSid);
+    if (!h) return;
+    const failedAgent = agentId || h.agentId;
+    await setAgentState(failedAgent, markAway ? 'away' : 'idle');
+    if (failedAgent) h.excluded.push(failedAgent);
+    h.agentId = null;
+    h.agentCallSid = null;
+
+    let waiting = false;
+    try {
+        const c = await twilioApi(`/Calls/${prospectSid}.json`);
+        waiting = ['queued', 'ringing', 'in-progress'].includes(c.status);
+    } catch (err) {
+        console.error('[handoff] could not read the caller status:', err);
+    }
+    if (!waiting) {
+        forgetHandoff(prospectSid);
+        return;
+    }
+
+    let next = null;
+    try {
+        next = await claimAgent(h.projectId, null, h.excluded);
+    } catch (err) {
+        console.error('[handoff] claim next agent failed:', err);
+    }
+    if (!next) {
+        await finishOverflow(prospectSid);
+        return;
+    }
+    try {
+        await dialAgent(prospectSid, next);
+    } catch (err) {
+        console.error('[handoff] could not ring the next CM:', err);
+        await setAgentState(next, 'idle');
+        await finishOverflow(prospectSid);
+    }
 }
 
 // =====================================================================
@@ -897,7 +1063,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
 
     // Bust the per-tenant playbook cache and this tenant's clip audio cache so
     // the next call picks up the new script immediately.
-    playbookCache.delete(tenant_id);
+    bustPlaybookCache(tenant_id);
     for (const key of [...audioCache.keys()]) {
         if (key === `${base}` || key.startsWith(`${base}/`)) audioCache.delete(key);
     }
@@ -1090,6 +1256,9 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         agent_phone: ctx.agent_phone || '',
         agent_name: ctx.agent_name || '',
         tenant_id: ctx.tenant_id || '',
+        operator_id: ctx.operator_id || '',
+        project_id: ctx.project_id || '',
+        contact_id: ctx.contact_id || '',
     });
     const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
     const form = new URLSearchParams({
@@ -1118,6 +1287,9 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         status: 'pending',
         script_phase: 'greeting',
         tenant_id: ctx.tenant_id,
+        contact_id: ctx.contact_id || null,
+        operator_id: ctx.operator_id || null,
+        project_id: ctx.project_id || null,
     }).select('id').single();
     if (sInsErr) {
         // If we can't create the session row we must not dial — a dial without
@@ -1321,6 +1493,8 @@ const RESULT_STATUS_MAP = {
     not_available: '不在', rejected: '断り', voicemail: '留守電',
     silence_timeout: '無音切断', duration_timeout: '時間切れ',
     loop_detected: 'ループ', error_limit: 'エラー',
+    // 受付は突破したが渡せる CM がいなかった＝未架電に戻し、要再架電で優先して掛け直す
+    overflow_recall: '未架電',
     'no-answer': '不在', busy: '話し中', failed: '失敗', canceled: 'キャンセル',
 };
 function priorityForResult(result) {
@@ -1370,7 +1544,7 @@ fastify.post('/call-status', async (request, reply) => {
         // PRESERVED result so the contact's terminal label is derived from the
         // rich in-call result, not blindly from Twilio's CallStatus.
         const { data: session } = await supabase.from('call_sessions')
-            .select('id, company_name, contact_name, result, phone_number, tenant_id, metadata')
+            .select('id, company_name, contact_name, result, phone_number, tenant_id, metadata, contact_id')
             .eq('call_sid', callSid)
             .order('created_at', { ascending: false })
             .limit(1)
@@ -1392,10 +1566,16 @@ fastify.post('/call-status', async (request, reply) => {
 
         // (c) CRITICAL reset — always move the contact off 架電中, even if the
         // Claude enrichment below fails. This is the fix for the stuck-架電中 bug.
-        const { error: cErr } = await supabase.from('contacts')
-            .update({ status: contactStatus, priority, call_duration_seconds: duration, updated_at: new Date().toISOString() })
-            .eq('phone_number', session.phone_number)
-            .eq('tenant_id', session.tenant_id);
+        // 架電先は id で当てる（同じ番号が別プロジェクトにも在りうる）。id の無い旧い通話だけ番号で当てる。
+        const contactPatch = {
+            status: contactStatus, priority, call_duration_seconds: duration, updated_at: new Date().toISOString(),
+        };
+        if (result === 'overflow_recall') contactPatch.needs_recall = true;
+        const { error: cErr } = await (session.contact_id
+            ? supabase.from('contacts').update(contactPatch).eq('id', session.contact_id)
+            : supabase.from('contacts').update(contactPatch)
+                .eq('phone_number', session.phone_number)
+                .eq('tenant_id', session.tenant_id));
         if (cErr) console.error('[call-status] contact reset failed:', cErr.message);
         else console.log(`[call-status] contact ${session.phone_number} → ${contactStatus} (result=${result}, call=${callSid})`);
 
@@ -1431,6 +1611,7 @@ ${log}
 - voicemail: 留守番電話
 - silence_timeout / duration_timeout: タイムアウト
 - loop_detected / error_limit: 異常終了
+- overflow_recall: 受付は突破したが取れる担当がいなかった（要再架電・優先して掛け直す）
 - no-answer / busy / failed / canceled: Twilio標準
 
 以下のJSONのみを返してください（他のテキスト不要）：
@@ -1452,10 +1633,12 @@ ${log}
                 nextCallDate = parsed.next_call_date || null;
             } catch { memo = text.substring(0, 100); }
 
-            await supabase.from('contacts')
-                .update({ memo, next_call_date: nextCallDate || null })
-                .eq('phone_number', session.phone_number)
-                .eq('tenant_id', session.tenant_id);
+            const enrich = { memo, next_call_date: nextCallDate || null };
+            await (session.contact_id
+                ? supabase.from('contacts').update(enrich).eq('id', session.contact_id)
+                : supabase.from('contacts').update(enrich)
+                    .eq('phone_number', session.phone_number)
+                    .eq('tenant_id', session.tenant_id));
         } catch (e) {
             console.error('[call-status] enrichment failed (contact already reset):', e);
         }
@@ -1549,7 +1732,7 @@ const MAX_CLIP_UPLOAD_BYTES = 3 * 1024 * 1024;
 
 // Drop cached audio + playbook for a tenant so the next call reloads them.
 function bustTenantAudio(tenantId, base) {
-    playbookCache.delete(tenantId);
+    bustPlaybookCache(tenantId);
     for (const k of [...audioCache.keys()]) {
         if (k === `${base}` || k.startsWith(`${base}/`)) audioCache.delete(k);
     }
@@ -1661,6 +1844,158 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
     }
 });
 
+// ---------------------------------------------------------------------
+// 自動架電（作る順番の2番目）＝ログイン中の CM のブラウザが数秒おきにここを叩く。
+// その CM が「空き」なら、その CM の担当分を、同時にかける件数の枠まで発信する。
+// CM がタブを閉じれば叩かれなくなる＝架電も止まる（サーバ側に常駐の仕組みを持たない）。
+// ---------------------------------------------------------------------
+async function voiceSetGate(tenantId, operatorId) {
+    const { data: pb, error } = await resolvePlaybookRow(tenantId, operatorId);
+    if (error) return `playbook lookup failed: ${error.message}`;
+    if (!pb) return '台本がありません（Voice Setup で台本と音声を設定してください）';
+    const { data: clips, error: clipErr } = await supabase
+        .from('audio_clips').select('audio_ready').eq('playbook_id', pb.id).eq('active', true);
+    if (clipErr) return `clip audio check failed: ${clipErr.message}`;
+    if (!clips || clips.length === 0) return 'セリフが1件もありません（Voice Setup で台本を作ってください）';
+    const missing = clips.filter((c) => !c.audio_ready).length;
+    if (missing > 0) return `音声が未設定のセリフが ${missing} 件あるため架電できません`;
+    return null;
+}
+
+fastify.post('/dial-tick', async (request, reply) => {
+    if (!verifyProvisionSecret(request)) {
+        return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const userId = String(request.body?.user_id || '').trim();
+    if (!userId) return reply.code(400).send({ error: 'user_id is required' });
+
+    const { data: u, error: uErr } = await supabase
+        .from('user_profiles')
+        .select('id, tenant_id, is_active, is_online, call_state, call_state_at')
+        .eq('id', userId)
+        .maybeSingle();
+    if (uErr) return reply.code(500).send({ error: uErr.message });
+    if (!u || !u.is_active) return reply.send({ ok: true, dialed: 0, reason: 'inactive' });
+
+    // 通話中のまま残った状態の掃除＝取った通話がもう無く、2分以上たっていれば空きに戻す。
+    if (u.call_state === 'on_call') {
+        const stale = Date.now() - new Date(u.call_state_at).getTime() > 2 * 60 * 1000;
+        const ringing = [...handoffs.values()].some((h) => h.agentId === userId);
+        if (stale && !ringing) {
+            const { count: live } = await supabase
+                .from('call_sessions')
+                .select('id', { count: 'exact', head: true })
+                .eq('handled_by', userId)
+                .eq('status', 'calling');
+            if (!live) await setAgentState(userId, 'idle');
+        }
+        return reply.send({ ok: true, dialed: 0, reason: 'on_call' });
+    }
+    if (!u.is_online || u.call_state !== 'idle') {
+        return reply.send({ ok: true, dialed: 0, reason: u.is_online ? u.call_state : 'offline' });
+    }
+
+    const gate = await voiceSetGate(u.tenant_id, userId);
+    if (gate) {
+        console.log(`[dial-tick] blocked operator=${userId} reason=${gate}`);
+        return reply.send({ ok: true, dialed: 0, reason: gate });
+    }
+
+    // 同時にかける件数＝この CM の分（「一人あたり3〜5件」か「人数に応じて自動」かは試しながら調整＝env）。
+    const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { count: inFlight } = await supabase
+        .from('call_sessions')
+        .select('id', { count: 'exact', head: true })
+        .eq('operator_id', userId)
+        .in('status', ['pending', 'calling'])
+        .gte('created_at', since);
+    const slots = Math.max(0, PER_OPERATOR_CONCURRENCY - (inFlight || 0));
+    if (slots === 0) return reply.send({ ok: true, dialed: 0, reason: 'at concurrency cap', in_flight: inFlight || 0 });
+
+    const { data: claimed, error: claimErr } = await supabase
+        .rpc('claim_contacts_for_operator', { p_user: userId, p_limit: slots });
+    if (claimErr) return reply.code(500).send({ error: `claim failed: ${claimErr.message}` });
+    const contacts = claimed || [];
+    if (contacts.length === 0) return reply.send({ ok: true, dialed: 0, reason: 'no 未架電 contacts' });
+
+    const baseUrl = `https://${request.headers.host}`;
+    let dialed = 0;
+    let failed = 0;
+    for (let i = 0; i < contacts.length; i++) {
+        const c = contacts[i];
+        try {
+            await placeOutboundCall(baseUrl, c, {
+                tenant_id: c.tenant_id,
+                operator_id: userId,
+                project_id: c.project_id,
+                contact_id: c.id,
+            });
+            dialed++;
+        } catch (e) {
+            failed++;
+            console.error(`[dial-tick] dial failed for contact ${c.id}:`, e);
+            const { error: revErr } = await supabase.rpc('unclaim_contact', { p_contact: c.id });
+            if (revErr) console.error(`[dial-tick] unclaim failed for contact ${c.id}:`, revErr.message);
+        }
+        if (i < contacts.length - 1) await new Promise((r) => setTimeout(r, DIAL_SPACING_MS));
+    }
+    return reply.send({ ok: true, dialed, failed, in_flight_before: inFlight || 0 });
+});
+
+// 保留音（<Enqueue waitUrl>）。Twilio が待っている間くり返し取りに来る。
+fastify.all('/hold-music', async (request, reply) => {
+    const url = `https://${request.headers.host}${request.raw.url}`;
+    const params = request.method === 'POST' ? (request.body || {}) : {};
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+    reply.type('text/xml').send(`<Response><Play loop="0">${xmlEsc(HOLD_MUSIC_URL)}</Play></Response>`);
+});
+
+// CM のブラウザが出た瞬間に Twilio が取りに来る＝保留中の相手とつなぐ。
+fastify.all('/agent-bridge', async (request, reply) => {
+    const url = `https://${request.headers.host}${request.raw.url}`;
+    const params = request.method === 'POST' ? (request.body || {}) : {};
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+    const prospect = String(request.query.prospect || '');
+    const h = handoffs.get(prospect);
+    if (!h || !h.agentId) {
+        return reply.type('text/xml').send('<Response><Hangup/></Response>');
+    }
+    const { error } = await supabase
+        .from('call_sessions')
+        .update({ handled_by: h.agentId })
+        .eq('call_sid', prospect);
+    if (error) console.error('[handoff] handled_by update failed:', error.message);
+    console.log(`[handoff] CM ${h.agentId} picked up ${prospect}`);
+    reply.type('text/xml').send(`<Response><Dial><Queue>${queueName(prospect)}</Queue></Dial></Response>`);
+});
+
+// CM 側の1本が終わった／出なかった。出た通話が終わった → 空きに戻す。出なかった → 離席にして次の人へ。
+fastify.post('/agent-status', async (request, reply) => {
+    const url = `https://${request.headers.host}${request.raw.url}`;
+    const params = request.body || {};
+    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+    const prospect = String(request.query.prospect || '');
+    const h = handoffs.get(prospect);
+    if (!h || params.CallSid !== h.agentCallSid) return reply.send({ ok: true, ignored: true });
+
+    const status = params.CallStatus || '';
+    const duration = params.CallDuration ? parseInt(params.CallDuration, 10) : 0;
+    if (status === 'completed' && duration > 0) {
+        await setAgentState(h.agentId, 'idle');
+        forgetHandoff(prospect);
+        return reply.send({ ok: true, released: true });
+    }
+    console.log(`[handoff] CM ${h.agentId} did not pick up (${status}); trying the next CM`);
+    await onAgentLegFailed(prospect, { markAway: true });
+    return reply.send({ ok: true, retried: true });
+});
+
 fastify.all('/incoming-call', async (request, reply) => {
     // Same Twilio-signature gate as /recording-status. The kick-call WF
     // passes call params in the query string, which Twilio includes in the
@@ -1679,6 +2014,9 @@ fastify.all('/incoming-call', async (request, reply) => {
     const agent_phone = escXml(decodeURIComponent(request.query.agent_phone || ''));
     const agent_name = escXml(decodeURIComponent(request.query.agent_name || ''));
     const tenant_id = escXml(decodeURIComponent(request.query.tenant_id || ''));
+    const operator_id = escXml(decodeURIComponent(request.query.operator_id || ''));
+    const project_id = escXml(decodeURIComponent(request.query.project_id || ''));
+    const contact_id = escXml(decodeURIComponent(request.query.contact_id || ''));
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -1690,6 +2028,9 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="agent_phone" value="${agent_phone}" />
             <Parameter name="agent_name" value="${agent_name}" />
             <Parameter name="tenant_id" value="${tenant_id}" />
+            <Parameter name="operator_id" value="${operator_id}" />
+            <Parameter name="project_id" value="${project_id}" />
+            <Parameter name="contact_id" value="${contact_id}" />
             <Parameter name="stream_token" value="${issueStreamToken()}" />
         </Stream>
     </Connect>
@@ -1702,7 +2043,8 @@ fastify.all('/incoming-call', async (request, reply) => {
 // =====================================================================
 
 fastify.register(async (fastify) => {
-    fastify.get('/media-stream', { websocket: true }, (connection /*, req */) => {
+    fastify.get('/media-stream', { websocket: true }, (connection, req) => {
+        const publicHost = req?.headers?.host || '';
         console.log('▶ Twilio client connected');
 
         // --- Pre-auth gate (review finding #6) ---------------------------
@@ -2030,11 +2372,78 @@ fastify.register(async (fastify) => {
         // kept after a successful transfer and auto-expires via TTL —
         // there is no live-call signal we can use to release it early.
         // -----------------------------------------------------------------
+        // 作る順番の2番目（家 §3-2）＝相手を保留（保留音）にして、空いている CM のブラウザへつなぐ。
+        // 渡す相手＝かけた本人 → 同じプロジェクトで一番長く空いている人 → 誰もいなければ
+        // 「改めてご連絡いたします」で切って、要再架電を付ける。
+        const handoffToBrowser = async () => {
+            const tenantId = callParams.tenant_id;
+            const projectId = callParams.project_id;
+            const operatorId = callParams.operator_id || null;
+            let agentId = null;
+            try {
+                agentId = await claimAgent(projectId, operatorId, []);
+            } catch (err) {
+                console.error('[handoff] claim agent failed:', err);
+            }
+            if (!agentId) {
+                console.log(`[handoff] no free CM in project ${projectId}; asking to call back later`);
+                if (cfg?.clips.has('callback_request')) {
+                    try {
+                        await playAudio('callback_request');
+                    } catch (err) {
+                        console.error('[handoff] callback_request playback failed:', err);
+                    }
+                }
+                await endCallWithFarewell('overflow_recall', { playFarewell: false });
+                return;
+            }
+
+            const clip = cfg?.clips.get('callback_request');
+            registerHandoff(callSid, {
+                tenantId,
+                projectId,
+                agentId: null,
+                agentCallSid: null,
+                excluded: [],
+                baseUrl: `https://${publicHost}`,
+                clipPath: clip ? (cfg.audioBasePath ? `${cfg.audioBasePath}/${clip.filename}` : clip.filename) : null,
+            });
+            try {
+                await updateLiveCall(callSid, enqueueTwiml(`https://${publicHost}`, callSid));
+            } catch (err) {
+                console.error('[handoff] could not put the caller on hold:', err);
+                await setAgentState(agentId, 'idle');
+                forgetHandoff(callSid);
+                await endCallWithFarewell('error_limit');
+                return;
+            }
+            // The live call now runs the <Enqueue> TwiML; this media stream is over.
+            state = 'ENDED';
+            const { error: updErr } = await supabase
+                .from('call_sessions')
+                .update({ result: 'transferred' })
+                .eq('call_sid', callSid);
+            if (updErr) console.error('[handoff] call_sessions update error:', updErr);
+            try {
+                await dialAgent(callSid, agentId);
+            } catch (err) {
+                console.error('[handoff] could not ring the CM:', err);
+                await onAgentLegFailed(callSid, { markAway: false, agentId });
+            }
+        };
+
         const handleTransfer = async () => {
             disableVad('transferring');
             const tenantId = callParams?.tenant_id;
             const agentPhone = callParams?.agent_phone;
             const agentName = callParams?.agent_name;
+
+            // 担当 CM とプロジェクトが付いた通話（自動架電）は、保留音 → ブラウザ。
+            // 手動の「Make a Call」（担当者の携帯へ直結）はこれまでどおり下の経路。
+            if (callSid && tenantId && callParams?.project_id) {
+                await handoffToBrowser();
+                return;
+            }
 
             if (!callSid) {
                 console.error('[transfer] callSid missing; cannot transfer');
@@ -2807,7 +3216,7 @@ fastify.register(async (fastify) => {
                         );
                         // Load the tenant's playbook, then greet. Without a
                         // playbook there's nothing to say, so end gracefully.
-                        loadPlaybook(callParams.tenant_id)
+                        loadPlaybook(callParams.tenant_id, callParams.operator_id || null)
                             .then((loaded) => {
                                 if (!loaded) {
                                     console.error(
