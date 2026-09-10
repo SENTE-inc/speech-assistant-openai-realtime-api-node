@@ -657,6 +657,8 @@ const HOLD_MUSIC_URL = process.env.HOLD_MUSIC_URL
     || 'http://com.twilio.sounds.music.s3.amazonaws.com/MARKOVICHAMP-Borghestral.mp3';
 const AGENT_RING_TIMEOUT_S = parseInt(process.env.AGENT_RING_TIMEOUT_S || '10', 10);
 const PER_OPERATOR_CONCURRENCY = parseInt(process.env.PER_OPERATOR_CONCURRENCY || '3', 10);
+// まだかける会社（未通電・担当者不在）を次にかけるまでの間（作る順番の3番目）。
+const RETRY_AFTER_HOURS = parseInt(process.env.RETRY_AFTER_HOURS || '24', 10);
 const HANDOFF_TTL_MS = 15 * 60 * 1000;
 const handoffs = new Map(); // prospect callSid -> { tenantId, projectId, agentId, agentCallSid, excluded, baseUrl, clipPath, createdAt }
 
@@ -1566,18 +1568,31 @@ fastify.post('/call-status', async (request, reply) => {
 
         // (c) CRITICAL reset — always move the contact off 架電中, even if the
         // Claude enrichment below fails. This is the fix for the stuck-架電中 bug.
-        // 架電先は id で当てる（同じ番号が別プロジェクトにも在りうる）。id の無い旧い通話だけ番号で当てる。
-        const contactPatch = {
-            status: contactStatus, priority, call_duration_seconds: duration, updated_at: new Date().toISOString(),
-        };
-        if (result === 'overflow_recall') contactPatch.needs_recall = true;
-        const { error: cErr } = await (session.contact_id
-            ? supabase.from('contacts').update(contactPatch).eq('id', session.contact_id)
-            : supabase.from('contacts').update(contactPatch)
+        // 自動架電の通話（contact_id あり）＝AI が付ける結果・上限回数・再コールは DB 関数が決める
+        // （作る順番の3番目・家 ▼Tom 待ち #3）。id の無い旧い通話（手動の Make a Call）はこれまでどおり番号で当てる。
+        let cErr = null;
+        if (session.contact_id) {
+            const { data: applied, error } = await supabase.rpc('apply_call_outcome', {
+                p_session: session.id,
+                p_retry: `${RETRY_AFTER_HOURS} hours`,
+            });
+            cErr = error;
+            if (!error) {
+                console.log(
+                    `[call-status] contact ${session.contact_id} → ${applied ?? '(CM が付ける／回数に数えない)'} ` +
+                        `(result=${result}, call=${callSid})`
+                );
+            }
+            await supabase.from('contacts').update({ call_duration_seconds: duration }).eq('id', session.contact_id);
+        } else {
+            const { error } = await supabase.from('contacts')
+                .update({ status: contactStatus, priority, call_duration_seconds: duration, updated_at: new Date().toISOString() })
                 .eq('phone_number', session.phone_number)
-                .eq('tenant_id', session.tenant_id));
+                .eq('tenant_id', session.tenant_id);
+            cErr = error;
+            if (!error) console.log(`[call-status] contact ${session.phone_number} → ${contactStatus} (result=${result}, call=${callSid})`);
+        }
         if (cErr) console.error('[call-status] contact reset failed:', cErr.message);
-        else console.log(`[call-status] contact ${session.phone_number} → ${contactStatus} (result=${result}, call=${callSid})`);
 
         // (d) Best-effort enrichment: summarize the conversation for memo/next_call_date.
         try {
