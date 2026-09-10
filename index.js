@@ -1265,7 +1265,8 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
     const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
     const form = new URLSearchParams({
         To: contact.phone_number,
-        From: TWILIO_FROM_NUMBER,
+        // プロジェクトの番号（作る順番の6番目）があればそれ、無ければ共通の番号
+        From: ctx.from_number || TWILIO_FROM_NUMBER,
         Url: `${baseUrl}/incoming-call?${qs.toString()}`,
         StatusCallback: TWILIO_STATUS_CALLBACK_URL || `${baseUrl}/call-status`,
         StatusCallbackMethod: 'POST',
@@ -1934,6 +1935,18 @@ fastify.post('/dial-tick', async (request, reply) => {
     if (contacts.length === 0) return reply.send({ ok: true, dialed: 0, reason: 'no 未架電 contacts' });
 
     const baseUrl = `https://${request.headers.host}`;
+    // 発信番号＝プロジェクトごとに1本（BAN 対策・家 §3-3）。付いていなければ共通の番号。
+    const projectIds = [...new Set(contacts.map((c) => c.project_id).filter(Boolean))];
+    const fromByProject = new Map();
+    if (projectIds.length > 0) {
+        const { data: nums, error: numErr } = await supabase
+            .from('phone_numbers')
+            .select('project_id, e164')
+            .in('project_id', projectIds)
+            .eq('status', 'active');
+        if (numErr) console.error('[dial-tick] phone number lookup failed:', numErr.message);
+        for (const n of nums || []) fromByProject.set(n.project_id, n.e164);
+    }
     let dialed = 0;
     let failed = 0;
     for (let i = 0; i < contacts.length; i++) {
@@ -1944,6 +1957,7 @@ fastify.post('/dial-tick', async (request, reply) => {
                 operator_id: userId,
                 project_id: c.project_id,
                 contact_id: c.id,
+                from_number: fromByProject.get(c.project_id) || null,
             });
             dialed++;
         } catch (e) {
@@ -2009,6 +2023,119 @@ fastify.post('/agent-status', async (request, reply) => {
     console.log(`[handoff] CM ${h.agentId} did not pick up (${status}); trying the next CM`);
     await onAgentLegFailed(prospect, { markAway: true });
     return reply.send({ ok: true, retried: true });
+});
+
+// ---------------------------------------------------------------------
+// 発信番号（作る順番の6番目）＝アプリの中から Twilio で 050 を買う／今ある番号を登録する。
+// 買い方＝承認済みの Regulatory Bundle と、その Bundle に入っている住所を付けて買う（家 §3「▼ Twilio
+// Regulatory Bundle と 050番号」）。050 は type=Local を Contains=8150* で絞る（National は 404）。
+// 🔴 買う＝月額が発生する＝1回ごとに人（Tom）が画面で確認して押す。ここは言われた番号を買うだけ。
+// ---------------------------------------------------------------------
+const TWILIO_BUNDLE_SID = process.env.TWILIO_BUNDLE_SID || 'BU176d3e3a0538e56b0bcef459b2b4e8ec';
+const TWILIO_ADDRESS_SID = process.env.TWILIO_ADDRESS_SID || 'AD2e3d30278b1b6aab805156d67342c62c';
+const NUMBER_MONTHLY_JPY = parseFloat(process.env.NUMBER_MONTHLY_JPY || '766.64'); // 2026-09-10 Twilio Pricing API 実測
+
+fastify.post('/numbers/available', async (request, reply) => {
+    if (!verifyProvisionSecret(request)) return reply.code(401).send({ error: 'unauthorized' });
+    try {
+        const data = await twilioApi('/AvailablePhoneNumbers/JP/Local.json?Contains=8150*&VoiceEnabled=true&PageSize=10');
+        const numbers = (data.available_phone_numbers || [])
+            .filter((n) => String(n.phone_number || '').startsWith('+8150'))
+            .map((n) => ({ phone_number: n.phone_number, friendly_name: n.friendly_name }));
+        return reply.send({ ok: true, numbers, monthly_cost_jpy: NUMBER_MONTHLY_JPY });
+    } catch (err) {
+        console.error('[numbers] search failed:', err);
+        return reply.code(502).send({ error: '空き番号を探せませんでした' });
+    }
+});
+
+fastify.post('/numbers/owned', async (request, reply) => {
+    if (!verifyProvisionSecret(request)) return reply.code(401).send({ error: 'unauthorized' });
+    try {
+        const data = await twilioApi('/IncomingPhoneNumbers.json?PageSize=100');
+        const owned = (data.incoming_phone_numbers || []).map((n) => ({
+            sid: n.sid,
+            phone_number: n.phone_number,
+            friendly_name: n.friendly_name,
+        }));
+        const { data: known } = await supabase.from('phone_numbers').select('twilio_sid, tenant_id');
+        const knownBySid = new Map((known || []).map((k) => [k.twilio_sid, k.tenant_id]));
+        return reply.send({
+            ok: true,
+            numbers: owned.map((n) => ({ ...n, registered_tenant_id: knownBySid.get(n.sid) || null })),
+        });
+    } catch (err) {
+        console.error('[numbers] list failed:', err);
+        return reply.code(502).send({ error: 'Twilio の番号を読めませんでした' });
+    }
+});
+
+fastify.post('/numbers/purchase', async (request, reply) => {
+    if (!verifyProvisionSecret(request)) return reply.code(401).send({ error: 'unauthorized' });
+    const tenantId = String(request.body?.tenant_id || '').trim();
+    const phoneNumber = String(request.body?.phone_number || '').trim();
+    const friendlyName = String(request.body?.friendly_name || '').trim() || `AI Voice ${phoneNumber}`;
+    if (!tenantId || !/^\+8150\d{8}$/.test(phoneNumber)) {
+        return reply.code(400).send({ error: '050 の番号とテナントを指定してください' });
+    }
+    let bought;
+    try {
+        bought = await twilioApi('/IncomingPhoneNumbers.json', {
+            PhoneNumber: phoneNumber,
+            BundleSid: TWILIO_BUNDLE_SID,
+            AddressSid: TWILIO_ADDRESS_SID,
+            FriendlyName: friendlyName,
+        });
+    } catch (err) {
+        console.error('[numbers] purchase failed:', err);
+        return reply.code(502).send({ error: '番号を買えませんでした（Twilio が受け付けませんでした）' });
+    }
+    const { data: row, error } = await supabase
+        .from('phone_numbers')
+        .insert({
+            tenant_id: tenantId,
+            e164: bought.phone_number,
+            twilio_sid: bought.sid,
+            friendly_name: bought.friendly_name || friendlyName,
+            monthly_cost_jpy: NUMBER_MONTHLY_JPY,
+        })
+        .select('id, e164, twilio_sid')
+        .single();
+    if (error) {
+        // 買えたのに記録できなかった＝登録し直せば済む（番号は Twilio に在る）
+        console.error(`[numbers] bought ${bought.sid} but could not record it:`, error.message);
+        return reply.code(500).send({ error: `番号は買えましたが記録に失敗しました（${bought.phone_number}）。「Twilio にある番号を登録」から登録してください` });
+    }
+    console.log(`[numbers] purchased ${bought.phone_number} (${bought.sid}) for tenant ${tenantId}`);
+    return reply.send({ ok: true, number: row });
+});
+
+fastify.post('/numbers/register', async (request, reply) => {
+    if (!verifyProvisionSecret(request)) return reply.code(401).send({ error: 'unauthorized' });
+    const tenantId = String(request.body?.tenant_id || '').trim();
+    const sid = String(request.body?.sid || '').trim();
+    if (!tenantId || !/^PN[0-9a-f]{32}$/.test(sid)) return reply.code(400).send({ error: 'テナントと番号の SID を指定してください' });
+    let n;
+    try {
+        n = await twilioApi(`/IncomingPhoneNumbers/${sid}.json`);
+    } catch (err) {
+        console.error('[numbers] lookup failed:', err);
+        return reply.code(404).send({ error: 'その番号は Twilio にありません' });
+    }
+    const { data: row, error } = await supabase
+        .from('phone_numbers')
+        .insert({
+            tenant_id: tenantId,
+            e164: n.phone_number,
+            twilio_sid: n.sid,
+            friendly_name: n.friendly_name,
+            monthly_cost_jpy: String(n.phone_number || '').startsWith('+8150') ? NUMBER_MONTHLY_JPY : null,
+            purchased_at: n.date_created ? new Date(n.date_created).toISOString() : new Date().toISOString(),
+        })
+        .select('id, e164, twilio_sid')
+        .single();
+    if (error) return reply.code(400).send({ error: error.message.includes('duplicate') ? 'この番号はもう登録されています' : error.message });
+    return reply.send({ ok: true, number: row });
 });
 
 fastify.all('/incoming-call', async (request, reply) => {
