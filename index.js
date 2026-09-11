@@ -194,6 +194,18 @@ async function fetchClip(path) {
     return buf;
 }
 
+// 先頭のバイトで形式を決める（レビュー F）＝アップロードされた何かを ffmpeg の自動判定に任せない。
+// 声のファイルは TTS の mp3・画面が録音を直した wav・それ以前に録った肉声の m4a（名前は .mp3 のまま中身は
+// `ftypM4A `＝2026-09-12 本番の使用中48本のうち22本・sente の肉声）の3つ。m4a を落とすと今の肉声が無音になる。
+function detectAudioFormat(buf) {
+    if (!buf || buf.length < 4) return null;
+    if (buf.length >= 12 && buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WAVE') return 'wav';
+    if (buf.length >= 8 && buf.toString('latin1', 4, 8) === 'ftyp') return 'mp4'; // m4a／mp4（ISO BMFF）
+    if (buf.toString('latin1', 0, 3) === 'ID3') return 'mp3';
+    if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return 'mp3'; // MPEG の frame sync
+    return null;
+}
+
 // Convert MP3 buffer -> mulaw 8kHz mono by spawning ffmpeg directly.
 // We MUST write to a temp file rather than stdin, because the MP3 demuxer
 // needs to seek over ID3v2/VBR headers — which fails on a pipe with
@@ -203,12 +215,16 @@ function convertMp3ToMulaw(mp3Buffer, label = '') {
         if (!mp3Buffer || mp3Buffer.length === 0) {
             return reject(new Error(`[ffmpeg ${label}] input mp3 buffer is empty`));
         }
+        const format = detectAudioFormat(mp3Buffer);
+        if (!format) {
+            return reject(new Error(`[ffmpeg ${label}] not an mp3/wav/m4a file; refusing to decode`));
+        }
 
         let tmpDir;
         let tmpFile;
         try {
             tmpDir = mkdtempSync(join(tmpdir(), 'mp3conv-'));
-            tmpFile = join(tmpDir, 'in.mp3');
+            tmpFile = join(tmpDir, `in.${format}`);
             writeFileSync(tmpFile, mp3Buffer);
         } catch (err) {
             console.error(`[ffmpeg ${label}] tmp file write failed:`, err);
@@ -223,6 +239,9 @@ function convertMp3ToMulaw(mp3Buffer, label = '') {
         const args = [
             '-hide_banner',
             '-loglevel', 'error',
+            // 入力は手元の1ファイルだけ・形式は先頭のバイトで決めた物に固定する
+            '-protocol_whitelist', 'file',
+            '-f', format,
             '-i', tmpFile,
             '-ar', '8000',
             '-ac', '1',
@@ -622,6 +641,14 @@ function hasSufficientTransferEvidence(transcript) {
     return TRANSFER_EVIDENCE_PATTERNS.some((p) => hay.includes(p));
 }
 
+// 日本の番号だけにかける（レビュー C2）＝国外・高額番号へ SENTE の Twilio で発信しない。
+const isJapaneseE164 = (p) => /^\+81\d{9,10}$/.test(String(p || ''));
+// ログに電話番号を出さない（レビュー D1）＝末尾4桁だけ。
+const maskPhone = (p) => {
+    const s = String(p || '');
+    return s.length > 4 ? `***${s.slice(-4)}` : (s ? '***' : '');
+};
+
 // =====================================================================
 // Twilio REST: hand off the live call to a human agent
 // =====================================================================
@@ -630,11 +657,15 @@ async function transferCall(callSid, agentPhone) {
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
         throw new Error('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not configured');
     }
+    // 担当者の番号は TwiML に埋める＝日本の番号でなければつながない・エスケープする（レビュー C2・F）
+    if (!isJapaneseE164(agentPhone)) {
+        throw new Error('agent phone is not a Japanese number');
+    }
     const url =
         `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
     const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
 
-    const twiml = `<Response><Dial>${agentPhone}</Dial></Response>`;
+    const twiml = `<Response><Dial>${xmlEsc(agentPhone)}</Dial></Response>`;
 
     const res = await fetch(url, {
         method: 'POST',
@@ -649,7 +680,7 @@ async function transferCall(callSid, agentPhone) {
         const text = await res.text().catch(() => '');
         throw new Error(`Twilio transfer failed: ${res.status} ${text}`);
     }
-    console.log(`✓ Call transferred to ${agentPhone} (callSid=${callSid})`);
+    console.log(`✓ Call transferred to ${maskPhone(agentPhone)} (callSid=${callSid})`);
 }
 
 // =====================================================================
@@ -661,6 +692,9 @@ async function transferCall(callSid, agentPhone) {
 const HOLD_MUSIC_URL = process.env.HOLD_MUSIC_URL
     || 'http://com.twilio.sounds.music.s3.amazonaws.com/MARKOVICHAMP-Borghestral.mp3';
 const AGENT_RING_TIMEOUT_S = parseInt(process.env.AGENT_RING_TIMEOUT_S || '10', 10);
+// 保留の上限（秒・レビュー C4）＝超えたら保留から出して「改めてご連絡いたします」で切る。
+// 保留音を1曲ごとに取りに来させてここで見る＝エンジンが再起動して handoffs が消えても止まる。
+const HOLD_MAX_SECONDS = parseInt(process.env.HOLD_MAX_SECONDS || '120', 10);
 const PER_OPERATOR_CONCURRENCY = parseInt(process.env.PER_OPERATOR_CONCURRENCY || '3', 10);
 // まだかける会社（未通電・担当者不在）を次にかけるまでの間（作る順番の3番目）。
 const RETRY_AFTER_HOURS = parseInt(process.env.RETRY_AFTER_HOURS || '24', 10);
@@ -706,8 +740,10 @@ async function twilioApi(path, form) {
 
 const updateLiveCall = (callSid, twiml) => twilioApi(`/Calls/${callSid}.json`, { Twiml: twiml });
 
+// action＝保留から出た時（上限の <Leave/>・CM との通話の後）に Twilio が取りに来る＝/queue-exit
 const enqueueTwiml = (baseUrl, callSid) =>
-    `<Response><Enqueue waitUrl="${xmlEsc(`${baseUrl}/hold-music`)}" waitUrlMethod="POST">${queueName(callSid)}</Enqueue></Response>`;
+    `<Response><Enqueue action="${xmlEsc(`${baseUrl}/queue-exit`)}" method="POST" ` +
+    `waitUrl="${xmlEsc(`${baseUrl}/hold-music`)}" waitUrlMethod="POST">${queueName(callSid)}</Enqueue></Response>`;
 
 async function claimAgent(projectId, preferred, exclude) {
     const { data, error } = await supabase.rpc('claim_agent_for_handoff', {
@@ -743,20 +779,57 @@ async function dialAgent(prospectSid, agentId) {
     console.log(`[handoff] ringing CM ${agentId} for ${prospectSid} (agent leg ${call.sid})`);
 }
 
-// Nobody can take the call: play 「改めてご連絡いたします」 to the waiting caller, hang up,
-// and leave 要再架電 (the call-status handler reads result=overflow_recall).
-async function finishOverflow(prospectSid) {
-    const h = handoffs.get(prospectSid);
+// 「改めてご連絡いたします」を流して切る TwiML を作り、要再架電の印（result=overflow_recall）を付ける。
+// finishOverflow（保留中の相手を REST で切り替える）と /queue-exit（保留から出た相手に返す）の共通部分。
+// 印は「取次の途中（result が transferred か空・誰も取っていない）」の時だけ＝別の結果を上書きしない。
+async function buildOverflow(prospectSid, clipPath) {
     let twiml = '<Response><Hangup/></Response>';
-    if (h?.clipPath) {
-        const { data } = await supabase.storage.from(AUDIO_BUCKET).createSignedUrl(h.clipPath, 300);
+    if (clipPath) {
+        const { data } = await supabase.storage.from(AUDIO_BUCKET).createSignedUrl(clipPath, 300);
         if (data?.signedUrl) twiml = `<Response><Play>${xmlEsc(data.signedUrl)}</Play><Hangup/></Response>`;
     }
     const { error } = await supabase
         .from('call_sessions')
         .update({ result: 'overflow_recall' })
-        .eq('call_sid', prospectSid);
+        .eq('call_sid', prospectSid)
+        .is('handled_by', null)
+        .or('result.is.null,result.eq.transferred');
     if (error) console.error('[handoff] overflow result update failed:', error.message);
+    return twiml;
+}
+
+// 再起動で handoffs が消えた時の「改めてご連絡いたします」＝通話の行からプロジェクトの台本を引き直す。
+async function callbackClipPathFor(prospectSid) {
+    const { data: s } = await supabase
+        .from('call_sessions')
+        .select('tenant_id, project_id')
+        .eq('call_sid', prospectSid)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    if (!s?.tenant_id) return null;
+    const { data: pb } = await resolvePlaybookRow(s.tenant_id, s.project_id || null);
+    if (!pb) return null;
+    const { data: clip } = await supabase
+        .from('audio_clips')
+        .select('filename, audio_ready')
+        .eq('playbook_id', pb.id)
+        .eq('key', 'callback_request')
+        .eq('active', true)
+        .maybeSingle();
+    if (!clip?.audio_ready) return null;
+    const base = (pb.audio_base_path || '').trim();
+    return base ? `${base}/${clip.filename}` : clip.filename;
+}
+
+// Nobody can take the call: play 「改めてご連絡いたします」 to the waiting caller, hang up,
+// and leave 要再架電 (the call-status handler reads result=overflow_recall).
+async function finishOverflow(prospectSid) {
+    const h = handoffs.get(prospectSid);
+    // /queue-exit が先に片付けていれば何もしない（二重に流さない）
+    if (!h || h.finished) return;
+    h.finished = true;
+    const twiml = await buildOverflow(prospectSid, h.clipPath);
     try {
         await updateLiveCall(prospectSid, twiml);
     } catch (err) {
@@ -769,7 +842,8 @@ async function finishOverflow(prospectSid) {
 // free CM in the same project while the caller is still waiting.
 async function onAgentLegFailed(prospectSid, { markAway, agentId } = {}) {
     const h = handoffs.get(prospectSid);
-    if (!h) return;
+    // /queue-exit か finishOverflow がもう片付けている＝その CM は向こうで空きに戻した（二重に動かない）
+    if (!h || h.finished) return;
     const failedAgent = agentId || h.agentId;
     await setAgentState(failedAgent, markAway ? 'away' : 'idle');
     if (failedAgent) h.excluded.push(failedAgent);
@@ -785,6 +859,14 @@ async function onAgentLegFailed(prospectSid, { markAway, agentId } = {}) {
     }
     if (!waiting) {
         forgetHandoff(prospectSid);
+        return;
+    }
+    if (h.finished) return; // 上の await の間に /queue-exit が片付けた
+
+    // 保留の上限（レビュー C4）＝保留音の曲の変わり目を待たず、次の CM を探す前にもここで見る
+    if (Date.now() - h.createdAt > HOLD_MAX_SECONDS * 1000) {
+        console.log(`[handoff] ${prospectSid} on hold > ${HOLD_MAX_SECONDS}s; not ringing another CM`);
+        await finishOverflow(prospectSid);
         return;
     }
 
@@ -823,18 +905,18 @@ function acquireTransferLock(tenantId, agentPhone, callSid) {
     const existing = transferLocks.get(key);
     const now = Date.now();
     if (existing && now - existing.lockedAt < LOCK_TTL_MS) {
-        console.log(`[lock] transfer blocked for ${key} (held by ${existing.callSid})`);
+        console.log(`[lock] transfer blocked for ${tenantId}:${maskPhone(agentPhone)} (held by ${existing.callSid})`);
         return false;
     }
     transferLocks.set(key, { lockedAt: now, callSid });
-    console.log(`[lock] transfer acquired for ${key} by ${callSid}`);
+    console.log(`[lock] transfer acquired for ${tenantId}:${maskPhone(agentPhone)} by ${callSid}`);
     return true;
 }
 
 function releaseTransferLock(tenantId, agentPhone) {
     const key = `${tenantId}:${agentPhone}`;
     transferLocks.delete(key);
-    console.log(`[lock] transfer released for ${key}`);
+    console.log(`[lock] transfer released for ${tenantId}:${maskPhone(agentPhone)}`);
 }
 
 // =====================================================================
@@ -844,6 +926,20 @@ function releaseTransferLock(tenantId, agentPhone) {
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
+
+// Twilio に渡す URL の元（レビュー F）＝env PUBLIC_BASE_URL があればそれ、無ければ今どおり Host ヘッダ。
+// 署名の検証は Twilio が実際に叩いた URL（Host）で行う＝ここは変えない。
+// 形は https://<host> だけ（パス付き・http は使わず、警告を出して今どおり Host にする）。
+const PUBLIC_BASE_URL = (() => {
+    const raw = (process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+    if (!raw) return '';
+    if (!/^https:\/\/[^/]+$/.test(raw)) {
+        console.warn('[config] PUBLIC_BASE_URL is not "https://<host>"; ignoring it (using the Host header)');
+        return '';
+    }
+    return raw;
+})();
+const publicBaseUrl = (host) => PUBLIC_BASE_URL || `https://${host}`;
 
 // Public liveness endpoints. Kept intentionally minimal — no architecture
 // details, build info, env, or tenant data — so they leak nothing to an
@@ -977,6 +1073,23 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // Per-project sets live under <slug>/p-<project>/ so storage separates cleanly.
     const base = project_id ? `${slug}/p-${project_id}` : slug;
 
+    // 通話中の電話がある間は作り直さない（レビュー E3）＝下でクリップを消して入れ直す間に
+    // 始まった通話が0本の台本を掴むと、無言電話になる。テナント既定の声はプロジェクトを持たない
+    // 通話も使うので、テナント全体で見る。
+    const liveSince = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    let liveQuery = supabase
+        .from('call_sessions').select('id', { count: 'exact', head: true })
+        .eq('status', 'calling').gte('created_at', liveSince);
+    liveQuery = project_id ? liveQuery.eq('project_id', project_id) : liveQuery.eq('tenant_id', tenant_id);
+    const { count: liveCalls, error: liveErr } = await liveQuery;
+    if (liveErr) {
+        console.error('[provision] live call check failed:', liveErr.message);
+        return reply.code(500).send({ error: '通話の状態を確かめられませんでした' });
+    }
+    if (liveCalls) {
+        return reply.code(409).send({ error: '通話中の電話があるため、今は声を作り直せません' });
+    }
+
     const realtimeSystemMessage =
         (typeof body.realtime_system_message === 'string' && body.realtime_system_message.trim()) ||
         `あなたはプロの営業アシスタントです。必ず日本語で話してください。\n${company_name}の担当者です。\n簡潔に丁寧に対応してください。`;
@@ -1005,7 +1118,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
             company_name, voice, audio_base_path: base,
             realtime_system_message: realtimeSystemMessage, updated_at: new Date().toISOString(),
         }).eq('id', playbookId);
-        if (upErr) return reply.code(500).send({ error: `playbook update failed: ${upErr.message}` });
+        if (upErr) {
+            console.error('[provision] playbook update failed:', upErr.message);
+            return reply.code(500).send({ error: '台本を保存できませんでした' });
+        }
         await supabase.from('audio_clips').delete().eq('playbook_id', playbookId);
         await supabase.from('call_intents').delete().eq('playbook_id', playbookId);
     } else {
@@ -1013,7 +1129,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
             tenant_id, project_id, name: 'default', company_name, voice, audio_base_path: base,
             realtime_system_message: realtimeSystemMessage, is_active: true,
         }).select('id').single();
-        if (insErr) return reply.code(500).send({ error: `playbook insert failed: ${insErr.message}` });
+        if (insErr) {
+            console.error('[provision] playbook insert failed:', insErr.message);
+            return reply.code(500).send({ error: '台本を保存できませんでした' });
+        }
         playbookId = created.id;
     }
 
@@ -1028,7 +1147,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
         suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
     }));
     const { error: clipErr } = await supabase.from('audio_clips').insert(clipRows);
-    if (clipErr) return reply.code(500).send({ error: `clips insert failed: ${clipErr.message}` });
+    if (clipErr) {
+        console.error('[provision] clips insert failed:', clipErr.message);
+        return reply.code(500).send({ error: 'セリフを保存できませんでした' });
+    }
 
     const intentRows = INTENT_TEMPLATE.map((i) => ({
         playbook_id: playbookId, tenant_id, name: i.name, action: i.action || 'play_audio',
@@ -1037,7 +1159,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
         wants_callback_info: !!i.wants_callback_info, sort_order: i.sort_order, active: true,
     }));
     const { error: intErr } = await supabase.from('call_intents').insert(intentRows);
-    if (intErr) return reply.code(500).send({ error: `intents insert failed: ${intErr.message}` });
+    if (intErr) {
+        console.error('[provision] intents insert failed:', intErr.message);
+        return reply.code(500).send({ error: '台本を保存できませんでした' });
+    }
 
     // Synthesize each clip with text and upload it — unless this is a
     // structure-only build (synthesize=false = 台本だけ作成), in which case the
@@ -1059,7 +1184,8 @@ fastify.post('/provision-playbook', async (request, reply) => {
             results.push({ key: c.key, status: 'ok', bytes: buf.length });
             readyKeys.push(c.key);
         } catch (err) {
-            results.push({ key: c.key, status: 'failed', error: err.message });
+            console.error(`[provision] clip ${c.key} failed:`, err.message);
+            results.push({ key: c.key, status: 'failed', error: '音声を作れませんでした' });
         }
     }
     // Flag successfully synthesized clips as having audio.
@@ -1104,6 +1230,14 @@ function isValidTwilioSignature(url, params, signature) {
     return given.length === expected.length && crypto.timingSafeEqual(given, expected);
 }
 
+// Twilio が叩いた URL で署名を確かめる。PUBLIC_BASE_URL があればそれで先に試し、合わなければ今どおり Host で。
+function isValidTwilioRequest(request, params) {
+    const signature = request.headers['x-twilio-signature'];
+    const path = request.raw.url;
+    if (PUBLIC_BASE_URL && isValidTwilioSignature(`${PUBLIC_BASE_URL}${path}`, params, signature)) return true;
+    return isValidTwilioSignature(`https://${request.headers.host}${path}`, params, signature);
+}
+
 // Delete recordings past their retention window: storage object first, then
 // the metadata row. Runs opportunistically after each intake and via the
 // secret-protected endpoint below (Railway sleeps, so no in-process timer).
@@ -1136,8 +1270,7 @@ async function purgeExpiredRecordings() {
 
 fastify.post('/recording-status', async (request, reply) => {
     const params = request.body || {};
-    const url = `https://${request.headers.host}/recording-status`;
-    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+    if (!isValidTwilioRequest(request, params)) {
         console.error('[recording] rejected callback with bad signature');
         return reply.code(403).send({ error: 'invalid signature' });
     }
@@ -1222,7 +1355,7 @@ fastify.post('/recording-status', async (request, reply) => {
         // The recording stays on Twilio (we delete only after success), so a
         // failed intake loses nothing — it can be re-fetched later.
         console.error('[recording] intake failed:', err);
-        return reply.code(500).send({ error: String(err.message || err) });
+        return reply.code(500).send({ error: 'recording intake failed' });
     }
 });
 
@@ -1254,8 +1387,36 @@ const TWILIO_STATUS_CALLBACK_URL = process.env.TWILIO_STATUS_CALLBACK_URL || '';
 // Per-tenant ceiling on simultaneous in-flight calls (runaway backstop; tunable).
 const MAX_CONCURRENT_PER_TENANT = parseInt(process.env.MAX_CONCURRENT_PER_TENANT || '5', 10);
 const DIAL_SPACING_MS = parseInt(process.env.DIAL_SPACING_MS || '1100', 10); // Twilio ≈1 CPS/number
+// 1本の電話の上限（秒・レビュー C4）＝保留や通話が何かの理由で終わらなくても、ここで Twilio が切る。
+const CALL_TIME_LIMIT_S = parseInt(process.env.CALL_TIME_LIMIT_S || '3600', 10);
+// 声セットの関門（台本が無い・セリフが0件・音声が未設定）で止めた応答にだけ付ける code。
+// 画面はこの code だけで判定する（reason の文言が変わっても壊れない）＝/kick-call と /dial-tick の両方。
+const VOICE_NOT_READY = 'voice_not_ready';
 
 async function placeOutboundCall(baseUrl, contact, ctx) {
+    // 日本の番号だけにかける（レビュー C2）＝国外・高額番号は Twilio に投げず、人が見る「要確認」へ回す
+    // （自動では掛け直さない＝DB 060 の人間確認レーン）。呼び手は NON_JP_NUMBER を見て架電中へ戻さない。
+    if (!isJapaneseE164(contact.phone_number)) {
+        const contactId = contact.id || ctx.contact_id || null;
+        if (contactId) {
+            // 自動架電（operator_id あり）は取り出しで回数を1つ足している＝unclaim_contact で戻してから
+            // （架電中→未架電・回数−1）、未架電の行だけを要確認へ。手動の /kick-call は回数を足していないので直接。
+            let fromStatus = '架電中';
+            if (ctx.operator_id) {
+                const { error: unErr } = await supabase.rpc('unclaim_contact', { p_contact: contactId });
+                if (unErr) console.error(`[dial] unclaim failed for contact ${contactId}:`, unErr.message);
+                else fromStatus = '未架電';
+            }
+            const { error } = await supabase.from('contacts')
+                .update({ status: '要確認', updated_at: new Date().toISOString() })
+                .eq('id', contactId)
+                .eq('status', fromStatus);
+            if (error) console.error(`[dial] could not move contact ${contactId} to 要確認:`, error.message);
+        }
+        const err = new Error('not a Japanese phone number');
+        err.code = 'NON_JP_NUMBER';
+        throw err;
+    }
     const qs = new URLSearchParams({
         company: contact.company_name || '',
         contact: contact.contact_name || '',
@@ -1275,6 +1436,7 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         Url: `${baseUrl}/incoming-call?${qs.toString()}`,
         StatusCallback: TWILIO_STATUS_CALLBACK_URL || `${baseUrl}/call-status`,
         StatusCallbackMethod: 'POST',
+        TimeLimit: String(CALL_TIME_LIMIT_S),
         Record: 'true',
         RecordingChannels: 'dual',
         RecordingStatusCallback: `${baseUrl}/recording-status`,
@@ -1352,7 +1514,7 @@ fastify.post('/kick-call', async (request, reply) => {
         agent_phone: body.agent_phone || '',
         agent_name: body.agent_name || '',
     };
-    const baseUrl = `https://${request.headers.host}`;
+    const baseUrl = publicBaseUrl(request.headers.host);
 
     // 🔴 D1 ゲート（Tom 決定 2026-07-19 / 実装 2026-07-31）＝声セットが未完成なら
     // 架電しない。フォールバックもしない。
@@ -1365,24 +1527,30 @@ fastify.post('/kick-call', async (request, reply) => {
         .from('call_playbooks').select('id')
         .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).is('project_id', null)
         .eq('is_active', true).maybeSingle();
-    if (gatePbErr) return reply.code(500).send({ error: `playbook lookup failed: ${gatePbErr.message}` });
+    if (gatePbErr) {
+        console.error('[kick-call] playbook lookup failed:', gatePbErr.message);
+        return reply.code(500).send({ error: 'playbook lookup failed' });
+    }
     if (!gatePb) {
         console.log(`[kick-call] blocked tenant=${tenant_id} reason=no_playbook`);
-        return reply.send({ ok: true, dialed: 0, reason: '台本がありません（Voice Setup で台本と音声を設定してください）' });
+        return reply.send({ ok: true, dialed: 0, code: VOICE_NOT_READY, reason: '台本がありません（Voice Setup で台本と音声を設定してください）' });
     }
     const { data: gateClips, error: gateClipErr } = await supabase
         .from('audio_clips').select('audio_ready')
         .eq('playbook_id', gatePb.id).eq('active', true);
-    if (gateClipErr) return reply.code(500).send({ error: `clip audio check failed: ${gateClipErr.message}` });
+    if (gateClipErr) {
+        console.error('[kick-call] clip audio check failed:', gateClipErr.message);
+        return reply.code(500).send({ error: 'clip audio check failed' });
+    }
     const missingAudio = (gateClips || []).filter((c) => !c.audio_ready).length;
     if (!gateClips || gateClips.length === 0) {
         console.log(`[kick-call] blocked tenant=${tenant_id} reason=no_clips`);
-        return reply.send({ ok: true, dialed: 0, reason: 'セリフが1件もありません（Voice Setup で台本を作ってください）' });
+        return reply.send({ ok: true, dialed: 0, code: VOICE_NOT_READY, reason: 'セリフが1件もありません（Voice Setup で台本を作ってください）' });
     }
     if (missingAudio > 0) {
         console.log(`[kick-call] blocked tenant=${tenant_id} reason=missing_audio count=${missingAudio}`);
         return reply.send({
-            ok: true, dialed: 0, missing_audio: missingAudio,
+            ok: true, dialed: 0, code: VOICE_NOT_READY, missing_audio: missingAudio,
             reason: `音声が未設定のセリフが ${missingAudio} 件あるため架電できません（Voice Setup で録音またはAI音声を設定してください）`,
         });
     }
@@ -1413,7 +1581,10 @@ fastify.post('/kick-call', async (request, reply) => {
         .order('priority', { ascending: true })
         .order('created_at', { ascending: true })
         .limit(CANDIDATE_OVERSELECT);
-    if (error) return reply.code(500).send({ error: `contacts query failed: ${error.message}` });
+    if (error) {
+        console.error('[kick-call] contacts query failed:', error.message);
+        return reply.code(500).send({ error: 'contacts query failed' });
+    }
     if (!candidates || candidates.length === 0) {
         return reply.send({ ok: true, dialed: 0, reason: 'no 未架電 contacts' });
     }
@@ -1440,7 +1611,10 @@ fastify.post('/kick-call', async (request, reply) => {
         .eq('status', '未架電')
         .in('id', candidateIds)
         .select('id, company_name, contact_name, phone_number');
-    if (claimErr) return reply.code(500).send({ error: `contact claim failed: ${claimErr.message}` });
+    if (claimErr) {
+        console.error('[kick-call] contact claim failed:', claimErr.message);
+        return reply.code(500).send({ error: 'contact claim failed' });
+    }
     const contacts = claimed || [];
     if (contacts.length === 0) {
         return reply.send({ ok: true, dialed: 0, reason: 'all candidates claimed by a concurrent kick' });
@@ -1451,12 +1625,13 @@ fastify.post('/kick-call', async (request, reply) => {
         const c = contacts[i];
         if (!c.phone_number) continue;
         try {
-            const sid = await placeOutboundCall(baseUrl, c, ctx);
+            // 通話の行に架電先の id を残す＝通話の終わりで同じ番号の別の行まで書き換えない（レビュー E2）
+            const sid = await placeOutboundCall(baseUrl, c, { ...ctx, contact_id: c.id });
             calls.push({ contact_id: c.id, call_sid: sid });
-            console.log(`[kick-call] dialed ${c.phone_number} (tenant=${tenant_id}, sid=${sid})`);
+            console.log(`[kick-call] dialed ${maskPhone(c.phone_number)} (tenant=${tenant_id}, sid=${sid})`);
         } catch (e) {
-            console.error(`[kick-call] dial failed for contact ${c.id}:`, e);
-            errors.push({ contact_id: c.id, error: String(e.message || e) });
+            console.error(`[kick-call] dial failed for contact ${c.id}:`, e.message || e);
+            errors.push({ contact_id: c.id, error: e.code === 'NON_JP_NUMBER' ? 'not a Japanese number' : 'dial failed' });
             // Dial (or session pre-insert) failed for a claimed contact —
             // revert it to 未架電 so it isn't stranded at 架電中.
             const { error: revErr } = await supabase
@@ -1513,8 +1688,7 @@ function priorityForResult(result) {
 
 fastify.post('/call-status', async (request, reply) => {
     const params = request.body || {};
-    const url = `https://${request.headers.host}/call-status`;
-    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+    if (!isValidTwilioRequest(request, params)) {
         console.error('[call-status] rejected callback with bad signature');
         return reply.code(403).send({ error: 'invalid signature' });
     }
@@ -1552,7 +1726,7 @@ fastify.post('/call-status', async (request, reply) => {
         // PRESERVED result so the contact's terminal label is derived from the
         // rich in-call result, not blindly from Twilio's CallStatus.
         const { data: session } = await supabase.from('call_sessions')
-            .select('id, company_name, contact_name, result, phone_number, tenant_id, metadata, contact_id')
+            .select('id, company_name, contact_name, result, phone_number, tenant_id, metadata, contact_id, project_id')
             .eq('call_sid', callSid)
             .order('created_at', { ascending: false })
             .limit(1)
@@ -1574,10 +1748,11 @@ fastify.post('/call-status', async (request, reply) => {
 
         // (c) CRITICAL reset — always move the contact off 架電中, even if the
         // Claude enrichment below fails. This is the fix for the stuck-架電中 bug.
-        // 自動架電の通話（contact_id あり）＝AI が付ける結果・上限回数・再コールは DB 関数が決める
-        // （作る順番の3番目・家 ▼Tom 待ち #3）。id の無い旧い通話（手動の Make a Call）はこれまでどおり番号で当てる。
+        // 自動架電の通話（contact_id とプロジェクトあり）＝AI が付ける結果・上限回数・再コールは DB 関数が決める
+        // （作る順番の3番目・家 ▼Tom 待ち #3）。手動の /kick-call は架電先の id で1行だけ当てる（レビュー E2）。
+        // id の無い旧い通話だけ、これまでどおり番号で当てる。
         let cErr = null;
-        if (session.contact_id) {
+        if (session.contact_id && session.project_id) {
             const { data: applied, error } = await supabase.rpc('apply_call_outcome', {
                 p_session: session.id,
                 p_retry: `${RETRY_AFTER_HOURS} hours`,
@@ -1591,12 +1766,14 @@ fastify.post('/call-status', async (request, reply) => {
             }
             await supabase.from('contacts').update({ call_duration_seconds: duration }).eq('id', session.contact_id);
         } else {
-            const { error } = await supabase.from('contacts')
-                .update({ status: contactStatus, priority, call_duration_seconds: duration, updated_at: new Date().toISOString() })
-                .eq('phone_number', session.phone_number)
-                .eq('tenant_id', session.tenant_id);
+            const patch = { status: contactStatus, priority, call_duration_seconds: duration, updated_at: new Date().toISOString() };
+            const { error } = await (session.contact_id
+                ? supabase.from('contacts').update(patch).eq('id', session.contact_id)
+                : supabase.from('contacts').update(patch)
+                    .eq('phone_number', session.phone_number)
+                    .eq('tenant_id', session.tenant_id));
             cErr = error;
-            if (!error) console.log(`[call-status] contact ${session.phone_number} → ${contactStatus} (result=${result}, call=${callSid})`);
+            if (!error) console.log(`[call-status] contact ${session.contact_id || maskPhone(session.phone_number)} → ${contactStatus} (result=${result}, call=${callSid})`);
         }
         if (cErr) console.error('[call-status] contact reset failed:', cErr.message);
 
@@ -1650,8 +1827,10 @@ ${log}
             let memo = '', nextCallDate = null;
             try {
                 const parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```/g, '').trim());
-                memo = parsed.memo || '';
-                nextCallDate = parsed.next_call_date || null;
+                // 要約は相手の発言からも作られる＝形と長さを縛ってから書く（レビュー E2）
+                memo = String(parsed.memo || '').slice(0, 500);
+                const d = String(parsed.next_call_date || '');
+                nextCallDate = /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(Date.parse(d)) ? d : null;
             } catch { memo = text.substring(0, 100); }
 
             const enrich = { memo, next_call_date: nextCallDate || null };
@@ -1667,7 +1846,7 @@ ${log}
         return reply.send({ ok: true, contact_status: contactStatus, result });
     } catch (err) {
         console.error('[call-status] failed:', err);
-        return reply.code(500).send({ error: String(err.message || err) });
+        return reply.code(500).send({ error: 'call-status failed' });
     }
 });
 
@@ -1687,6 +1866,10 @@ const streamTokens = new Map(); // token -> expiry epoch ms
 const WS_PREAUTH_TIMEOUT_MS = parseInt(process.env.WS_PREAUTH_TIMEOUT_MS || '5000', 10);
 const MAX_UNAUTH_WS = parseInt(process.env.MAX_UNAUTH_WS || '50', 10);
 let unauthWsCount = 0;
+// 同じ送り元から張れる未認証の本数（レビュー E4）＝1か所から50本張られて本物の通話が断られるのを防ぐ。
+// Twilio の media server は IP を共有する＝本物の通話が同じ IP から重なっても届く幅（20）にしてある。
+const MAX_UNAUTH_WS_PER_IP = parseInt(process.env.MAX_UNAUTH_WS_PER_IP || '20', 10);
+const unauthWsByIp = new Map(); // ip -> 未認証の本数
 
 function issueStreamToken() {
     // Opportunistic sweep so the map can't grow unbounded.
@@ -1731,7 +1914,7 @@ fastify.post('/preview-voice', async (request, reply) => {
         return reply.type('audio/mpeg').send(buf);
     } catch (err) {
         console.error(`[preview-voice] voice=${voice} failed: ${err.message}`);
-        return reply.code(502).send({ error: `tts failed: ${err.message}` });
+        return reply.code(502).send({ error: '音声を作れませんでした' });
     }
 });
 
@@ -1816,6 +1999,10 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
             if (buf.length > MAX_CLIP_UPLOAD_BYTES) {
                 return reply.code(413).send({ error: 'ファイルが大きすぎます（上限3MB）' });
             }
+            // 通話で鳴らせない形式は受け取らない（鳴らせないクリップは無言電話になる・レビュー F）
+            if (!detectAudioFormat(buf)) {
+                return reply.code(415).send({ error: 'mp3・wav・m4a のファイルにしてください' });
+            }
             const contentType = (typeof body.content_type === 'string' && body.content_type.startsWith('audio/'))
                 ? body.content_type : 'audio/mpeg';
             const originalName = typeof body.original_filename === 'string'
@@ -1861,7 +2048,7 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
         return reply.send({ ok: true, key, source: 'tts', audio_ready: true, recorded_filename: null, resynthesized: true, bytes: buf.length });
     } catch (err) {
         console.error('[clip-audio] handler threw:', err);
-        return reply.code(500).send({ error: err.message || 'clip-audio failed' });
+        return reply.code(500).send({ error: '音声を保存できませんでした' });
     }
 });
 
@@ -1870,16 +2057,23 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
 // その CM が「空き」なら、その CM の担当分を、同時にかける件数の枠まで発信する。
 // CM がタブを閉じれば叩かれなくなる＝架電も止まる（サーバ側に常駐の仕組みを持たない）。
 // ---------------------------------------------------------------------
+// 止めた理由（reason＝画面にそのまま出す文）と、声セットが揃っていないせいで止めた時だけ code（VOICE_NOT_READY）。
 async function voiceSetGate(tenantId, projectId) {
     const { data: pb, error } = await resolvePlaybookRow(tenantId, projectId);
-    if (error) return `playbook lookup failed: ${error.message}`;
-    if (!pb) return '台本がありません（Voice Setup で台本と音声を設定してください）';
+    if (error) {
+        console.error('[dial-tick] playbook lookup failed:', error.message);
+        return { reason: '台本を読めませんでした' };
+    }
+    if (!pb) return { reason: '台本がありません（Voice Setup で台本と音声を設定してください）', code: VOICE_NOT_READY };
     const { data: clips, error: clipErr } = await supabase
         .from('audio_clips').select('audio_ready').eq('playbook_id', pb.id).eq('active', true);
-    if (clipErr) return `clip audio check failed: ${clipErr.message}`;
-    if (!clips || clips.length === 0) return 'セリフが1件もありません（Voice Setup で台本を作ってください）';
+    if (clipErr) {
+        console.error('[dial-tick] clip audio check failed:', clipErr.message);
+        return { reason: '音声を確かめられませんでした' };
+    }
+    if (!clips || clips.length === 0) return { reason: 'セリフが1件もありません（Voice Setup で台本を作ってください）', code: VOICE_NOT_READY };
     const missing = clips.filter((c) => !c.audio_ready).length;
-    if (missing > 0) return `音声が未設定のセリフが ${missing} 件あるため架電できません`;
+    if (missing > 0) return { reason: `音声が未設定のセリフが ${missing} 件あるため架電できません`, code: VOICE_NOT_READY };
     return null;
 }
 
@@ -1895,7 +2089,10 @@ fastify.post('/dial-tick', async (request, reply) => {
         .select('id, tenant_id, is_active, is_online, call_state, call_state_at')
         .eq('id', userId)
         .maybeSingle();
-    if (uErr) return reply.code(500).send({ error: uErr.message });
+    if (uErr) {
+        console.error('[dial-tick] profile lookup failed:', uErr.message);
+        return reply.code(500).send({ error: 'profile lookup failed' });
+    }
     if (!u || !u.is_active) return reply.send({ ok: true, dialed: 0, reason: 'inactive' });
 
     // 通話中のまま残った状態の掃除＝取った通話がもう無く、2分以上たっていれば空きに戻す。
@@ -1926,8 +2123,8 @@ fastify.post('/dial-tick', async (request, reply) => {
         .maybeSingle();
     const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null);
     if (gate) {
-        console.log(`[dial-tick] blocked operator=${userId} reason=${gate}`);
-        return reply.send({ ok: true, dialed: 0, reason: gate });
+        console.log(`[dial-tick] blocked operator=${userId} reason=${gate.reason}`);
+        return reply.send({ ok: true, dialed: 0, reason: gate.reason, ...(gate.code ? { code: gate.code } : {}) });
     }
 
     // 同時にかける件数＝この CM の分（「一人あたり3〜5件」か「人数に応じて自動」かは試しながら調整＝env）。
@@ -1943,11 +2140,14 @@ fastify.post('/dial-tick', async (request, reply) => {
 
     const { data: claimed, error: claimErr } = await supabase
         .rpc('claim_contacts_for_operator', { p_user: userId, p_limit: slots });
-    if (claimErr) return reply.code(500).send({ error: `claim failed: ${claimErr.message}` });
+    if (claimErr) {
+        console.error('[dial-tick] claim failed:', claimErr.message);
+        return reply.code(500).send({ error: 'claim failed' });
+    }
     const contacts = claimed || [];
     if (contacts.length === 0) return reply.send({ ok: true, dialed: 0, reason: 'no 未架電 contacts' });
 
-    const baseUrl = `https://${request.headers.host}`;
+    const baseUrl = publicBaseUrl(request.headers.host);
     // 発信番号＝プロジェクトごとに1本（BAN 対策・家 §3-3）。付いていなければ共通の番号。
     const projectIds = [...new Set(contacts.map((c) => c.project_id).filter(Boolean))];
     const fromByProject = new Map();
@@ -1975,9 +2175,12 @@ fastify.post('/dial-tick', async (request, reply) => {
             dialed++;
         } catch (e) {
             failed++;
-            console.error(`[dial-tick] dial failed for contact ${c.id}:`, e);
-            const { error: revErr } = await supabase.rpc('unclaim_contact', { p_contact: c.id });
-            if (revErr) console.error(`[dial-tick] unclaim failed for contact ${c.id}:`, revErr.message);
+            console.error(`[dial-tick] dial failed for contact ${c.id}:`, e.message || e);
+            // 日本の番号でない＝もう「要確認」に回した（未架電へ戻すと10秒おきに同じ所で止まる）
+            if (e.code !== 'NON_JP_NUMBER') {
+                const { error: revErr } = await supabase.rpc('unclaim_contact', { p_contact: c.id });
+                if (revErr) console.error(`[dial-tick] unclaim failed for contact ${c.id}:`, revErr.message);
+            }
         }
         if (i < contacts.length - 1) await new Promise((r) => setTimeout(r, DIAL_SPACING_MS));
     }
@@ -1985,25 +2188,75 @@ fastify.post('/dial-tick', async (request, reply) => {
 });
 
 // 保留音（<Enqueue waitUrl>）。Twilio が待っている間くり返し取りに来る。
+// 1曲ずつ返す（loop="0" だと二度と取りに来ない）＝来るたびに保留の長さ（QueueTime）を見て、
+// 上限を超えていたら <Leave/> で保留から出す → /queue-exit（レビュー C4）。
 fastify.all('/hold-music', async (request, reply) => {
-    const url = `https://${request.headers.host}${request.raw.url}`;
     const params = request.method === 'POST' ? (request.body || {}) : {};
-    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+    if (!isValidTwilioRequest(request, params)) {
         return reply.code(403).send({ error: 'invalid signature' });
     }
-    reply.type('text/xml').send(`<Response><Play loop="0">${xmlEsc(HOLD_MUSIC_URL)}</Play></Response>`);
+    const queueTime = parseInt(params.QueueTime || '0', 10) || 0;
+    if (queueTime > HOLD_MAX_SECONDS) {
+        console.log(`[handoff] ${params.CallSid || '(no sid)'} on hold ${queueTime}s > ${HOLD_MAX_SECONDS}s; leaving the queue`);
+        return reply.type('text/xml').send('<Response><Leave/></Response>');
+    }
+    reply.type('text/xml').send(`<Response><Play>${xmlEsc(HOLD_MUSIC_URL)}</Play></Response>`);
+});
+
+// 保留から出た（<Enqueue action>）。取った CM との通話が終わった後にも来る。
+// 上限の <Leave/> かエラーで出た時は、渡せる CM がいなかったのと同じ＝「改めてご連絡いたします」で切って要再架電。
+// finishOverflow（REST で相手を切り替えた側）と二重に動かない＝handoff の finished を見る／result の上書きもしない。
+fastify.post('/queue-exit', async (request, reply) => {
+    const params = request.body || {};
+    if (!isValidTwilioRequest(request, params)) {
+        return reply.code(403).send({ error: 'invalid signature' });
+    }
+    const xml = (twiml) => reply.type('text/xml').send(twiml);
+    const prospect = String(params.CallSid || '');
+    const queueResult = String(params.QueueResult || '');
+
+    // CM が取った＝その通話が終わった後に来る → 切るだけ
+    if (queueResult === 'bridged' || queueResult === 'bridging-in-process') {
+        return xml('<Response><Hangup/></Response>');
+    }
+    // 相手が切った／REST で切り替え済み（finishOverflow）→ 何もしない
+    if (queueResult === 'hangup' || queueResult === 'redirected' || !prospect) {
+        return xml('<Response/>');
+    }
+
+    const h = handoffs.get(prospect);
+    if (h?.finished) return xml('<Response/>');
+    if (h) {
+        h.finished = true;
+        // 鳴らしている CM がいれば止めて空きに戻す（出ても保留の相手はもういない）
+        if (h.agentCallSid) {
+            try {
+                await twilioApi(`/Calls/${h.agentCallSid}.json`, { Status: 'canceled' });
+            } catch (_) {
+                try { await twilioApi(`/Calls/${h.agentCallSid}.json`, { Status: 'completed' }); }
+                catch (err) { console.error('[handoff] could not stop the CM leg:', err.message); }
+            }
+        }
+        if (h.agentId) await setAgentState(h.agentId, 'idle');
+    }
+    // 再起動で handoffs が消えていれば、通話の行から台本を引き直す
+    const clipPath = h ? h.clipPath : await callbackClipPathFor(prospect);
+    const twiml = await buildOverflow(prospect, clipPath);
+    forgetHandoff(prospect);
+    console.log(`[handoff] ${prospect} left the queue (${queueResult || 'unknown'}); nobody took it`);
+    return xml(twiml);
 });
 
 // CM のブラウザが出た瞬間に Twilio が取りに来る＝保留中の相手とつなぐ。
 fastify.all('/agent-bridge', async (request, reply) => {
-    const url = `https://${request.headers.host}${request.raw.url}`;
     const params = request.method === 'POST' ? (request.body || {}) : {};
-    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+    if (!isValidTwilioRequest(request, params)) {
         return reply.code(403).send({ error: 'invalid signature' });
     }
     const prospect = String(request.query.prospect || '');
     const h = handoffs.get(prospect);
-    if (!h || !h.agentId) {
+    // 保留の相手がもう出た（/queue-exit・finishOverflow）＝つなぐ先が無い
+    if (!h || h.finished || !h.agentId) {
         return reply.type('text/xml').send('<Response><Hangup/></Response>');
     }
     const { error } = await supabase
@@ -2017,14 +2270,14 @@ fastify.all('/agent-bridge', async (request, reply) => {
 
 // CM 側の1本が終わった／出なかった。出た通話が終わった → 空きに戻す。出なかった → 離席にして次の人へ。
 fastify.post('/agent-status', async (request, reply) => {
-    const url = `https://${request.headers.host}${request.raw.url}`;
     const params = request.body || {};
-    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+    if (!isValidTwilioRequest(request, params)) {
         return reply.code(403).send({ error: 'invalid signature' });
     }
     const prospect = String(request.query.prospect || '');
     const h = handoffs.get(prospect);
-    if (!h || params.CallSid !== h.agentCallSid) return reply.send({ ok: true, ignored: true });
+    // 片付け中（finished）の handoff には触らない＝CM の状態は片付けた側が戻す
+    if (!h || h.finished || params.CallSid !== h.agentCallSid) return reply.send({ ok: true, ignored: true });
 
     const status = params.CallStatus || '';
     const duration = params.CallDuration ? parseInt(params.CallDuration, 10) : 0;
@@ -2149,7 +2402,10 @@ fastify.post('/numbers/register', async (request, reply) => {
         })
         .select('id, e164, twilio_sid')
         .single();
-    if (error) return reply.code(400).send({ error: error.message.includes('duplicate') ? 'この番号はもう登録されています' : error.message });
+    if (error) {
+        if (!error.message.includes('duplicate')) console.error('[numbers] register failed:', error.message);
+        return reply.code(400).send({ error: error.message.includes('duplicate') ? 'この番号はもう登録されています' : '番号を登録できませんでした' });
+    }
     return reply.send({ ok: true, number: row });
 });
 
@@ -2157,28 +2413,30 @@ fastify.all('/incoming-call', async (request, reply) => {
     // Same Twilio-signature gate as /recording-status. The kick-call WF
     // passes call params in the query string, which Twilio includes in the
     // signed URL; POST body params (if any) are appended per the spec.
-    const url = `https://${request.headers.host}${request.raw.url}`;
     const params = request.method === 'POST' ? (request.body || {}) : {};
-    if (!isValidTwilioSignature(url, params, request.headers['x-twilio-signature'])) {
+    if (!isValidTwilioRequest(request, params)) {
         console.error('[incoming-call] rejected request with bad signature');
         return reply.code(403).send({ error: 'invalid signature' });
     }
 
-    const escXml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
-    const company = escXml(decodeURIComponent(request.query.company || 'unknown'));
-    const contact = escXml(decodeURIComponent(request.query.contact || 'unknown'));
-    const phone = escXml(decodeURIComponent(request.query.phone || 'unknown'));
-    const agent_phone = escXml(decodeURIComponent(request.query.agent_phone || ''));
-    const agent_name = escXml(decodeURIComponent(request.query.agent_name || ''));
-    const tenant_id = escXml(decodeURIComponent(request.query.tenant_id || ''));
-    const operator_id = escXml(decodeURIComponent(request.query.operator_id || ''));
-    const project_id = escXml(decodeURIComponent(request.query.project_id || ''));
-    const contact_id = escXml(decodeURIComponent(request.query.contact_id || ''));
+    // query は Fastify がもうデコード済み＝もう一度 decodeURIComponent すると、社名の「%」
+    // （例「100%ジュース」）で URIError → 500 になり、相手に「application error」が流れて切れる（レビュー E1）。
+    const q = (key, fallback = '') => xmlEsc(String(request.query[key] || fallback));
+    const company = q('company', 'unknown');
+    const contact = q('contact', 'unknown');
+    const phone = q('phone', 'unknown');
+    const agent_phone = q('agent_phone');
+    const agent_name = q('agent_name');
+    const tenant_id = q('tenant_id');
+    const operator_id = q('operator_id');
+    const project_id = q('project_id');
+    const contact_id = q('contact_id');
+    const streamUrl = `${publicBaseUrl(request.headers.host).replace(/^http/, 'ws')}/media-stream`;
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://${request.headers.host}/media-stream">
+        <Stream url="${xmlEsc(streamUrl)}">
             <Parameter name="company" value="${company}" />
             <Parameter name="contact" value="${contact}" />
             <Parameter name="phone" value="${phone}" />
@@ -2211,6 +2469,13 @@ fastify.register(async (fastify) => {
         // that don't authenticate within WS_PREAUTH_TIMEOUT_MS so an attacker
         // can't connect and idle to exhaust resources.
         let authenticated = false;
+        const clientIp = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim()
+            || req?.socket?.remoteAddress || 'unknown';
+        if ((unauthWsByIp.get(clientIp) || 0) >= MAX_UNAUTH_WS_PER_IP) {
+            console.error(`[media-stream] too many unauthenticated sockets from one client (≥ ${MAX_UNAUTH_WS_PER_IP}); refusing`);
+            try { connection.close(); } catch (_) {}
+            return;
+        }
         if (unauthWsCount >= MAX_UNAUTH_WS) {
             console.error(
                 `[media-stream] too many unauthenticated sockets (${unauthWsCount} ≥ ${MAX_UNAUTH_WS}); refusing`
@@ -2219,6 +2484,7 @@ fastify.register(async (fastify) => {
             return;
         }
         unauthWsCount++;
+        unauthWsByIp.set(clientIp, (unauthWsByIp.get(clientIp) || 0) + 1);
         let preAuthTimer = setTimeout(() => {
             preAuthTimer = null;
             if (!authenticated) {
@@ -2241,6 +2507,8 @@ fastify.register(async (fastify) => {
             if (slotReleased) return;
             slotReleased = true;
             if (unauthWsCount > 0) unauthWsCount--;
+            const n = (unauthWsByIp.get(clientIp) || 0) - 1;
+            if (n > 0) unauthWsByIp.set(clientIp, n); else unauthWsByIp.delete(clientIp);
         };
 
         // Identity
@@ -2352,7 +2620,7 @@ fastify.register(async (fastify) => {
             const trimmed = content?.trim();
             console.log(
                 `[saveTranscript] called role=${role} callSid=${callSid} ` +
-                    `contentLen=${trimmed?.length ?? 0} preview="${trimmed?.substring(0, 40) ?? ''}"`
+                    `contentLen=${trimmed?.length ?? 0}`
             );
             if (!callSid) {
                 console.warn('[saveTranscript] SKIPPED: callSid is missing');
@@ -2393,7 +2661,7 @@ fastify.register(async (fastify) => {
                                 );
                             } else {
                                 console.log(
-                                    `[saveTranscript] ✓ INSERT OK session_id=${data.id} role=${role}: ${trimmed.substring(0, 60)}`
+                                    `[saveTranscript] ✓ INSERT OK session_id=${data.id} role=${role} len=${trimmed.length}`
                                 );
                             }
                         });
@@ -2562,11 +2830,11 @@ fastify.register(async (fastify) => {
                 agentId: null,
                 agentCallSid: null,
                 excluded: [],
-                baseUrl: `https://${publicHost}`,
+                baseUrl: publicBaseUrl(publicHost),
                 clipPath: clip ? (cfg.audioBasePath ? `${cfg.audioBasePath}/${clip.filename}` : clip.filename) : null,
             });
             try {
-                await updateLiveCall(callSid, enqueueTwiml(`https://${publicHost}`, callSid));
+                await updateLiveCall(callSid, enqueueTwiml(publicBaseUrl(publicHost), callSid));
             } catch (err) {
                 console.error('[handoff] could not put the caller on hold:', err);
                 await setAgentState(agentId, 'idle');
@@ -2610,7 +2878,7 @@ fastify.register(async (fastify) => {
             if (!tenantId || !agentPhone) {
                 console.error(
                     `[transfer] missing tenant_id (${tenantId || 'none'}) or ` +
-                        `agent_phone (${agentPhone || 'none'}); cannot transfer`
+                        `agent_phone (${agentPhone ? 'set' : 'none'}); cannot transfer`
                 );
                 await endCallWithFarewell('error_limit');
                 return;
@@ -2618,7 +2886,7 @@ fastify.register(async (fastify) => {
 
             if (!acquireTransferLock(tenantId, agentPhone, callSid)) {
                 console.log(
-                    `[transfer] agent ${agentPhone} already busy with another call; ` +
+                    `[transfer] agent ${maskPhone(agentPhone)} already busy with another call; ` +
                         `falling back to callback flow`
                 );
                 if (cfg?.clips.has('callback_request')) {
@@ -2633,7 +2901,7 @@ fastify.register(async (fastify) => {
             }
 
             console.log(
-                `[transfer] handing off callSid=${callSid} to ${agentName || '(no name)'} <${agentPhone}>`
+                `[transfer] handing off callSid=${callSid} to ${agentName || '(no name)'} <${maskPhone(agentPhone)}>`
             );
             try {
                 await transferCall(callSid, agentPhone);
@@ -2887,7 +3155,8 @@ fastify.register(async (fastify) => {
                 return;
             }
 
-            console.log(`User said: "${transcript}"`);
+            // 相手の発話はログに出さない（call_transcripts にだけ残す・レビュー D1）
+            console.log(`User said (${transcript.length} chars)`);
             lastUserTranscript = transcript;
             lastSpeechAt = Date.now();
             saveTranscript('user', transcript);
@@ -2933,8 +3202,8 @@ fastify.register(async (fastify) => {
                 contact: callParams?.contact,
             }, cfg.classifierPrompt);
             console.log(
-                `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms):`,
-                decision
+                `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms): ` +
+                    `intent=${decision.intent ?? '(none)'}${decision.callback_info ? ' callback_info=(set)' : ''}`
             );
 
             // -----------------------------------------------------------------
@@ -2998,7 +3267,7 @@ fastify.register(async (fastify) => {
             if (intent.is_transfer && !hasSufficientTransferEvidence(transcript)) {
                 console.log(
                     `[transfer-guard] blocked transfer on insufficient evidence ` +
-                        `(transcript="${transcript}"); reprompting instead`
+                        `(${transcript.length} chars); reprompting instead`
                 );
                 await repromptOrEnd();
                 return;
@@ -3032,7 +3301,7 @@ fastify.register(async (fastify) => {
                         .update({ metadata: { callback_info: decision.callback_info } })
                         .eq('call_sid', callSid);
                     if (cbErr) console.error('[callback_info] save failed:', cbErr);
-                    else console.log(`[callback_info] saved: ${decision.callback_info}`);
+                    else console.log(`[callback_info] saved (${String(decision.callback_info).length} chars)`);
                 } catch (err) {
                     console.error('[callback_info] threw:', err);
                 }

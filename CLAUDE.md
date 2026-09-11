@@ -20,6 +20,7 @@
 - **本番へ出す＝GitHub の `main` への push**（Railway が `main` を自動デプロイ）＝作業ブランチを早送りで `main` へ。
 - **取次の判定を触る前**＝言い回しは2か所（台本の `call_intents.triggers` と `TRANSFER_EVIDENCE_PATTERNS`）で、足す時は両方／自由会話（`switchToRealtime`）は片道＝取次に戻らない。家＝`~/sente/sfav_operator_voice_sets_spec.md` の罠・AI Voice の家 §3-3「🚀」④。
 - 作業の先端ブランチと本番への出し方＝家の §3-3「🚀 本番への出し方」（ここに焼かない）。
+- 🔴🔴 **声のファイルは名前と中身の形式が一致しない**＝`call-audio` の名前は全部 `.mp3` だが、`sente` の肉声の中身は m4a（先頭 `ftyp`）。ffmpeg に渡す形式は `detectAudioFormat`（先頭バイト＝mp3／wav／mp4）で決める。**形式を絞る変更は、使用中の全クリップの先頭バイトを数えてから出す**（mp3／wav だけにすると肉声が全部無音になる）。家＝`~/sente/sfav_operator_voice_sets_spec.md` の罠。
 - 🔴🔴 **env の名前は、コードが読む側で確かめる。**発信の From＝**プロジェクトの番号（`phone_numbers`・`feat/phone-numbers` 以降）→ 無ければ `TWILIO_FROM_NUMBER`（`index.js`・2026-09-10 に 050 を設定）→ それも無ければハードコードの米国番号 `+1 831-273-4595`**。⚠ **Railway には別名の `TWILIO_PHONE_NUMBER` も残っているが、どこからも読まれていない**＝「Railway に番号の env が在る」を根拠に From が正しいと判断しない。⚠ **From はログに出ない**＝効いたかは **env の在否＋デプロイ成功＋コードが読む名前**の3点で判定する。
 - ⚠ **番号の `VoiceUrl` は発信に効かない**＝`placeOutboundCall` が Twilio に `Url` を毎回明示して渡すため。`VoiceUrl` が効くのは**折り返しの着信**だけ（050 は現在 未設定）。
 - 🔴🔴 **`VoiceUrl` を `/incoming-call` に向けない。**`/incoming-call` は**発信専用の入口**で、`tenant_id` を query string でしか受け取らない。折り返しの着信には query が無いので `loadPlaybook('')` が `null` → `endCallWithFarewell('error_limit')`＝**かけてきた相手を「それでは失礼いたします」で切る。**着信は取次の作り直し（`~/sente/sente_aivoice_canonical.md` §3-2）の側で設計する。⚠ **米国番号 `+1 831-273-4595` は既にこの形で `/incoming-call` に向いている**（そちらに折り返す人はいないので実害は未観測）。
