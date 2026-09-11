@@ -2016,7 +2016,9 @@ fastify.post('/agent-status', async (request, reply) => {
     const status = params.CallStatus || '';
     const duration = params.CallDuration ? parseInt(params.CallDuration, 10) : 0;
     if (status === 'completed' && duration > 0) {
-        await setAgentState(h.agentId, 'idle');
+        // 取った電話が終わった＝CM は結果入力中。空きに戻すのは画面（結果を保存した時に set_my_presence idle）。
+        // ここで idle にすると、入力の途中で次の電話が回ってきて画面が変わる（家 §3-3「画面の組み直し」）。
+        await setAgentState(h.agentId, 'away');
         forgetHandoff(prospect);
         return reply.send({ ok: true, released: true });
     }
