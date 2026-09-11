@@ -593,6 +593,8 @@ const TRANSFER_FILLER_ONLY = new Set([
 const TRANSFER_EVIDENCE_PATTERNS = [
     'お繋ぎ', 'おつなぎ', 'お繋ぎします', 'お繋ぎいたします',
     '代わります', '代わり', '替わります', '担当に代わ', '担当者に代わ',
+    // 文字起こしは「代わります」を「変わります」と書くことがある（2026-09-11 実架電「はい、今変わります」）
+    '変わります', '担当に変わ', '担当者に変わ',
     '担当です', '担当の', '私が担当', '責任者', '私が責任者',
     '代表です', '私が代表', '代表の', '社長です', '社長の',
     '本人です', '私です', '私が', '詳しく聞かせて', '詳しく聞きたい',
@@ -906,7 +908,7 @@ const CLIP_TEMPLATE = [
 // not exposed in the dashboard form. audio_key references CLIP_TEMPLATE keys.
 const INTENT_TEMPLATE = [
     { name: 'transfer', audio_key: 'transfer_success', is_transfer: true, sort_order: 1,
-        triggers: ['お繋ぎします', '少々お待ち', '担当者に代わります', '私が担当です', '代表です', '私が代表です', '社長です', '興味があります', '詳しく聞かせてください', '担当に代わります'] },
+        triggers: ['お繋ぎします', '少々お待ち', '担当者に代わります', '私が担当です', '代表です', '私が代表です', '社長です', '興味があります', '詳しく聞かせてください', '担当に代わります', '担当に変わります', '今変わります'] },
     { name: 'reason', audio_key: 'reason', sort_order: 2,
         triggers: ['どのようなご用件', '何のご用件', 'どういったご提案'] },
     { name: 'company', audio_key: 'company', sort_order: 3,
