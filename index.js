@@ -304,7 +304,7 @@ async function getAudioBuffer(cfg, key) {
 
 // --- Per-tenant playbook (script + clips + intents) ----------------------
 const PLAYBOOK_TTL_MS = 5 * 60 * 1000;
-const playbookCache = new Map(); // `${tenantId}:${operatorId}` -> { cfg, loadedAt }
+const playbookCache = new Map(); // `${tenantId}:${projectId}` -> { cfg, loadedAt }
 
 // Drop every cached playbook of a tenant (tenant default and each operator's set).
 function bustPlaybookCache(tenantId) {
@@ -315,18 +315,21 @@ function bustPlaybookCache(tenantId) {
 
 // 声セットの選び方（作る順番の2番目・家 §3-3）＝その会社の担当 CM の声セットがあればそれ、
 // 無ければテナントの既定。「AI が話していた声の本人につながる」ための前提。
-async function resolvePlaybookRow(tenantId, operatorId) {
+// 声（台本）はプロジェクトに1セット（家 §3-3「🚀」④ の決定・Tom 2026-09-11）＝そのプロジェクトの台本 → 無ければテナント既定。
+// CM ごとの台本（owner_user_id 入り）は引かない。
+async function resolvePlaybookRow(tenantId, projectId) {
     const base = () => supabase
         .from('call_playbooks')
         .select('*')
         .eq('tenant_id', tenantId)
         .eq('is_active', true)
-        .is('campaign_id', null);
-    if (operatorId) {
-        const own = await base().eq('owner_user_id', operatorId).maybeSingle();
-        if (own.error || own.data) return own;
+        .is('campaign_id', null)
+        .is('owner_user_id', null);
+    if (projectId) {
+        const pj = await base().eq('project_id', projectId).maybeSingle();
+        if (pj.error || pj.data) return pj;
     }
-    return base().is('owner_user_id', null).maybeSingle();
+    return base().is('project_id', null).maybeSingle();
 }
 
 // Build the Claude classifier prompt from a playbook's intents.
@@ -349,13 +352,13 @@ function buildClassifierPrompt(cfg) {
         `{ "intent": "<上記nameのいずれか>", "callback_info": "<日時情報があれば。無ければ省略>" }`;
 }
 
-async function loadPlaybook(tenantId, operatorId = null) {
+async function loadPlaybook(tenantId, projectId = null) {
     if (!tenantId) return null;
-    const cacheKey = `${tenantId}:${operatorId || ''}`;
+    const cacheKey = `${tenantId}:${projectId || ''}`;
     const cached = playbookCache.get(cacheKey);
     if (cached && Date.now() - cached.loadedAt < PLAYBOOK_TTL_MS) return cached.cfg;
 
-    const { data: pb, error: pbErr } = await resolvePlaybookRow(tenantId, operatorId);
+    const { data: pb, error: pbErr } = await resolvePlaybookRow(tenantId, projectId);
     if (pbErr || !pb) {
         console.error(
             `[playbook] load failed for tenant ${tenantId}: ${pbErr?.message || 'no active playbook'}`
@@ -950,10 +953,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // from a shared secret. Anyone holding PROVISION_SECRET can act on any
     // tenant_id today — a per-tenant JWT/principal is the proper fix.
     const tenant_id = (body.tenant_id || '').trim();
-    // owner_user_id null => tenant default set (legacy/admin-managed); a uuid =>
-    // that operator's own voice set. The dashboard route resolves & authorizes
-    // the owner server-side (client forced to self); we trust it here.
-    const owner_user_id = (body.owner_user_id || '').trim() || null;
+    // project_id null => tenant default set; a uuid => that project's voice set
+    // (声はプロジェクトに1セット). The dashboard route authorizes the project
+    // server-side (admin / client_admin, same tenant); we trust it here.
+    const project_id = (body.project_id || '').trim() || null;
     const company_name = (body.company_name || '').trim();
     const voice = (body.voice || 'shimmer').trim();
     const clipTexts = body.clip_texts && typeof body.clip_texts === 'object' ? body.clip_texts : {};
@@ -969,8 +972,8 @@ fastify.post('/provision-playbook', async (request, reply) => {
         .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
     if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
     const slug = (tenant.slug || '').trim();
-    // Per-operator sets live under <slug>/<owner>/ so storage separates cleanly.
-    const base = owner_user_id ? `${slug}/${owner_user_id}` : slug;
+    // Per-project sets live under <slug>/p-<project>/ so storage separates cleanly.
+    const base = project_id ? `${slug}/p-${project_id}` : slug;
 
     const realtimeSystemMessage =
         (typeof body.realtime_system_message === 'string' && body.realtime_system_message.trim()) ||
@@ -980,10 +983,10 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // otherwise create one. Either way we rebuild its clips and intents.
     let existingQuery = supabase
         .from('call_playbooks').select('id')
-        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true);
-    existingQuery = owner_user_id
-        ? existingQuery.eq('owner_user_id', owner_user_id)
-        : existingQuery.is('owner_user_id', null);
+        .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true);
+    existingQuery = project_id
+        ? existingQuery.eq('project_id', project_id)
+        : existingQuery.is('project_id', null);
     const { data: existing } = await existingQuery.maybeSingle();
 
     // Preserve any clip a tenant recorded in their own voice (source='recorded')
@@ -1005,7 +1008,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
         await supabase.from('call_intents').delete().eq('playbook_id', playbookId);
     } else {
         const { data: created, error: insErr } = await supabase.from('call_playbooks').insert({
-            tenant_id, owner_user_id, name: 'default', company_name, voice, audio_base_path: base,
+            tenant_id, project_id, name: 'default', company_name, voice, audio_base_path: base,
             realtime_system_message: realtimeSystemMessage, is_active: true,
         }).select('id').single();
         if (insErr) return reply.code(500).send({ error: `playbook insert failed: ${insErr.message}` });
@@ -1354,11 +1357,11 @@ fastify.post('/kick-call', async (request, reply) => {
     // 理由＝音声ファイルが無いクリップは playAudio がエラーログを出して再生を
     // スキップするだけなので、ゲートが無いと「つながるのに何も喋らない電話」が
     // 営業先に飛ぶ（無言電話）。発信の口はここだけなので、最後の砦はここに置く。
-    // 判定対象は通話路 loadPlaybook と同じ声セット＝campaign_id IS NULL /
-    // owner_user_id IS NULL / is_active（Phase 2 で架電者ごとの set に切り替える）。
+    // 判定対象＝手動の /kick-call はプロジェクトを持たない＝テナント既定の声セット
+    // （campaign_id／owner_user_id／project_id が空・is_active）。
     const { data: gatePb, error: gatePbErr } = await supabase
         .from('call_playbooks').select('id')
-        .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null)
+        .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).is('project_id', null)
         .eq('is_active', true).maybeSingle();
     if (gatePbErr) return reply.code(500).send({ error: `playbook lookup failed: ${gatePbErr.message}` });
     if (!gatePb) {
@@ -1764,9 +1767,9 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
     // holding PROVISION_SECRET can act on any tenant_id until per-tenant auth.
     const action = (body.action || '').trim();
     const tenant_id = (body.tenant_id || '').trim();
-    // owner_user_id null => tenant default set; a uuid => that operator's set.
-    // Authorized/forced server-side by the dashboard route (client = self).
-    const owner_user_id = (body.owner_user_id || '').trim() || null;
+    // project_id null => tenant default set; a uuid => that project's set.
+    // Authorized server-side by the dashboard route (admin / client_admin, same tenant).
+    const project_id = (body.project_id || '').trim() || null;
     const key = (body.key || '').trim();
     if (!tenant_id || !key || !['upload', 'delete', 'synthesize', 'preview'].includes(action)) {
         return reply.code(400).send({ error: 'action(upload|delete|synthesize|preview), tenant_id and key are required' });
@@ -1777,14 +1780,14 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
         .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
     if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
     const slug = (tenant.slug || '').trim();
-    const base = owner_user_id ? `${slug}/${owner_user_id}` : slug;
+    const base = project_id ? `${slug}/p-${project_id}` : slug;
 
     let pbQuery = supabase
         .from('call_playbooks').select('id, voice')
-        .eq('tenant_id', tenant_id).is('campaign_id', null).eq('is_active', true);
-    pbQuery = owner_user_id
-        ? pbQuery.eq('owner_user_id', owner_user_id)
-        : pbQuery.is('owner_user_id', null);
+        .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true);
+    pbQuery = project_id
+        ? pbQuery.eq('project_id', project_id)
+        : pbQuery.is('project_id', null);
     const { data: pb, error: pbErr } = await pbQuery.maybeSingle();
     if (pbErr || !pb) return reply.code(409).send({ error: '先に台本を作成してください' });
 
@@ -1865,8 +1868,8 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
 // その CM が「空き」なら、その CM の担当分を、同時にかける件数の枠まで発信する。
 // CM がタブを閉じれば叩かれなくなる＝架電も止まる（サーバ側に常駐の仕組みを持たない）。
 // ---------------------------------------------------------------------
-async function voiceSetGate(tenantId, operatorId) {
-    const { data: pb, error } = await resolvePlaybookRow(tenantId, operatorId);
+async function voiceSetGate(tenantId, projectId) {
+    const { data: pb, error } = await resolvePlaybookRow(tenantId, projectId);
     if (error) return `playbook lookup failed: ${error.message}`;
     if (!pb) return '台本がありません（Voice Setup で台本と音声を設定してください）';
     const { data: clips, error: clipErr } = await supabase
@@ -1911,7 +1914,15 @@ fastify.post('/dial-tick', async (request, reply) => {
         return reply.send({ ok: true, dialed: 0, reason: u.is_online ? u.call_state : 'offline' });
     }
 
-    const gate = await voiceSetGate(u.tenant_id, userId);
+    // 声はプロジェクトに1セット＝その CM の「今日」のプロジェクトの声で判定する
+    const { data: cur } = await supabase
+        .from('project_members')
+        .select('project_id')
+        .eq('user_id', userId)
+        .eq('is_current', true)
+        .limit(1)
+        .maybeSingle();
+    const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null);
     if (gate) {
         console.log(`[dial-tick] blocked operator=${userId} reason=${gate}`);
         return reply.send({ ok: true, dialed: 0, reason: gate });
@@ -3360,7 +3371,7 @@ fastify.register(async (fastify) => {
                         );
                         // Load the tenant's playbook, then greet. Without a
                         // playbook there's nothing to say, so end gracefully.
-                        loadPlaybook(callParams.tenant_id, callParams.operator_id || null)
+                        loadPlaybook(callParams.tenant_id, callParams.project_id || null)
                             .then((loaded) => {
                                 if (!loaded) {
                                     console.error(
