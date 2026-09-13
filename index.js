@@ -987,16 +987,15 @@ function verifyProvisionSecret(req) {
 const CLIP_TEMPLATE = [
     { key: 'greeting',         clip_type: 'greeting', filename: '01_greeting.mp3',         sort_order: 1 },
     { key: 'reason',           clip_type: 'response', filename: '04_reason.mp3',           sort_order: 2 },
+    // 社名と担当は1本（D8）＝「社名は？」「どなたですか？」の両方にこれで答える
     { key: 'company',          clip_type: 'response', filename: '05_company.mp3',          sort_order: 3 },
-    { key: 'who',              clip_type: 'response', filename: '06_who.mp3',              sort_order: 4 },
     { key: 'appointment',      clip_type: 'response', filename: '07_appointment.mp3',      sort_order: 5 },
     { key: 'transfer_success', clip_type: 'response', filename: '09_transfer_success.mp3', sort_order: 6 },
     { key: 'callback_request', clip_type: 'response', filename: '11_callback_request.mp3', sort_order: 7 },
     { key: 'sorry_disturb',    clip_type: 'response', filename: '15_sorry_disturb.mp3',    sort_order: 8, suppress_farewell: true },
+    // 相づち・聞き返しは1本ずつ（D8）＝fillerKeys／pardonKeys は1本でも回る
     { key: '16a_hai',          clip_type: 'filler',   filename: '16a_hai.mp3',             sort_order: 9 },
-    { key: '16b_hai',          clip_type: 'filler',   filename: '16b_hai.mp3',             sort_order: 10 },
     { key: '22a_pardon',       clip_type: 'pardon',   filename: '22a_pardon.mp3',          sort_order: 11 },
-    { key: '22b_pardon',       clip_type: 'pardon',   filename: '22b_pardon.mp3',          sort_order: 12 },
     { key: 'farewell',         clip_type: 'farewell', filename: '21_farewell.mp3',         sort_order: 13 },
 ];
 
@@ -1009,7 +1008,7 @@ const INTENT_TEMPLATE = [
         triggers: ['どのようなご用件', '何のご用件', 'どういったご提案'] },
     { name: 'company', audio_key: 'company', sort_order: 3,
         triggers: ['どちらの会社', 'どこの会社', '会社名は'] },
-    { name: 'who', audio_key: 'who', sort_order: 4,
+    { name: 'who', audio_key: 'company', sort_order: 4,
         triggers: ['どなた様', 'お名前は', '担当者のお名前'] },
     { name: 'appointment', audio_key: 'appointment', sort_order: 5,
         triggers: ['アポイントは', 'お約束は', 'ご予約は'] },
