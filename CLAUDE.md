@@ -6,7 +6,7 @@
 # speech-assistant — 架電エージェント本体（Twilio × OpenAI Realtime）
 
 **ドメインは SENTE。家は `~/sente/sente_aivoice_canonical.md`。**基盤も SENTE（GitHub `SENTE-inc`／Railway／Supabase SENTE org の `outbound call`）。
-🔴 **架電の実体は `~/sente/` に在る**（設計・WF・契約・金額とも）。**Sales Forge は「月¥33,000 を払う客」1社**で、`~/sales-forge/` を開いても架電の実体は見つからない〔2026-08-02 移管〕。⚠ **SENTE 本業（取込／請求／原価／ダッシュ）とも別プロダクト**＝データも entity も混ぜない。
+🔴 **架電の実体は `~/sente/` に在る**（設計・WF・契約・金額とも）。**Sales Forge は AI Voice の客1社**（金額と請求の形は家 §3 冒頭の 💴）で、`~/sales-forge/` を開いても架電の実体は見つからない〔2026-08-02 移管〕。⚠ **SENTE 本業（取込／請求／原価／ダッシュ）とも別プロダクト**＝データも entity も混ぜない。
 
 ## 🔴 外向き（ここが最大の地雷）
 - **実行すると実際に電話が鳴る。**テストのつもりの1本も外部への発信。**架電は毎回 Tom の明示 GO。**
