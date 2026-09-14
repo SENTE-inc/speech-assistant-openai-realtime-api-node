@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Blob } from 'node:buffer';
 import crypto from 'node:crypto';
+import { registerVoiceAi } from './voice-ai.js';
 
 dotenv.config();
 
@@ -1086,7 +1087,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
         return reply.code(500).send({ error: '通話の状態を確かめられませんでした' });
     }
     if (liveCalls) {
-        return reply.code(409).send({ error: '通話中の電話があるため、今は声を作り直せません' });
+        return reply.code(409).send({ error: '通話中の電話があるため、今は音声を作り直せません' });
     }
 
     const realtimeSystemMessage =
@@ -1136,15 +1137,20 @@ fastify.post('/provision-playbook', async (request, reply) => {
     }
 
     // Build and insert clip + intent rows from the templates.
-    const clipRows = CLIP_TEMPLATE.map((c) => ({
-        playbook_id: playbookId, tenant_id, key: c.key, clip_type: c.clip_type,
-        filename: c.filename, text: String(clipTexts[c.key] ?? '').trim(),
-        source: priorByKey[c.key]?.source === 'recorded' ? 'recorded' : 'tts',
-        audio_ready: priorByKey[c.key]?.source === 'recorded',
-        recorded_filename: priorByKey[c.key]?.source === 'recorded'
-            ? (priorByKey[c.key]?.recorded_filename ?? null) : null,
-        suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
-    }));
+    // 肉声（recorded）と音声タブで選んだ ElevenLabs のテイク（elevenlabs）は作り直さない＝音も source もそのまま
+    // （OpenAI TTS で上書きすると声が変わる・voice-ai.js）
+    const clipRows = CLIP_TEMPLATE.map((c) => {
+        const prior = priorByKey[c.key];
+        const kept = prior?.source === 'recorded' || prior?.source === 'elevenlabs';
+        return {
+            playbook_id: playbookId, tenant_id, key: c.key, clip_type: c.clip_type,
+            filename: c.filename, text: String(clipTexts[c.key] ?? '').trim(),
+            source: kept ? prior.source : 'tts',
+            audio_ready: kept,
+            recorded_filename: prior?.source === 'recorded' ? (prior?.recorded_filename ?? null) : null,
+            suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
+        };
+    });
     const { error: clipErr } = await supabase.from('audio_clips').insert(clipRows);
     if (clipErr) {
         console.error('[provision] clips insert failed:', clipErr.message);
@@ -1172,6 +1178,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
     for (const c of clipRows) {
         // Keep a tenant's own recording — never synthesize over 肉声.
         if (c.source === 'recorded') { results.push({ key: c.key, status: 'kept_recorded', recorded_filename: c.recorded_filename ?? null }); continue; }
+        if (c.source === 'elevenlabs') { results.push({ key: c.key, status: 'kept_elevenlabs' }); continue; }
         if (!synthesize) { results.push({ key: c.key, status: 'no_audio' }); continue; }
         if (!c.text) { results.push({ key: c.key, status: 'skipped_no_text' }); continue; }
         const path = base ? `${base}/${c.filename}` : c.filename;
@@ -1982,6 +1989,11 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
 
     const path = base ? `${base}/${clip.filename}` : clip.filename;
 
+    // 音声タブで選んだ ElevenLabs の音は OpenAI TTS で上書きしない（作り直しは音声タブのテイクで＝voice-ai.js）
+    if (clip.source === 'elevenlabs' && (action === 'delete' || action === 'synthesize')) {
+        return reply.code(409).send({ error: 'この音声は「AI音声を生成」のテイクで作り直してください' });
+    }
+
     try {
         if (action === 'preview') {
             const { data: signed, error: sErr } = await supabase.storage
@@ -2049,6 +2061,11 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
         console.error('[clip-audio] handler threw:', err);
         return reply.code(500).send({ error: '音声を保存できませんでした' });
     }
+});
+
+// 音声タブ（案件 → 台本の提案 → ElevenLabs のテイク → 選んで保存・上限）＝voice-ai.js
+registerVoiceAi(fastify, {
+    supabase, anthropic, verifyProvisionSecret, AUDIO_BUCKET, CLIP_TEMPLATE, bustTenantAudio, detectAudioFormat,
 });
 
 // ---------------------------------------------------------------------
