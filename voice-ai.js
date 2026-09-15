@@ -253,9 +253,10 @@ export function registerVoiceAi(fastify, deps) {
         });
         if (!res.ok) throw new Error(`voices ${res.status}`);
         const data = await res.json();
-        // 日本語の声だけ（アカウントに足したライブラリの声も出る）
+        // 日本語が母語の声だけ（アカウントに足したライブラリの声も出る）。🪤 verified_languages で絞ると、英語の既定の声
+        // （Alice 等）が「日本語も話せる」として混ざる＝電話で名乗る声にならない（2026-09-15 プレビューで Alice が先頭に出た）
         const list = (data.voices || [])
-            .filter((v) => v.labels?.language === 'ja' || (v.verified_languages || []).some((l) => l.language === 'ja'))
+            .filter((v) => v.labels?.language === 'ja')
             .map((v) => ({
                 voice_id: v.voice_id,
                 name: String(v.name || '').split(' - ')[0].trim() || v.voice_id,
