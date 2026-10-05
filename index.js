@@ -11,6 +11,7 @@ import { spawn } from 'node:child_process';
 import {
     hasSufficientTransferEvidence, buildClassifierPrompt, buildTranscriptionPrompt,
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
+    decideFastHandover, decideAfterClassifierV2, decideHold, isWordless,
 } from './transfer-logic.js';
 import {
     existsSync,
@@ -587,7 +588,24 @@ function mulawToWav(mulawBuffer) {
 // Whisper transcription
 // =====================================================================
 
+// 文字起こし＝{ ok, text }（ok=false＝API の失敗）。保留音の判定は「失敗」を「言葉なし」に数えない（障害で CM を呼ばない）
+async function transcribeDetailed(mulawBuffer, prompt) {
+    try {
+        const text = await transcribeWhisperRaw(mulawBuffer, prompt);
+        return text === undefined ? { ok: false, text: null } : { ok: true, text };
+    } catch (err) {
+        console.error('[stt] error:', err?.message || err);
+        return { ok: false, text: null };
+    }
+}
+
 async function transcribeWhisper(mulawBuffer, prompt) {
+    const text = await transcribeWhisperRaw(mulawBuffer, prompt);
+    return text === undefined ? null : text;
+}
+
+// 戻り値＝文字列（空なら null）／失敗は undefined
+async function transcribeWhisperRaw(mulawBuffer, prompt) {
     const wav = mulawToWav(mulawBuffer);
     const formData = new FormData();
     formData.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
@@ -606,7 +624,7 @@ async function transcribeWhisper(mulawBuffer, prompt) {
     if (!res.ok) {
         const txt = await res.text().catch(() => '');
         console.error('Whisper error:', res.status, txt);
-        return null;
+        return undefined;
     }
     const data = await res.json();
     return (data?.text || '').trim() || null;
@@ -2640,6 +2658,16 @@ fastify.register(async (fastify) => {
         let aborted = false;
         let transferPhase = 'none'; // none | claiming | committing | committed
         let sessionIdPromise = null;
+        // 版6＝取次は1通話に1回（commitTransfer だけが立てる）／受付の言葉を聞いた時刻（保留音の「言葉の後」の判定）
+        let transferCommitted = false;
+        let announcedAt = 0;
+        // 版6＝保留音の検知（発話の VAD とは別の時計）。20ms の枠ごとに音量を見て、切れ目の短い連続を数える
+        let holdRing = [];
+        let holdRun = null;      // { start, lastLoud, rms: [] }（枠の番号）
+        let holdFrame = 0;
+        let holdCheckInFlight = false;
+        let holdCooldownUntil = 0;
+        let pendingHold = false; // 処理中に保留音と決まった＝聞き取りに戻った時に取次する
 
         // VAD
         const VAD_RMS_THRESHOLD = 2000;
@@ -2651,6 +2679,9 @@ fastify.register(async (fastify) => {
         const HUMAN_PAUSE_MS = 600; // hold the filler clip for this long after silence-end so the caller's last word lands cleanly
         const PREROLL_FRAMES = 15;       // ~300ms kept before VAD confirms speech, so soft onsets aren't clipped
         const MAX_UTTERANCE_FRAMES = 300; // 6s＝設定が在る通話の1発話の上限（§1-d）
+        const HOLD_RMS_THRESHOLD = 350;   // 保留音の「音あり」の線＝発話の線（2000）より低い＝小さな保留音も拾う（試しの電話で決め直す）
+        const HOLD_GAP_FRAMES = 50;       // 1.0s 未満の休みはつなぐ（音楽の小節の休み）
+        const HOLD_RING_FRAMES = 800;     // 16s ぶんの音を手元に持つ（候補の区間を文字起こしへ回す）
         const SPLIT_OVERLAP_FRAMES = 50;  // 1s＝区切った時に次の発話の頭へ重ねる分
         let speechActive = false;
         let speechFrames = 0;
@@ -3261,12 +3292,92 @@ fastify.register(async (fastify) => {
             state = 'LISTENING';
             lastSpeechAt = Date.now();
             enableVadDelayed(POST_PLAYBACK_DELAY_MS, 'after pardon');
+            afterBackToListening();
         };
 
         // -----------------------------------------------------------------
         // 取次のつまみが在る通話だけ＝判定の記録・待機の出入り・判定の実行
         // 家＝~/sente/sfav_transfer_tuning_plan.md §1-e〜1-g
         // -----------------------------------------------------------------
+        // 版6＝取次を決める所は1か所（音の判定と言葉の判定が同時に決めても1回だけ・切れた後には進まない）
+        //   clipKey＝取次の声（受付に向けて流す時だけ）。本人の名乗り・保留音では流さない（Tom「早く取り次いで欲しい」）
+        const commitTransfer = async (why, { clipKey = null } = {}) => {
+            if (transferCommitted || aborted || state === 'ENDED') return false;
+            transferCommitted = true;
+            holdRun = null;
+            pendingHold = false;
+            leaveWait(why);
+            consecutiveEmpty = 0;
+            currentPlaybackToken = ++markCounter; // 流れかけのつなぎの「はい」を止める
+            state = 'PLAYING';
+            disableVad(`transfer (${why})`);
+            console.log(`[transfer] committed (${why}${clipKey ? `, clip ${clipKey}` : ', no clip'})`);
+            if (clipKey) {
+                await playAudio(clipKey);
+                if (aborted || state === 'ENDED') return true; // 段0
+            }
+            await handleTransfer();
+            if (timeoutInterval) {
+                clearInterval(timeoutInterval);
+                timeoutInterval = null;
+            }
+            return true;
+        };
+
+        // 聞き取りに戻った時＝処理中に決まった保留音の取次を、ここで実行する（処理が否定・取次・終了に進んだ時はここに来ない）
+        const afterBackToListening = () => {
+            if (!pendingHold || transferCommitted) return;
+            pendingHold = false;
+            setImmediate(() => {
+                if (state === 'LISTENING' && !transferCommitted) commitTransfer('hold').catch((e) => console.error('[hold] commit error:', e));
+            });
+        };
+
+        // 版6＝保留音の検知（§3-1）。設定の行が v2 の通話で、聞いている間・処理中に数える
+        const holdTick = (mulaw) => {
+            holdFrame++;
+            holdRing.push(mulaw);
+            if (holdRing.length > HOLD_RING_FRAMES) holdRing.shift();
+            const rms = calculateRms(mulaw);
+            if (rms > HOLD_RMS_THRESHOLD) {
+                if (!holdRun) holdRun = { start: holdFrame, lastLoud: holdFrame, rms: [] };
+                holdRun.lastLoud = holdFrame;
+                holdRun.rms.push(rms);
+            } else if (holdRun && holdFrame - holdRun.lastLoud >= HOLD_GAP_FRAMES) {
+                holdRun = null;
+            }
+            if (!holdRun || holdCheckInFlight || Date.now() < holdCooldownUntil) return;
+            const frames = holdFrame - holdRun.start + 1;
+            if (frames < ts.hold_music_seconds * 50) return;
+            const sorted = [...holdRun.rms].sort((a, b) => a - b);
+            checkHold(frames, Math.round(sorted[Math.floor(sorted.length / 2)] || 0)).catch((e) => {
+                holdCheckInFlight = false;
+                console.error('[hold] check error:', e);
+            });
+        };
+
+        const checkHold = async (frames, medianRms) => {
+            holdCheckInFlight = true;
+            const seconds = Math.round((frames / 50) * 10) / 10;
+            const audio = Buffer.concat(holdRing.slice(-Math.min(frames, HOLD_RING_FRAMES)));
+            const res = await transcribeDetailed(audio, cfg?.transcriptionPrompt);
+            holdCheckInFlight = false;
+            holdCooldownUntil = Date.now() + 2000;
+            holdRun = null; // 次の判定は、もう一度 秒数ぶん鳴ってから
+            if (transferCommitted || aborted || state === 'ENDED' || state === 'REALTIME') return;
+            const base = { event: 'hold_music', hold_seconds: seconds, hold_rms: medianRms, transcript: res.text ?? null, in_wait: !!waitCtx };
+            if (!res.ok) { logDecision({ ...base, action: 'stt_error' }); return; }
+            if (!isWordless(res.text)) { logDecision({ ...base, action: 'has_words' }); return; }
+            const announced = !!waitCtx || (announcedAt && Date.now() - announcedAt <= ts.wait_max_seconds * 1000);
+            const dec = decideHold({ ts, announced });
+            console.log(`[hold] music ${seconds}s rms=${medianRms} announced=${!!announced} → ${dec.transfer ? (ts.hold_music_record_only ? 'record_only' : 'transfer') : dec.reason}`);
+            if (!dec.transfer) { logDecision({ ...base, gate: dec.reason, action: 'no_transfer' }); return; }
+            if (ts.hold_music_record_only) { logDecision({ ...base, gate: dec.reason, action: 'record_only' }); return; }
+            logDecision({ ...base, gate: dec.reason, action: 'transfer' });
+            if (state === 'LISTENING') await commitTransfer('hold');
+            else pendingHold = true; // 処理中の発話の判定を追い越さない
+        };
+
         // 判定の記録（call_turn_decisions）。失敗しても通話は止めない
         const logDecision = (fields) => {
             if ((!ts && !tsFallback) || !callSid) return;
@@ -3292,6 +3403,7 @@ fastify.register(async (fastify) => {
                 settings_scope: ts?.scope ?? null,
                 settings_version: ts?.version ?? null,
                 settings_hash: ts?.hash ?? null,
+                ...(fields.hold_seconds != null ? { hold_seconds: fields.hold_seconds, hold_rms: fields.hold_rms ?? null } : {}),
             };
             const pending = sessionIdPromise;
             pending.then((sid) => {
@@ -3315,6 +3427,7 @@ fastify.register(async (fastify) => {
             } else if (!vadEnabled) {
                 enableVadDelayed(0, 'waiting');
             }
+            afterBackToListening();
             if (waitCtx && pendingUtterance) {
                 const u = pendingUtterance;
                 pendingUtterance = null;
@@ -3355,7 +3468,9 @@ fastify.register(async (fastify) => {
                 matched_phrase: d.matched ?? null, action: d.action, in_wait: meta.inWait,
             });
             if (state === 'ENDED') return;
+            if (d.gate && String(d.gate).startsWith('words')) announcedAt = Date.now(); // 受付の言葉を聞いた（保留音の「言葉の後」）
 
+            if (d.action === 'transfer_fast') { await commitTransfer('handover'); return; }
             if (d.action === 'continue_wait') { continueWait(); return; }
             if (d.action === 'wait_enter') { enterWait(); return; } // つなぎの「はい」はこの発話の処理で流れた＝足さない
             if (d.action === 'reprompt') { await repromptOrEnd(); return; }
@@ -3370,16 +3485,7 @@ fastify.register(async (fastify) => {
                     await switchToRealtime();
                     return;
                 }
-                consecutiveEmpty = 0;
-                state = 'PLAYING';
-                disableVad('playing response');
-                await playAudio(tIntent.audio_key);
-                if (aborted || state === 'ENDED') return; // 段0
-                await handleTransfer();
-                if (timeoutInterval) {
-                    clearInterval(timeoutInterval);
-                    timeoutInterval = null;
-                }
+                await commitTransfer('transfer', { clipKey: tIntent.audio_key });
                 return;
             }
 
@@ -3453,18 +3559,26 @@ fastify.register(async (fastify) => {
             const fillerKeys = inWait ? [] : (cfg?.fillerKeys || []);
             const fillerKey = fillerKeys.length ? fillerKeys[haiPatternIndex % fillerKeys.length] : null;
             haiPatternIndex++;
-            const fillerPromise = new Promise((resolve) =>
-                setTimeout(resolve, HUMAN_PAUSE_MS)
+            const startFiller = (delayMs) => new Promise((resolve) =>
+                setTimeout(resolve, delayMs)
             ).then(() => {
-                if (state === 'ENDED' || !fillerKey) return;
+                if (state === 'ENDED' || !fillerKey || transferCommitted) return;
                 return playAudio(fillerKey);
             }).catch((err) => console.error('Filler playback error:', err));
+            // 版6（v2）＝「はい」は中身を聞いてから決める＝担当者本人の名乗りなら流さない（Tom「『はい』なしで取次」）
+            const v2 = !!ts?.v2;
+            let fillerPromise = v2 ? null : startFiller(HUMAN_PAUSE_MS);
             console.log(
-                `[parallel] Whisper started; filler ${fillerKey || '(none)'} scheduled in ${HUMAN_PAUSE_MS}ms`
+                `[parallel] Whisper started; filler ${fillerKey || '(none)'} ${v2 ? 'decided after STT' : `scheduled in ${HUMAN_PAUSE_MS}ms`}`
             );
 
             const transcript = await whisperPromise;
             console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
+            let fast = null;
+            if (v2) {
+                fast = transcript ? decideFastHandover({ transcript, ts }) : null;
+                fillerPromise = fast ? Promise.resolve() : startFiller(Math.max(0, HUMAN_PAUSE_MS - (Date.now() - t0)));
+            }
 
             if (!transcript) {
                 if (inWait) {
@@ -3524,6 +3638,11 @@ fastify.register(async (fastify) => {
             }
 
             const turnMeta = { transcript, inWait, forced, stateBefore };
+            // 版6＝担当者本人の名乗りは Haiku を待たずに取次（「はい」も取次の声も流さない）
+            if (fast) {
+                await actOnDecision(fast, null, null, turnMeta);
+                return;
+            }
             // 手順3＝待機中の相づちだけは Haiku の前に決める（設定が在る通話だけ＝§1-f）
             if (ts) {
                 const pre = decideBeforeClassifier({ transcript, ts, inWait });
@@ -3566,7 +3685,7 @@ fastify.register(async (fastify) => {
             // 設定が在る通話＝新しい判定順（§1-f）。無い通話は下の今の流れ
             if (ts) {
                 const intentDef = cfg.intentByName.get(decision.intent) || null;
-                const d = decideAfterClassifier({ transcript, intentName: decision.intent, intentDef, ts, inWait });
+                const d = (ts.v2 ? decideAfterClassifierV2 : decideAfterClassifier)({ transcript, intentName: decision.intent, intentDef, ts, inWait });
                 await actOnDecision(d, intentDef, decision, turnMeta);
                 return;
             }
@@ -3857,6 +3976,14 @@ fastify.register(async (fastify) => {
                     );
                 }
                 return;
+            }
+
+            // 版6＝保留音の検知（発話の VAD とは別）。聞いている間と処理中だけ数え、こちらが話している間・あいさつ前は数え直す
+            if (ts?.v2 && !transferCommitted && callStartTime && Date.now() - callStartTime >= CALL_START_GRACE_MS
+                && (state === 'LISTENING' || state === 'PROCESSING')) {
+                holdTick(Buffer.from(base64Payload, 'base64'));
+            } else if (holdRun) {
+                holdRun = null;
             }
 
             // While we are speaking (or in any non-listening state) we
