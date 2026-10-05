@@ -330,6 +330,8 @@ const SCENARIOS = {
             if (!has(r, /committed \(hold, no clip\)/)) errs.push('取次の声を流した／取次の入口を通っていない');
             if (has(r, /Playing transfer_success/)) errs.push('保留中に取次の声を流した');
             if (!resultsSaved(r).includes('transferred')) errs.push(`結果が transferred でない: ${resultsSaved(r)}`);
+            const rings = r.events.filter((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')).length;
+            if (rings !== 1) errs.push(`CM を ${rings} 回呼んだ（1回のはず）`);
             const h = holdEvents(r).find((x) => x.action === 'transfer');
             if (!h || !(h.hold_seconds >= 4)) errs.push(`記録に保留音の秒数が無い: ${JSON.stringify(h)}`);
             return errs;
@@ -425,6 +427,20 @@ const SCENARIOS = {
             const errs = [];
             if (r.events.some((e) => e.t === 'twilio')) errs.push('文字起こしの失敗で取次した');
             if (!holdEvents(r).some((x) => x.action === 'stt_error')) errs.push('失敗の記録が無い');
+            return errs;
+        },
+    },
+    // 「少々お待ちください」の判定が遅い間に音楽の判定が先に返る＝「担当者が出るまで待つ」なら取次しない（追い越さない＝codex レビュー 4）
+    v2_race_words_wait: {
+        settings: V2({ on_words: 'wait' }),
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'silence', ms: 700 }, { kind: 'music', ms: 14000 }],
+        haiku: haikuFor([['少々お待ち', 'wait']]),
+        haikuDelayMs: 6000,
+        maxMs: 30000,
+        check(r) {
+            const errs = [];
+            if (r.events.some((e) => e.t === 'twilio')) errs.push('「担当者が出るまで待つ」なのに保留音で取次した');
+            if (!holdEvents(r).some((x) => x.action === 'no_transfer' && x.gate === 'words_wait')) errs.push(`保留音を「言葉の後」として決め直していない: ${JSON.stringify(holdEvents(r).map((x) => [x.action, x.gate]))}`);
             return errs;
         },
     },

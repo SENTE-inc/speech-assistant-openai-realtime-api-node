@@ -2667,7 +2667,11 @@ fastify.register(async (fastify) => {
         let holdFrame = 0;
         let holdCheckInFlight = false;
         let holdCooldownUntil = 0;
-        let pendingHold = false; // 処理中に保留音と決まった＝聞き取りに戻った時に取次する
+        // 保留音の候補（文字起こしまで済んだ物）＝処理中・持ち越しの発話があれば、その判定が終わるまで取っておいて決め直す
+        let holdCandidate = null; // { seconds, rms, text, at }
+        // こちらが話している間と話し終えた直後0.8秒は保留音を数えない（つなぎの「はい」も含む＝codex レビュー 6）
+        let playbackActive = 0;
+        let holdQuietUntil = 0;
 
         // VAD
         const VAD_RMS_THRESHOLD = 2000;
@@ -2853,6 +2857,15 @@ fastify.register(async (fastify) => {
         // Playback (one key → cached mulaw → chunked → mark → await)
         // -----------------------------------------------------------------
         const playAudio = async (key) => {
+            playbackActive++;
+            try {
+                return await playAudioInner(key);
+            } finally {
+                playbackActive--;
+                holdQuietUntil = Date.now() + POST_PLAYBACK_DELAY_MS;
+            }
+        };
+        const playAudioInner = async (key) => {
             const token = ++markCounter;
             currentPlaybackToken = token;
 
@@ -3305,7 +3318,7 @@ fastify.register(async (fastify) => {
             if (transferCommitted || aborted || state === 'ENDED') return false;
             transferCommitted = true;
             holdRun = null;
-            pendingHold = false;
+            holdCandidate = null;
             leaveWait(why);
             consecutiveEmpty = 0;
             currentPlaybackToken = ++markCounter; // 流れかけのつなぎの「はい」を止める
@@ -3324,13 +3337,28 @@ fastify.register(async (fastify) => {
             return true;
         };
 
-        // 聞き取りに戻った時＝処理中に決まった保留音の取次を、ここで実行する（処理が否定・取次・終了に進んだ時はここに来ない）
+        // 保留音の候補を、その時の設定と状況で決める（処理中・持ち越しの発話があれば待つ＝追い越さない＝codex レビュー 4・5・7）
+        //   決め直すたびに「受付の言葉を聞いたか」を取り直す＝先に届いた「少々お待ちください」の判定の後で決まる
+        const tryHoldCommit = async () => {
+            const c = holdCandidate;
+            if (!c) return;
+            if (transferCommitted || aborted || state === 'ENDED' || state === 'REALTIME') { holdCandidate = null; return; }
+            if (Date.now() - c.at > 15000) { holdCandidate = null; return; } // 古い候補は捨てる
+            if (state !== 'LISTENING' || pendingUtterance) return; // 処理が終わって聞き取りに戻った時に、もう一度ここへ来る
+            holdCandidate = null;
+            const announced = !!waitCtx || (announcedAt && Date.now() - announcedAt <= ts.wait_max_seconds * 1000);
+            const dec = decideHold({ ts, announced });
+            const base = { event: 'hold_music', hold_seconds: c.seconds, hold_rms: c.rms, transcript: c.text, in_wait: !!waitCtx, gate: dec.reason };
+            console.log(`[hold] music ${c.seconds}s rms=${c.rms} announced=${!!announced} → ${dec.transfer ? (ts.hold_music_record_only ? 'record_only' : 'transfer') : dec.reason}`);
+            if (!dec.transfer) { logDecision({ ...base, action: 'no_transfer' }); return; }
+            if (ts.hold_music_record_only) { logDecision({ ...base, action: 'record_only' }); return; }
+            logDecision({ ...base, action: 'transfer' });
+            await commitTransfer('hold');
+        };
+        // 聞き取りに戻った時＝取っておいた保留音の候補を決め直す（処理が否定・取次・終了に進んだ時はここに来ない）
         const afterBackToListening = () => {
-            if (!pendingHold || transferCommitted) return;
-            pendingHold = false;
-            setImmediate(() => {
-                if (state === 'LISTENING' && !transferCommitted) commitTransfer('hold').catch((e) => console.error('[hold] commit error:', e));
-            });
+            if (!holdCandidate || transferCommitted) return;
+            setImmediate(() => tryHoldCommit().catch((e) => console.error('[hold] commit error:', e)));
         };
 
         // 版6＝保留音の検知（§3-1）。設定の行が v2 の通話で、聞いている間・処理中に数える
@@ -3368,14 +3396,8 @@ fastify.register(async (fastify) => {
             const base = { event: 'hold_music', hold_seconds: seconds, hold_rms: medianRms, transcript: res.text ?? null, in_wait: !!waitCtx };
             if (!res.ok) { logDecision({ ...base, action: 'stt_error' }); return; }
             if (!isWordless(res.text)) { logDecision({ ...base, action: 'has_words' }); return; }
-            const announced = !!waitCtx || (announcedAt && Date.now() - announcedAt <= ts.wait_max_seconds * 1000);
-            const dec = decideHold({ ts, announced });
-            console.log(`[hold] music ${seconds}s rms=${medianRms} announced=${!!announced} → ${dec.transfer ? (ts.hold_music_record_only ? 'record_only' : 'transfer') : dec.reason}`);
-            if (!dec.transfer) { logDecision({ ...base, gate: dec.reason, action: 'no_transfer' }); return; }
-            if (ts.hold_music_record_only) { logDecision({ ...base, gate: dec.reason, action: 'record_only' }); return; }
-            logDecision({ ...base, gate: dec.reason, action: 'transfer' });
-            if (state === 'LISTENING') await commitTransfer('hold');
-            else pendingHold = true; // 処理中の発話の判定を追い越さない
+            holdCandidate = { seconds, rms: medianRms, text: res.text ?? null, at: Date.now() };
+            await tryHoldCommit();
         };
 
         // 判定の記録（call_turn_decisions）。失敗しても通話は止めない
@@ -3427,7 +3449,7 @@ fastify.register(async (fastify) => {
             } else if (!vadEnabled) {
                 enableVadDelayed(0, 'waiting');
             }
-            afterBackToListening();
+            if (!(waitCtx && pendingUtterance)) afterBackToListening(); // 持ち越しの発話があれば、その判定の後で保留音を決め直す
             if (waitCtx && pendingUtterance) {
                 const u = pendingUtterance;
                 pendingUtterance = null;
@@ -3980,7 +4002,7 @@ fastify.register(async (fastify) => {
 
             // 版6＝保留音の検知（発話の VAD とは別）。聞いている間と処理中だけ数え、こちらが話している間・あいさつ前は数え直す
             if (ts?.v2 && !transferCommitted && callStartTime && Date.now() - callStartTime >= CALL_START_GRACE_MS
-                && (state === 'LISTENING' || state === 'PROCESSING')) {
+                && (state === 'LISTENING' || state === 'PROCESSING') && playbackActive === 0 && Date.now() >= holdQuietUntil) {
                 holdTick(Buffer.from(base64Payload, 'base64'));
             } else if (holdRun) {
                 holdRun = null;
@@ -4193,6 +4215,8 @@ fastify.register(async (fastify) => {
                     }
                     case 'stop':
                         console.log('Twilio: stop');
+                        // 通話が終わった＝この後の保留音・発話の判定から取次へ進まない（取次の切り替え中・後は正常な終わり＝codex レビュー）
+                        if (transferPhase !== 'committing' && transferPhase !== 'committed') aborted = true;
                         break;
                     default:
                         console.log('Twilio: unhandled event', data.event);

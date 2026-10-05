@@ -127,6 +127,8 @@ export function transferGate(transcript, ts) {
 // 手順3＝Haiku の前に決める物（待機中の相づちだけ）。決めない時は null
 export function decideBeforeClassifier({ transcript, ts, inWait }) {
     if (!inWait || !isFillerOnly(transcript)) return null;
+    // 版6＝つながない言い回しが相づちにも効く（codex レビュー 9）
+    if (ts.v2 && firstMatch(transcript, ts.block_phrases)) return null;
     return ts.after_wait_strict
         ? { step: '3', action: 'continue_wait', gate: 'filler_strict', matched: null }
         : { step: '3', action: 'transfer', gate: 'filler_after_wait', matched: null };
@@ -216,25 +218,41 @@ export function settingsHash(ts) {
 // 版6（DB 142）＝森さんが場面ごとに選ぶ取次（家＝~/sente/sfav_transfer_tuning_plan.md §3-0・3-1）
 // =====================================================================
 
-// 否定（不在・断り）の言葉＝名乗りの最速の道でも、これが一緒にあれば取次にしない（Haiku に回す）
-export const NEGATIVE_RE = /いません|おりません|不在|外出|席を外|出張|休み|結構です|けっこうです|お断り|必要ありません|間に合って|いりません|興味(が)?ない/;
+// 否定（不在・断り・打ち消し）の言葉＝名乗りの最速の道でも、これが一緒にあれば決めない（Haiku に回す）
+export const NEGATIVE_RE = /いません|おりません|いない|おらず|不在|外出|席を外|出張|休み|結構|けっこう|お断り|断って|必要(が)?(ありません|ない)|不要|間に合って|いりません|興味(が|は)?(ない|ありません)|受け付けて|ではありません|ではない|じゃない|じゃありません|違います|ちがいます/;
+// 質問・受付・第三者の話＝名乗りではない（最速の道に乗せない）
+const NOT_SELF_RE = /[?？]|ですか|ますか|でしょうか|ましたか|受付|の者|の方|別の/;
 
-// 担当者本人の名乗り＝言い回しの一覧（森さんが足せる）＋固定の形（「お電話代わりました」「担当の山田です」）
+// 担当者本人の言い方（森さんが画面で足す・消す）。「＊」は名前などの1〜8字（「担当の＊です」＝担当の山田です）。
+// ＊には「者・人・方・番号」を入れない＝「担当の者は」「代表の番号です」を名乗りにしない
+const WILD = '[^、。，．！？!?\\s者人方番号]{1,8}';
+function phraseRe(p) {
+    const esc = p.split(/[＊*]/).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    return new RegExp(esc.join(WILD));
+}
+export function matchPhrases(text, phrases) {
+    const hay = text || '';
+    for (const p of phrases || []) {
+        if (!p) continue;
+        if (/[＊*]/.test(p) ? phraseRe(p).test(hay) : hay.includes(p)) return p;
+    }
+    return null;
+}
+
+// 担当者本人の名乗り（版6）＝森さんの言い回しの一覧だけで決める（固定の判定は持たない＝消せば効かなくなる）
 export function matchHandover(transcript, ts) {
-    const hit = firstMatch(transcript, ts.handover_phrases);
-    if (hit) return hit;
-    const m = (transcript || '').match(HANDOVER_DONE_RE);
-    return m ? m[0] : null;
+    return matchPhrases(transcript, ts.handover_phrases);
 }
 
 // 本人が名乗った時の最速の道（Haiku を待たない・「はい」も取次の声も流さない＝Tom「早く取り次いで欲しい」）
-// 待たせる言い回しが一緒にある時（「担当です、少々お待ちください」）も本人＝最速で取次。否定・つながない言い回しがあれば決めない
+// 否定・質問・受付や第三者の話・つながない言い回しが一緒にあれば決めない（Haiku に回す＝codex レビュー 2・3）
 export function decideFastHandover({ transcript, ts }) {
     if (!ts?.v2 || !ts.on_handover) return null;
     const hit = matchHandover(transcript, ts);
     if (!hit) return null;
-    if (NEGATIVE_RE.test(transcript || '')) return null;
-    if (firstMatch(transcript, ts.block_phrases)) return null;
+    const text = transcript || '';
+    if (NEGATIVE_RE.test(text) || NOT_SELF_RE.test(text)) return null;
+    if (firstMatch(text, ts.block_phrases)) return null;
     return { step: '2h', action: 'transfer_fast', gate: 'handover', matched: hit };
 }
 
@@ -248,8 +266,10 @@ export function decideAfterClassifierV2({ transcript, intentName, intentDef, ts,
     }
     const blocked = firstMatch(transcript, ts.block_phrases);
     const handover = matchHandover(transcript, ts);
-    // 本人の名乗り（Haiku が transfer の時）
-    if (intentDef?.is_transfer && handover && !blocked) {
+    void handover;
+    // 本人の名乗り（Haiku が transfer の時）＝否定・質問・受付の話が混ざる物は名乗りにしない
+    const selfOk = handover && !NEGATIVE_RE.test(transcript || '') && !NOT_SELF_RE.test(transcript || '');
+    if (intentDef?.is_transfer && selfOk && !blocked) {
         if (ts.on_handover) return { step: '8h', action: 'transfer_fast', gate: 'handover', matched: handover };
         return { step: '8h', action: inWait ? 'continue_wait' : 'reprompt', gate: 'handover_off', matched: handover };
     }

@@ -115,3 +115,46 @@ test('DB の行 → v2 の正規化（on_words が空なら v1）と hash', () =
     assert.notEqual(settingsHash(v2), settingsHash({ ...v2, on_words: 'wait' }));
     assert.equal(settingsHash(v1), settingsHash({ ...v1, on_words: 'wait' })); // v1 の hash は版6の項目で変わらない
 });
+
+// ===== codex レビュー（2026-10-05 夜）の反例 =====
+const NOT_SELF = [
+    '私が担当ではありません。',
+    'お電話代わりましたが、営業電話は受け付けていないです。',
+    '担当者は今いないです。私は担当ですけど営業は不要です。',
+    'こちらは受付担当です。',
+    '代表の番号です。',
+    '担当の者は別の人です。',
+    'お電話が変わりましたか？',
+    '担当です。どちらの会社ですか。',
+    '担当の者にお繋ぎいたします。',
+];
+for (const text of NOT_SELF) {
+    test(`最速の道に乗せない「${text}」`, () => {
+        assert.equal(decideFastHandover({ transcript: text, ts: V2_DEFAULT }), null);
+    });
+    test(`Haiku が transfer と言っても名乗りで最速にしない「${text}」`, () => {
+        assert.notEqual(decide(text, 'transfer'), 'transfer_fast');
+    });
+}
+test('森さんが名乗りの句を消したら効かない（固定の判定を持たない）', () => {
+    const ts = { ...V2_DEFAULT, handover_phrases: [] };
+    assert.equal(decideFastHandover({ transcript: 'はい、私が担当ですが。', ts }), null);
+    const ts2 = { ...V2_DEFAULT, handover_phrases: V2_DEFAULT.handover_phrases.filter((p) => !p.includes('代わりました') && !p.includes('変わりました') && !p.includes('替わりました')) };
+    assert.equal(decideFastHandover({ transcript: 'お電話代わりました、山田です。', ts: ts2 }), null);
+});
+test('＊の言い回し＝名前は通す・者／番号／人は通さない', () => {
+    assert.equal(decideFastHandover({ transcript: '担当の山田です。', ts: V2_DEFAULT })?.action, 'transfer_fast');
+    assert.equal(decideFastHandover({ transcript: 'オーナーの佐藤ですけど。', ts: V2_DEFAULT })?.action, 'transfer_fast');
+    assert.equal(decideFastHandover({ transcript: '担当の者です。', ts: V2_DEFAULT }), null);
+});
+test('待機中の相づちにも「つながない言い回し」が効く', () => {
+    const ts = { ...V2_DEFAULT, after_wait_strict: false, block_phrases: ['はい'] };
+    assert.notEqual(decide('はい。', 'reprompt', { ts, inWait: true }), 'transfer');
+});
+test('DB 142 で移した行（受付の予告は待たせる言い方へ）＝「担当者に代わります」で保留音を待つ', () => {
+    // 141 の SENTE の行に 142 の update を当てた形
+    const migrated = { ...V2_DEFAULT, transfer_phrases: ['詳しく聞かせて', '詳しく聞きたい', '興味があります', '興味あります', '聞かせてください'] };
+    assert.equal(decide('担当者に代わります。', 'transfer', { ts: migrated }), 'wait_enter');
+    assert.equal(decide('担当の者にお繋ぎいたします。', 'transfer', { ts: migrated }), 'wait_enter');
+});
+
