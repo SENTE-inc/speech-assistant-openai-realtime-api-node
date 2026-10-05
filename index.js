@@ -324,7 +324,7 @@ async function getAudioBuffer(cfg, key) {
 
 // --- Per-tenant playbook (script + clips + intents) ----------------------
 const PLAYBOOK_TTL_MS = 5 * 60 * 1000;
-const playbookCache = new Map(); // `${tenantId}:${projectId}` -> { cfg, loadedAt }
+const playbookCache = new Map(); // `${tenantId}:${projectId}:${gender}` -> { cfg, loadedAt }
 
 // Drop every cached playbook of a tenant (tenant default and each operator's set).
 function bustPlaybookCache(tenantId) {
@@ -337,7 +337,40 @@ function bustPlaybookCache(tenantId) {
 // 無ければテナントの既定。「AI が話していた声の本人につながる」ための前提。
 // 声（台本）はプロジェクトに1セット（家 §3-3「🚀」④ の決定・Tom 2026-09-11）＝そのプロジェクトの台本 → 無ければテナント既定。
 // CM ごとの台本（owner_user_id 入り）は引かない。
-async function resolvePlaybookRow(tenantId, projectId) {
+// 🆕 声セットはプロジェクト × CM の性別に1セット（Tom 2026-10-05「架電した CM の性別で AI の声を切り替える」＝
+// 取次で出る CM と、受付が聞いた声の性別をそろえる）。DB＝call_playbooks.voice_gender（空＝性別なしのセット）。
+// 同じ範囲（プロジェクト、無ければテナント既定）の中の順＝
+//   ① CM と同じ性別で音声が揃ったセット → ② 性別なしで揃ったセット → ③ ほかの揃ったセット
+//   → 揃ったセットが無ければ同じ順で最初の1本（関門 voiceSetGate が「未設定」で止める＝今までと同じ）
+// ＝性別のセットを作り始めても、音声が揃うまでは今のセットで鳴り続ける。CM の居ない通話（受電・手動）は性別なし＝②が先。
+// プロジェクトにセットが1本も無い時だけテナント既定へ（今までと同じ）。
+const parseVoiceGender = (v) => (v === 'male' || v === 'female' ? v : null);
+
+// 声セットの範囲（プロジェクト × 性別）で台本を絞る＝/provision-playbook・/clip-audio・voice-ai.js が同じ1本を使う
+function scopePlaybookQuery(query, projectId, gender) {
+    const q = projectId ? query.eq('project_id', projectId) : query.is('project_id', null);
+    return gender ? q.eq('voice_gender', gender) : q.is('voice_gender', null);
+}
+
+// 音声の置き場＝<slug>（テナント既定）／<slug>/p-<project>（プロジェクト）＋性別のセットは /male・/female
+// （同じファイル名の音が性別のセットどうしで上書きし合わないように）
+function voiceSetBase(slug, projectId, gender) {
+    const base = projectId ? `${slug}/p-${projectId}` : slug;
+    return gender ? `${base}/${gender}` : base;
+}
+
+// 架電した CM の性別（user_profiles.gender）。読めなければ null＝性別なしと同じ扱い（通話は止めない）
+async function operatorGender(userId) {
+    if (!userId) return null;
+    const { data, error } = await supabase.from('user_profiles').select('gender').eq('id', userId).maybeSingle();
+    if (error) {
+        console.error('[playbook] operator gender lookup failed:', error.message);
+        return null;
+    }
+    return parseVoiceGender(data?.gender);
+}
+
+async function resolvePlaybookRow(tenantId, projectId, gender = null) {
     const base = () => supabase
         .from('call_playbooks')
         .select('*')
@@ -345,11 +378,36 @@ async function resolvePlaybookRow(tenantId, projectId) {
         .eq('is_active', true)
         .is('campaign_id', null)
         .is('owner_user_id', null);
+    const pick = async (rows) => {
+        if (!rows.length) return null;
+        const rank = (r) => {
+            const g = parseVoiceGender(r.voice_gender);
+            return gender && g === gender ? 0 : !g ? 1 : 2;
+        };
+        const ordered = [...rows].sort((a, b) => rank(a) - rank(b));
+        if (ordered.length === 1) return ordered[0];
+        const { data: clips, error } = await supabase
+            .from('audio_clips').select('playbook_id, audio_ready')
+            .in('playbook_id', ordered.map((r) => r.id)).eq('active', true);
+        if (error) {
+            console.error('[playbook] clip readiness lookup failed:', error.message);
+            return ordered[0];
+        }
+        const isReady = (id) => {
+            const mine = (clips || []).filter((c) => c.playbook_id === id);
+            return mine.length > 0 && mine.every((c) => c.audio_ready);
+        };
+        return ordered.find((r) => isReady(r.id)) || ordered[0];
+    };
     if (projectId) {
-        const pj = await base().eq('project_id', projectId).maybeSingle();
-        if (pj.error || pj.data) return pj;
+        const pj = await base().eq('project_id', projectId);
+        if (pj.error) return { data: null, error: pj.error };
+        const row = await pick(pj.data || []);
+        if (row) return { data: row, error: null };
     }
-    return base().is('project_id', null).maybeSingle();
+    const td = await base().is('project_id', null);
+    if (td.error) return { data: null, error: td.error };
+    return { data: await pick(td.data || []), error: null };
 }
 
 // Build the Claude classifier prompt from a playbook's intents.
@@ -372,13 +430,13 @@ function buildClassifierPrompt(cfg) {
         `{ "intent": "<上記nameのいずれか>", "callback_info": "<日時情報があれば。無ければ省略>" }`;
 }
 
-async function loadPlaybook(tenantId, projectId = null) {
+async function loadPlaybook(tenantId, projectId = null, gender = null) {
     if (!tenantId) return null;
-    const cacheKey = `${tenantId}:${projectId || ''}`;
+    const cacheKey = `${tenantId}:${projectId || ''}:${gender || ''}`;
     const cached = playbookCache.get(cacheKey);
     if (cached && Date.now() - cached.loadedAt < PLAYBOOK_TTL_MS) return cached.cfg;
 
-    const { data: pb, error: pbErr } = await resolvePlaybookRow(tenantId, projectId);
+    const { data: pb, error: pbErr } = await resolvePlaybookRow(tenantId, projectId, gender);
     if (pbErr || !pb) {
         console.error(
             `[playbook] load failed for tenant ${tenantId}: ${pbErr?.message || 'no active playbook'}`
@@ -803,13 +861,14 @@ async function buildOverflow(prospectSid, clipPath) {
 async function callbackClipPathFor(prospectSid) {
     const { data: s } = await supabase
         .from('call_sessions')
-        .select('tenant_id, project_id')
+        .select('tenant_id, project_id, operator_id')
         .eq('call_sid', prospectSid)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
     if (!s?.tenant_id) return null;
-    const { data: pb } = await resolvePlaybookRow(s.tenant_id, s.project_id || null);
+    // 受付が聞いていた声と同じセット＝架電した CM の性別で選ぶ（Tom 2026-10-05）
+    const { data: pb } = await resolvePlaybookRow(s.tenant_id, s.project_id || null, await operatorGender(s.operator_id));
     if (!pb) return null;
     const { data: clip } = await supabase
         .from('audio_clips')
@@ -1055,6 +1114,8 @@ fastify.post('/provision-playbook', async (request, reply) => {
     // (声はプロジェクトに1セット). The dashboard route authorizes the project
     // server-side (admin / client_admin, same tenant); we trust it here.
     const project_id = (body.project_id || '').trim() || null;
+    // voice_gender null => 性別なしのセット; male/female => その性別の CM が架電した時のセット（Tom 2026-10-05）
+    const voice_gender = parseVoiceGender(body.voice_gender);
     const company_name = (body.company_name || '').trim();
     const voice = (body.voice || 'shimmer').trim();
     const clipTexts = body.clip_texts && typeof body.clip_texts === 'object' ? body.clip_texts : {};
@@ -1070,8 +1131,8 @@ fastify.post('/provision-playbook', async (request, reply) => {
         .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
     if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
     const slug = (tenant.slug || '').trim();
-    // Per-project sets live under <slug>/p-<project>/ so storage separates cleanly.
-    const base = project_id ? `${slug}/p-${project_id}` : slug;
+    // Per-project sets live under <slug>/p-<project>/ (gendered sets under …/male|female) so storage separates cleanly.
+    const base = voiceSetBase(slug, project_id, voice_gender);
 
     // 通話中の電話がある間は作り直さない（レビュー E3）＝下でクリップを消して入れ直す間に
     // 始まった通話が0本の台本を掴むと、無言電話になる。テナント既定の声はプロジェクトを持たない
@@ -1096,13 +1157,12 @@ fastify.post('/provision-playbook', async (request, reply) => {
 
     // Find the tenant's active default playbook; update-in-place if it exists,
     // otherwise create one. Either way we rebuild its clips and intents.
-    let existingQuery = supabase
-        .from('call_playbooks').select('id')
-        .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true);
-    existingQuery = project_id
-        ? existingQuery.eq('project_id', project_id)
-        : existingQuery.is('project_id', null);
-    const { data: existing } = await existingQuery.maybeSingle();
+    const { data: existing } = await scopePlaybookQuery(
+        supabase
+            .from('call_playbooks').select('id')
+            .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true),
+        project_id, voice_gender,
+    ).maybeSingle();
 
     // Preserve any clip a tenant recorded in their own voice (source='recorded')
     // across a regenerate: keep that flag and DON'T re-synthesize/overwrite the
@@ -1126,7 +1186,8 @@ fastify.post('/provision-playbook', async (request, reply) => {
         await supabase.from('call_intents').delete().eq('playbook_id', playbookId);
     } else {
         const { data: created, error: insErr } = await supabase.from('call_playbooks').insert({
-            tenant_id, project_id, name: 'default', company_name, voice, audio_base_path: base,
+            tenant_id, project_id, ...(voice_gender ? { voice_gender } : {}),
+            name: 'default', company_name, voice, audio_base_path: base,
             realtime_system_message: realtimeSystemMessage, is_active: true,
         }).select('id').single();
         if (insErr) {
@@ -1961,6 +2022,7 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
     // project_id null => tenant default set; a uuid => that project's set.
     // Authorized server-side by the dashboard route (admin / client_admin, same tenant).
     const project_id = (body.project_id || '').trim() || null;
+    const voice_gender = parseVoiceGender(body.voice_gender);
     const key = (body.key || '').trim();
     if (!tenant_id || !key || !['upload', 'delete', 'synthesize', 'preview'].includes(action)) {
         return reply.code(400).send({ error: 'action(upload|delete|synthesize|preview), tenant_id and key are required' });
@@ -1971,15 +2033,14 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
         .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
     if (tErr || !tenant) return reply.code(404).send({ error: 'tenant not found' });
     const slug = (tenant.slug || '').trim();
-    const base = project_id ? `${slug}/p-${project_id}` : slug;
+    const base = voiceSetBase(slug, project_id, voice_gender);
 
-    let pbQuery = supabase
-        .from('call_playbooks').select('id, voice')
-        .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true);
-    pbQuery = project_id
-        ? pbQuery.eq('project_id', project_id)
-        : pbQuery.is('project_id', null);
-    const { data: pb, error: pbErr } = await pbQuery.maybeSingle();
+    const { data: pb, error: pbErr } = await scopePlaybookQuery(
+        supabase
+            .from('call_playbooks').select('id, voice')
+            .eq('tenant_id', tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true),
+        project_id, voice_gender,
+    ).maybeSingle();
     if (pbErr || !pb) return reply.code(409).send({ error: '先に台本を作成してください' });
 
     const { data: clip, error: clipErr } = await supabase
@@ -2066,6 +2127,7 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
 // 音声タブ（案件 → 台本の提案 → ElevenLabs のテイク → 選んで保存・上限）＝voice-ai.js
 registerVoiceAi(fastify, {
     supabase, anthropic, verifyProvisionSecret, AUDIO_BUCKET, CLIP_TEMPLATE, bustTenantAudio, detectAudioFormat,
+    parseVoiceGender, scopePlaybookQuery, voiceSetBase,
 });
 
 // ---------------------------------------------------------------------
@@ -2074,8 +2136,8 @@ registerVoiceAi(fastify, {
 // CM がタブを閉じれば叩かれなくなる＝架電も止まる（サーバ側に常駐の仕組みを持たない）。
 // ---------------------------------------------------------------------
 // 止めた理由（reason＝画面にそのまま出す文）と、声セットが揃っていないせいで止めた時だけ code（VOICE_NOT_READY）。
-async function voiceSetGate(tenantId, projectId) {
-    const { data: pb, error } = await resolvePlaybookRow(tenantId, projectId);
+async function voiceSetGate(tenantId, projectId, gender = null) {
+    const { data: pb, error } = await resolvePlaybookRow(tenantId, projectId, gender);
     if (error) {
         console.error('[dial-tick] playbook lookup failed:', error.message);
         return { reason: '台本を読めませんでした' };
@@ -2137,7 +2199,8 @@ fastify.post('/dial-tick', async (request, reply) => {
         .eq('is_current', true)
         .limit(1)
         .maybeSingle();
-    const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null);
+    // 声セットは CM の性別でも選ぶ（Tom 2026-10-05）＝この CM の通話が鳴らすセットで判定する
+    const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null, await operatorGender(userId));
     if (gate) {
         console.log(`[dial-tick] blocked operator=${userId} reason=${gate.reason}`);
         return reply.send({ ok: true, dialed: 0, reason: gate.reason, ...(gate.code ? { code: gate.code } : {}) });
@@ -3658,7 +3721,9 @@ fastify.register(async (fastify) => {
                         );
                         // Load the tenant's playbook, then greet. Without a
                         // playbook there's nothing to say, so end gracefully.
-                        loadPlaybook(callParams.tenant_id, callParams.project_id || null)
+                        // 声セットは架電した CM の性別で選ぶ（Tom 2026-10-05）＝CM の居ない通話は性別なし
+                        operatorGender(callParams.operator_id || null)
+                            .then((gender) => loadPlaybook(callParams.tenant_id, callParams.project_id || null, gender))
                             .then((loaded) => {
                                 if (!loaded) {
                                     console.error(

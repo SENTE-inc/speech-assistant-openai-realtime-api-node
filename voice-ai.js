@@ -163,6 +163,7 @@ export function registerVoiceAi(fastify, deps) {
     const {
         supabase, anthropic, verifyProvisionSecret, AUDIO_BUCKET,
         CLIP_TEMPLATE, bustTenantAudio, detectAudioFormat,
+        parseVoiceGender, scopePlaybookQuery, voiceSetBase,
     } = deps;
     const CLIP_KEYS = new Set(CLIP_TEMPLATE.map((c) => c.key));
     // 台本の型（エンジン）と AI に書かせる10本がずれたら起動時に分かるようにする
@@ -172,6 +173,8 @@ export function registerVoiceAi(fastify, deps) {
     async function readScope(body) {
         const tenant_id = str(body.tenant_id);
         const project_id = str(body.project_id) || null;
+        // 声セットはプロジェクト × CM の性別（Tom 2026-10-05）＝空＝性別なしのセット
+        const voice_gender = parseVoiceGender(body.voice_gender);
         if (!tenant_id) return { error: [400, 'tenant_id is required'] };
         const { data: tenant, error } = await supabase
             .from('tenants').select('id, slug').eq('id', tenant_id).maybeSingle();
@@ -180,7 +183,8 @@ export function registerVoiceAi(fastify, deps) {
         return {
             tenant_id,
             project_id,
-            base: project_id ? `${slug}/p-${project_id}` : slug,
+            voice_gender,
+            base: voiceSetBase(slug, project_id, voice_gender),
             exempt: body.actor_role === 'admin',
             user_id: str(body.user_id) || null,
         };
@@ -505,10 +509,11 @@ export function registerVoiceAi(fastify, deps) {
             return reply.code(500).send({ error: '通話の状態を確かめられませんでした' });
         }
 
-        let pbQuery = supabase.from('call_playbooks').select('id')
-            .eq('tenant_id', scope.tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true);
-        pbQuery = scope.project_id ? pbQuery.eq('project_id', scope.project_id) : pbQuery.is('project_id', null);
-        const { data: pb, error: pbErr } = await pbQuery.maybeSingle();
+        const { data: pb, error: pbErr } = await scopePlaybookQuery(
+            supabase.from('call_playbooks').select('id')
+                .eq('tenant_id', scope.tenant_id).is('campaign_id', null).is('owner_user_id', null).eq('is_active', true),
+            scope.project_id, scope.voice_gender,
+        ).maybeSingle();
         if (pbErr || !pb) return reply.code(409).send({ error: '先に台本を作成してください' });
 
         const { data: clips, error: clipErr } = await supabase
