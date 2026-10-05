@@ -9,6 +9,10 @@ import fetch from 'node-fetch';
 import ffmpegStatic from 'ffmpeg-static';
 import { spawn } from 'node:child_process';
 import {
+    hasSufficientTransferEvidence, buildClassifierPrompt, buildTranscriptionPrompt,
+    decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
+} from './transfer-logic.js';
+import {
     existsSync,
     statSync,
     accessSync,
@@ -412,25 +416,7 @@ async function resolvePlaybookRow(tenantId, projectId, gender = null) {
     return { data: await pick(td.data || []), error: null };
 }
 
-// Build the Claude classifier prompt from a playbook's intents.
-function buildClassifierPrompt(cfg) {
-    const lines = cfg.intents.map((i) => {
-        const ex = Array.isArray(i.triggers) ? i.triggers.join(' / ') : '';
-        return `- ${i.name}: ${ex}`;
-    });
-    return `あなたは営業電話の応対判断AIです。${cfg.companyName}の担当者として、` +
-        `会話の直近の発言から最も当てはまる意図(intent)を1つだけ選んでください。\n\n` +
-        `【意図の一覧（name: 該当する発言の例）】\n${lines.join('\n')}\n\n` +
-        `判断のポイント:\n` +
-        `- transfer（取次）は最も慎重に判断する。相手が「自分が担当者／責任者だ」と明確に名乗った、担当者本人が電話口に出て前向きに話を聞く姿勢を示した、または「お繋ぎします／代わります」と取り次ぎを明言した場合のみ選ぶ。単なる相槌・あいさつ・聞き返し（例:「はい」だけ／「すいません」／「お待たせ」／「もしもし」）や曖昧な発話では絶対に transfer を選ばない。\n` +
-        `- 担当者がいない・不在を示す発言（「いません」「不在」「外出中」「席を外している」等）は not_available（戻り時間が明示されていれば callback_scheduled）。transfer ではない。\n` +
-        `- transfer かどうか確信が持てない場合は transfer を選ばない（聞き取れていなければ reprompt、意味は通じるが当てはまらなければ openai_realtime）。\n` +
-        `- 聞き取れない・意味をなさない発話は "reprompt"。\n` +
-        `- 意味は通じるが上記に当てはまらない発言は "openai_realtime"。\n` +
-        `- 戻り時間など日時情報があれば callback_info に原文のまま記録。\n\n` +
-        `必ず次のJSONのみを返してください（説明文は不要）:\n` +
-        `{ "intent": "<上記nameのいずれか>", "callback_info": "<日時情報があれば。無ければ省略>" }`;
-}
+// Claude の分類プロンプトは transfer-logic.js の buildClassifierPrompt（設定が無い時は今のまま）。
 
 async function loadPlaybook(tenantId, projectId = null, gender = null) {
     if (!tenantId) return null;
@@ -486,9 +472,7 @@ async function loadPlaybook(tenantId, projectId = null, gender = null) {
     // trigger list dominates and is then truncated at 240 chars, which both
     // biases STT toward transfer phrases and drops the 不在/断り/折り返し
     // keywords entirely — exactly the words we most need disambiguated.
-    const vocab = [...new Set(intents.flatMap((i) => (Array.isArray(i.triggers) ? i.triggers.slice(0, 2) : [])))].join('、');
-    cfg.transcriptionPrompt =
-        `日本語の法人向け営業電話です。会社名は${pb.company_name}。想定される発言: ${vocab}`.slice(0, 240);
+    cfg.transcriptionPrompt = buildTranscriptionPrompt(pb.company_name, intents);
 
     playbookCache.set(cacheKey, { cfg, loadedAt: Date.now() });
 
@@ -502,6 +486,48 @@ async function loadPlaybook(tenantId, projectId = null, gender = null) {
         `[playbook] loaded tenant=${tenantId} clips=${cfg.clips.size} intents=${intents.length}`
     );
     return cfg;
+}
+
+// --- 取次のつまみ（transfer_settings）--------------------------------------
+// 家＝~/sente/sfav_transfer_tuning_plan.md §1-a〜1-c。プロジェクトの行 → 会社の既定の行 → 無し（＝今の挙動）。
+// 通話の始めに1回読み、その通話の間は固定。キャッシュは60秒＝保存から最大60秒後に始まる通話から効く。
+const TRANSFER_SETTINGS_TTL_MS = 60 * 1000;
+const TRANSFER_SETTINGS_LOAD_TIMEOUT_MS = 1500;
+const transferSettingsCache = new Map(); // `${tenantId}:${projectId}` -> { ts, loadedAt }
+const savedSnapshotHashes = new Set();
+
+async function loadTransferSettings(tenantId, projectId = null) {
+    if (!tenantId) return { ts: null, error: null };
+    if (projectId && !/^[0-9a-f-]{36}$/i.test(String(projectId))) projectId = null;
+    const cacheKey = `${tenantId}:${projectId || ''}`;
+    const cached = transferSettingsCache.get(cacheKey);
+    if (cached && Date.now() - cached.loadedAt < TRANSFER_SETTINGS_TTL_MS) return { ts: cached.ts, error: null };
+    let q = supabase.from('transfer_settings').select('*').eq('tenant_id', tenantId);
+    q = projectId ? q.or(`project_id.eq.${projectId},project_id.is.null`) : q.is('project_id', null);
+    const { data, error } = await q;
+    if (error) {
+        // 表が無い（DB 140 の前）も読取の失敗も、今の挙動で動かす
+        console.error('[transfer-settings] load failed; using the built-in behaviour:', error.message);
+        return { ts: null, error };
+    }
+    const rows = data || [];
+    const row = (projectId && rows.find((r) => r.project_id === projectId)) || rows.find((r) => !r.project_id) || null;
+    const ts = normalizeSettings(row);
+    if (ts) {
+        ts.hash = settingsHash(ts);
+        // 中身の控え＝鍵は（会社, hash）。2社が同じ中身でも、それぞれの会社から読めるように
+        const snapKey = `${tenantId}:${ts.hash}`;
+        if (!savedSnapshotHashes.has(snapKey)) {
+            savedSnapshotHashes.add(snapKey);
+            supabase.from('transfer_settings_snapshots')
+                .upsert({ tenant_id: tenantId, hash: ts.hash, settings: { ...ts, hash: undefined } },
+                    { onConflict: 'tenant_id,hash', ignoreDuplicates: true })
+                .then(({ error: e }) => { if (e) { savedSnapshotHashes.delete(snapKey); console.error('[transfer-settings] snapshot save failed:', e.message); } })
+                .catch((e) => { savedSnapshotHashes.delete(snapKey); console.error('[transfer-settings] snapshot threw:', e); });
+        }
+    }
+    transferSettingsCache.set(cacheKey, { ts, loadedAt: Date.now() });
+    return { ts, error: null };
 }
 
 // =====================================================================
@@ -601,9 +627,11 @@ async function classifyWithClaude(transcript, ctx = {}, prompt) {
         .filter(Boolean)
         .join(' / ');
 
-    const userMessage = contextLine
+    const baseMessage = contextLine
         ? `[文脈] ${contextLine}\n[発話] ${transcript}`
         : transcript;
+    // 待機中（受付に保留にされた後）の発話＝プロンプトの wait の判断文が読む（設定が在る通話だけ）
+    const userMessage = ctx.afterHold ? `[状況] 保留の後に電話に出た人の発言\n${baseMessage}` : baseMessage;
 
     const MAX_ATTEMPTS = 3;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -659,48 +687,8 @@ async function classifyWithClaude(transcript, ctx = {}, prompt) {
 // responsible-person evidence in the transcript. Conservative by design — when
 // in doubt it returns false so we reprompt instead of wrongly transferring.
 
-// Naked filler / acknowledgements that must NEVER, on their own, trigger a
-// transfer. Compared after stripping punctuation/whitespace.
-const TRANSFER_FILLER_ONLY = new Set([
-    'はい', 'はいはい', 'ええ', 'うん', 'もしもし', 'おまたせ', 'お待たせ',
-    'おまたせしました', 'お待たせしました', 'すいません', 'すみません',
-    'どうも', 'はいもしもし', 'はいどうも', 'えっと', 'あの', 'はーい',
-]);
-
-// Phrases that DO constitute explicit transfer / responsible-person evidence.
-// Kept in sync with the transfer intent triggers in INTENT_TEMPLATE plus the
-// "I am the person in charge" forms.
-const TRANSFER_EVIDENCE_PATTERNS = [
-    'お繋ぎ', 'おつなぎ', 'お繋ぎします', 'お繋ぎいたします',
-    '代わります', '代わり', '替わります', '担当に代わ', '担当者に代わ',
-    // 文字起こしは「代わります」を「変わります」と書くことがある（2026-09-11 実架電「はい、今変わります」）
-    '変わります', '担当に変わ', '担当者に変わ',
-    '担当です', '担当の', '私が担当', '責任者', '私が責任者',
-    '代表です', '私が代表', '代表の', '社長です', '社長の',
-    '本人です', '私です', '私が', '詳しく聞かせて', '詳しく聞きたい',
-    '興味があります', '興味あります', '聞かせてください', '聞きます',
-];
-
-function normalizeForTransferGuard(s) {
-    return (s || '')
-        .replace(/[\s、。，．！？!?・…ー「」『』（）()【】〜~]/g, '')
-        .trim();
-}
-
-// Returns true only when the transcript carries explicit transfer evidence and
-// is not just filler. Used as a hard gate before handleTransfer().
-function hasSufficientTransferEvidence(transcript) {
-    const norm = normalizeForTransferGuard(transcript);
-    // Too short to be a meaningful "put me through / I'm the person" statement.
-    if (norm.length < 4) return false;
-    // Pure filler / acknowledgement — never a transfer on its own.
-    if (TRANSFER_FILLER_ONLY.has(norm)) return false;
-    // Require at least one explicit evidence phrase in the ORIGINAL transcript
-    // (so punctuation inside a phrase doesn't matter much, but we keep the
-    // original to allow natural matching).
-    const hay = transcript || '';
-    return TRANSFER_EVIDENCE_PATTERNS.some((p) => hay.includes(p));
-}
+// 関門の本体（TRANSFER_FILLER_ONLY・TRANSFER_EVIDENCE_PATTERNS・hasSufficientTransferEvidence）は
+// transfer-logic.js へ移した＝試験 scripts/transfer-bench/ が同じ物を import する（2026-10-05）。
 
 // 日本の番号だけにかける（レビュー C2）＝国外・高額番号へ SENTE の Twilio で発信しない。
 const isJapaneseE164 = (p) => /^\+81\d{9,10}$/.test(String(p || ''));
@@ -786,6 +774,7 @@ async function twilioApi(path, form) {
         throw new Error('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not configured');
     }
     const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    // 応答が無いまま待たない（取次の切り替え中は終了の処理が手を出さない＝ここで止まると通話が止まったままになる）
     const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}${path}`, {
         method: form ? 'POST' : 'GET',
         headers: {
@@ -793,12 +782,14 @@ async function twilioApi(path, form) {
             ...(form ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
         },
         body: form ? new URLSearchParams(form) : undefined,
+        signal: AbortSignal.timeout(TWILIO_API_TIMEOUT_MS),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(`Twilio ${path} ${res.status}: ${JSON.stringify(data)}`);
     return data;
 }
 
+const TWILIO_API_TIMEOUT_MS = 10 * 1000;
 const updateLiveCall = (callSid, twiml) => twilioApi(`/Calls/${callSid}.json`, { Twiml: twiml });
 
 // action＝保留から出た時（上限の <Leave/>・CM との通話の後）に Twilio が取りに来る＝/queue-exit
@@ -1310,6 +1301,18 @@ function isValidTwilioRequest(request, params) {
 // Delete recordings past their retention window: storage object first, then
 // the metadata row. Runs opportunistically after each intake and via the
 // secret-protected endpoint below (Railway sleeps, so no in-process timer).
+// 取次の判定の記録（call_turn_decisions）も録音と同じ保持日数で消す＝録音が0件でも走る（DB 140 の関数）
+async function purgeExpiredDecisions() {
+    const { data, error } = await supabase.rpc('purge_call_turn_decisions');
+    if (error) {
+        // DB 140 の前は関数が無い＝黙って何もしない
+        if (!/purge_call_turn_decisions/.test(error.message || '')) console.error('[decision-log] purge failed:', error.message);
+        return 0;
+    }
+    if (data) console.log(`[decision-log] purged ${data} expired row(s)`);
+    return data || 0;
+}
+
 async function purgeExpiredRecordings() {
     const { data: expired, error } = await supabase
         .from('call_recordings')
@@ -1419,6 +1422,7 @@ fastify.post('/recording-status', async (request, reply) => {
 
         console.log(`✓ [recording] saved ${storagePath} (${mp3.length} bytes, expires=${expiresAt || 'never'})`);
         purgeExpiredRecordings().catch((e) => console.error('[recording] purge error:', e));
+        purgeExpiredDecisions().catch((e) => console.error('[decision-log] purge error:', e));
         return reply.send({ ok: true });
     } catch (err) {
         // The recording stays on Twilio (we delete only after success), so a
@@ -1433,7 +1437,9 @@ fastify.post('/purge-recordings', async (request, reply) => {
     if (!verifyProvisionSecret(request)) {
         return reply.code(403).send({ error: 'forbidden' });
     }
-    return reply.send(await purgeExpiredRecordings());
+    const recordings = await purgeExpiredRecordings();
+    const decisions = await purgeExpiredDecisions().catch(() => 0);
+    return reply.send({ ...recordings, decisions });
 });
 
 // =====================================================================
@@ -2619,6 +2625,22 @@ fastify.register(async (fastify) => {
         let consecutiveEmpty = 0;
         let pardonIndex = 0;
 
+        // 取次のつまみ（transfer_settings の行）。null＝今の挙動。通話の始めに1回読んで固定（家＝~/sente/sfav_transfer_tuning_plan.md）
+        let ts = null;
+        // 待機（受付に「少々お待ちください」と言われて保留中）＝状態とは別に持つ。{ startedAt, deadline }
+        let waitCtx = null;
+        // 待機中は処理している間も音を受け続ける＝その間に閉じた発話は最新の1つだけ持ち越す
+        let pendingUtterance = null; // { audio, forced }
+        // 処理している間も音を受け続ける（待機中と、6秒で区切った発話の処理中）＝§1-d
+        let captureWhileProcessing = false;
+        // 設定を読めず今の挙動で動いた通話（判定の記録に event=fallback を1行残す）
+        let tsFallback = false;
+        // 取次と終了の取り合い（段0）＝aborted は「切れた／こちらが切った」。
+        // transferPhase が committing／committed の間は取次が通話を持っている＝終了の処理は手を出さない
+        let aborted = false;
+        let transferPhase = 'none'; // none | claiming | committing | committed
+        let sessionIdPromise = null;
+
         // VAD
         const VAD_RMS_THRESHOLD = 2000;
         const SPEECH_START_FRAMES = 3;   // 3 consecutive frames (~60ms) required
@@ -2628,6 +2650,8 @@ fastify.register(async (fastify) => {
         const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
         const HUMAN_PAUSE_MS = 600; // hold the filler clip for this long after silence-end so the caller's last word lands cleanly
         const PREROLL_FRAMES = 15;       // ~300ms kept before VAD confirms speech, so soft onsets aren't clipped
+        const MAX_UTTERANCE_FRAMES = 300; // 6s＝設定が在る通話の1発話の上限（§1-d）
+        const SPLIT_OVERLAP_FRAMES = 50;  // 1s＝区切った時に次の発話の頭へ重ねる分
         let speechActive = false;
         let speechFrames = 0;
         let silenceFrames = 0;
@@ -2675,6 +2699,8 @@ fastify.register(async (fastify) => {
             }
             if (vadEnabled) console.log(`[vad] disabled (${reason})`);
             vadEnabled = false;
+            captureWhileProcessing = false;
+            pendingUtterance = null;
             resetVadCapture();
         };
 
@@ -2685,7 +2711,8 @@ fastify.register(async (fastify) => {
             const delay = Math.max(minDelayMs, remainingGrace);
             vadEnableTimer = setTimeout(() => {
                 vadEnableTimer = null;
-                if (state !== 'LISTENING') {
+                // 待機中は処理している間も聞く（持ち越しの発話を処理中でも次の声を捨てない）
+                if (state !== 'LISTENING' && !(state === 'PROCESSING' && waitCtx)) {
                     console.log(`[vad] enable timer fired but state=${state}; staying disabled`);
                     return;
                 }
@@ -2861,6 +2888,7 @@ fastify.register(async (fastify) => {
         // Greeting flow (single clip)
         // -----------------------------------------------------------------
         const playGreeting = async () => {
+            if (aborted || state === 'ENDED') return; // 読込の間に切れた
             state = 'PLAYING';
             disableVad('playing greeting');
             if (cfg?.greetingKey) await playAudio(cfg.greetingKey);
@@ -2892,12 +2920,21 @@ fastify.register(async (fastify) => {
             const projectId = callParams.project_id;
             const operatorId = callParams.operator_id || null;
             let agentId = null;
+            transferPhase = 'claiming';
             try {
                 agentId = await claimAgent(projectId, operatorId, []);
             } catch (err) {
                 console.error('[handoff] claim agent failed:', err);
             }
+            // CM を確保している間に切れた・こちらが切った＝確保を戻して抜ける（段0）
+            if (aborted) {
+                console.log('[handoff] call ended while claiming a CM; releasing');
+                transferPhase = 'none';
+                if (agentId) await setAgentState(agentId, 'idle');
+                return;
+            }
             if (!agentId) {
+                transferPhase = 'none';
                 console.log(`[handoff] no free CM in project ${projectId}; asking to call back later`);
                 if (cfg?.clips.has('callback_request')) {
                     try {
@@ -2920,15 +2957,25 @@ fastify.register(async (fastify) => {
                 baseUrl: publicBaseUrl(publicHost),
                 clipPath: clip ? (cfg.audioBasePath ? `${cfg.audioBasePath}/${clip.filename}` : clip.filename) : null,
             });
+            if (aborted) {
+                transferPhase = 'none';
+                await setAgentState(agentId, 'idle');
+                forgetHandoff(callSid);
+                return;
+            }
+            // ここから Twilio を <Enqueue> へ切り替える＝成否が出るまで終了の処理は手を出さない（段0）
+            transferPhase = 'committing';
             try {
                 await updateLiveCall(callSid, enqueueTwiml(publicBaseUrl(publicHost), callSid));
             } catch (err) {
                 console.error('[handoff] could not put the caller on hold:', err);
+                transferPhase = 'none';
                 await setAgentState(agentId, 'idle');
                 forgetHandoff(callSid);
                 await endCallWithFarewell('error_limit');
                 return;
             }
+            transferPhase = 'committed';
             // The live call now runs the <Enqueue> TwiML; this media stream is over.
             state = 'ENDED';
             const { error: updErr } = await supabase
@@ -2945,6 +2992,7 @@ fastify.register(async (fastify) => {
         };
 
         const handleTransfer = async () => {
+            if (aborted) return; // 「おつなぎします」の最中に切れた（段0）
             disableVad('transferring');
             const tenantId = callParams?.tenant_id;
             const agentPhone = callParams?.agent_phone;
@@ -2990,14 +3038,17 @@ fastify.register(async (fastify) => {
             console.log(
                 `[transfer] handing off callSid=${callSid} to ${agentName || '(no name)'} <${maskPhone(agentPhone)}>`
             );
+            transferPhase = 'committing';
             try {
                 await transferCall(callSid, agentPhone);
             } catch (err) {
                 console.error('[transfer] Twilio transfer failed:', err);
+                transferPhase = 'none';
                 releaseTransferLock(tenantId, agentPhone);
                 await endCallWithFarewell('error_limit');
                 return;
             }
+            transferPhase = 'committed';
 
             state = 'ENDED';
 
@@ -3019,6 +3070,12 @@ fastify.register(async (fastify) => {
         // Safe to call multiple times — re-entrancy is gated on state.
         // -----------------------------------------------------------------
         const endCallWithFarewell = async (reason, { playFarewell = true } = {}) => {
+            // 取次が Twilio を切り替えている最中・切り替えた後は、取次が通話を持っている（段0）
+            if (transferPhase === 'committing' || transferPhase === 'committed') {
+                console.log(`[end] endCallWithFarewell(${reason}) ignored; transfer is ${transferPhase}`);
+                return;
+            }
+            aborted = true;
             if (state === 'ENDED') {
                 console.log(`[end] endCallWithFarewell(${reason}) called but state=ENDED already; ignoring`);
                 return;
@@ -3090,10 +3147,23 @@ fastify.register(async (fastify) => {
             const silenceMs = now - lastSpeechAt;
             const durationMs = now - callStartAt;
 
+            // 待機の期限＝状態に関係なく見る（処理中・再生中でもすり抜けない）。結果は今の「無音切断」と同じ値
+            // （待機の期限切れだったことは判定の記録に残す）。待機中は下の無音の30秒は見ない＝§1-e
+            if (waitCtx) {
+                if (now >= waitCtx.deadline) {
+                    console.log(`[timeout] wait ${Math.round((now - waitCtx.startedAt) / 1000)}s reached the limit; ending call`);
+                    logDecision({ event: 'wait_timeout', in_wait: true, action: 'silence_timeout' });
+                    endCallWithFarewell('silence_timeout').catch((err) =>
+                        console.error('[timeout] wait handler error:', err)
+                    );
+                    return;
+                }
+            }
+
             // Silence timeout only fires while we're actively waiting for
             // the caller. During PLAYING/PROCESSING/REALTIME the assistant
             // is busy and silence is expected.
-            if (state === 'LISTENING' && silenceMs >= SILENCE_TIMEOUT_MS) {
+            if (!waitCtx && state === 'LISTENING' && silenceMs >= SILENCE_TIMEOUT_MS) {
                 console.log(
                     `[timeout] silence ${Math.round(silenceMs / 1000)}s ≥ ` +
                         `${SILENCE_TIMEOUT_MS / 1000}s; ending call`
@@ -3194,12 +3264,175 @@ fastify.register(async (fastify) => {
         };
 
         // -----------------------------------------------------------------
+        // 取次のつまみが在る通話だけ＝判定の記録・待機の出入り・判定の実行
+        // 家＝~/sente/sfav_transfer_tuning_plan.md §1-e〜1-g
+        // -----------------------------------------------------------------
+        // 判定の記録（call_turn_decisions）。失敗しても通話は止めない
+        const logDecision = (fields) => {
+            if ((!ts && !tsFallback) || !callSid) return;
+            if (!sessionIdPromise) {
+                sessionIdPromise = supabase.from('call_sessions').select('id').eq('call_sid', callSid)
+                    .order('created_at', { ascending: false }).limit(1).maybeSingle()
+                    .then(({ data }) => data?.id || null)
+                    .catch(() => null);
+            }
+            const row = {
+                tenant_id: callParams?.tenant_id,
+                event: fields.event,
+                state_before: fields.state_before ?? null,
+                in_wait: fields.in_wait ?? !!waitCtx,
+                transcript: fields.transcript ?? null,
+                forced_split: !!fields.forced_split,
+                step: fields.step ?? null,
+                haiku_intent: fields.haiku_intent ?? null,
+                gate: fields.gate ?? null,
+                matched_phrase: fields.matched_phrase ?? null,
+                action: fields.action ?? null,
+                settings_id: ts?.id ?? null,
+                settings_scope: ts?.scope ?? null,
+                settings_version: ts?.version ?? null,
+                settings_hash: ts?.hash ?? null,
+            };
+            const pending = sessionIdPromise;
+            pending.then((sid) => {
+                if (!sid) {
+                    if (sessionIdPromise === pending) sessionIdPromise = null; // 通話の行がまだ無い＝次で引き直す
+                    return;
+                }
+                return supabase.from('call_turn_decisions').insert({ ...row, session_id: sid })
+                    .then(({ error }) => { if (error) console.error('[decision-log] insert failed:', error.message); });
+            }).catch((err) => console.error('[decision-log] threw:', err));
+        };
+
+        // 聞き取りへ戻る。afterPlayback＝こちらが話し終えた直後（VAD を少し遅らせて開ける）
+        const resumeListening = (afterPlayback) => {
+            if (state === 'ENDED') return;
+            state = 'LISTENING';
+            captureWhileProcessing = false;
+            if (!waitCtx) lastSpeechAt = Date.now(); // 待機中は無音の30秒を見ない＝時計は触らない
+            if (afterPlayback) {
+                enableVadDelayed(POST_PLAYBACK_DELAY_MS, waitCtx ? 'waiting (after response)' : 'after response');
+            } else if (!vadEnabled) {
+                enableVadDelayed(0, 'waiting');
+            }
+            if (waitCtx && pendingUtterance) {
+                const u = pendingUtterance;
+                pendingUtterance = null;
+                // 回す時にもう一度確かめる（その間に別の発話が応答・取次へ進んでいたら回さない）
+                setImmediate(() => {
+                    if (state !== 'LISTENING' || !waitCtx) return;
+                    handleUserUtterance(u.audio, { forced: u.forced }).catch((err) => console.error('handleUserUtterance error:', err));
+                });
+            }
+        };
+        const enterWait = () => {
+            const now = Date.now();
+            waitCtx = { startedAt: now, deadline: now + ts.wait_max_seconds * 1000 };
+            recentUserUtterances = [];
+            recentClaudeDecisions = [];
+            console.log(`[wait] entered (max ${ts.wait_max_seconds}s)`);
+            logDecision({ event: 'wait_enter', in_wait: true });
+            // 6秒で区切った発話から入った時は、処理の間も聞き続けている＝その音（と持ち越し）を捨てない
+            resumeListening(!vadEnabled);
+        };
+        const continueWait = () => resumeListening(false);
+        const leaveWait = (why) => {
+            if (!waitCtx) return;
+            console.log(`[wait] left after ${Math.round((Date.now() - waitCtx.startedAt) / 1000)}s (${why})`);
+            waitCtx = null;
+            pendingUtterance = null;
+            recentUserUtterances = [];
+            recentClaudeDecisions = [];
+            logDecision({ event: 'wait_leave', in_wait: false, action: why });
+        };
+
+        // 判定（transfer-logic.js の decideBeforeClassifier／decideAfterClassifier）を実行する
+        const actOnDecision = async (d, intentDef, decision, meta) => {
+            console.log(`[decide] step=${d.step} action=${d.action}${d.gate ? ` gate=${d.gate}` : ''}${meta.inWait ? ' (waiting)' : ''}`);
+            logDecision({
+                event: 'turn', state_before: meta.stateBefore, transcript: meta.transcript, forced_split: meta.forced,
+                step: d.step, haiku_intent: decision?.intent ?? null, gate: d.gate ?? null,
+                matched_phrase: d.matched ?? null, action: d.action, in_wait: meta.inWait,
+            });
+            if (state === 'ENDED') return;
+
+            if (d.action === 'continue_wait') { continueWait(); return; }
+            if (d.action === 'wait_enter') { enterWait(); return; } // つなぎの「はい」はこの発話の処理で流れた＝足さない
+            if (d.action === 'reprompt') { await repromptOrEnd(); return; }
+            if (d.action === 'realtime') { consecutiveEmpty = 0; await switchToRealtime(); return; }
+
+            if (d.action === 'transfer') {
+                leaveWait('transfer'); // 「おつなぎします」の最中に待機の期限で切らない
+                const tIntent = intentDef?.is_transfer ? intentDef : cfg.intents.find((i) => i.is_transfer);
+                if (!tIntent?.audio_key || !cfg.clips.has(tIntent.audio_key)) {
+                    console.error('[intent] transfer has no playable clip; falling back to realtime');
+                    consecutiveEmpty = 0;
+                    await switchToRealtime();
+                    return;
+                }
+                consecutiveEmpty = 0;
+                state = 'PLAYING';
+                disableVad('playing response');
+                await playAudio(tIntent.audio_key);
+                if (aborted || state === 'ENDED') return; // 段0
+                await handleTransfer();
+                if (timeoutInterval) {
+                    clearInterval(timeoutInterval);
+                    timeoutInterval = null;
+                }
+                return;
+            }
+
+            // intent（否定＝切る）／answer（答えて聞く・待機中は待機を続ける）
+            if (!intentDef?.audio_key || !cfg.clips.has(intentDef.audio_key)) {
+                console.error(`[intent] "${intentDef?.name}" has no playable clip`);
+                if (meta.inWait) { continueWait(); return; }
+                consecutiveEmpty = 0;
+                await switchToRealtime();
+                return;
+            }
+            const looped = waitCtx ? false : recordClaudeDecision(intentDef.audio_key);
+            consecutiveEmpty = 0;
+            state = 'PLAYING';
+            disableVad('playing response');
+            await playAudio(intentDef.audio_key);
+
+            if (intentDef.wants_callback_info && decision?.callback_info && callSid) {
+                try {
+                    const { error: cbErr } = await supabase
+                        .from('call_sessions')
+                        .update({ metadata: { callback_info: decision.callback_info } })
+                        .eq('call_sid', callSid);
+                    if (cbErr) console.error('[callback_info] save failed:', cbErr);
+                } catch (err) {
+                    console.error('[callback_info] threw:', err);
+                }
+            }
+            if (looped) { await endCallWithFarewell('loop_detected'); return; }
+            if (intentDef.end_call) { await endCallWithFarewell(intentDef.end_reason || 'rejected'); return; }
+            if (state === 'PLAYING') resumeListening(true);
+        };
+
+        // -----------------------------------------------------------------
         // After a user utterance: filler + Whisper + Claude + action
         // -----------------------------------------------------------------
-        const handleUserUtterance = async (mulawAudio) => {
-            if (state === 'PROCESSING' || state === 'ENDED' || state === 'REALTIME') return;
+        const handleUserUtterance = async (mulawAudio, { forced = false } = {}) => {
+            // 処理の間に閉じた発話＝最新の1つだけ持ち越す（待機を続ける・待機に入る時に回す＝§1-d）
+            if (state === 'PROCESSING' && (waitCtx || captureWhileProcessing)) {
+                pendingUtterance = { audio: mulawAudio, forced };
+                return;
+            }
+            if (state !== 'LISTENING') return; // PLAYING／PROCESSING／ENDED／REALTIME／INITIAL は受けない
+            const inWait = !!waitCtx;
+            const stateBefore = state;
             state = 'PROCESSING';
-            disableVad('processing utterance');
+            // 待機中と、6秒で区切った発話（設定が在る通話）は VAD を止めない＝処理している間の声も受け続ける。
+            // 応答を流す時は disableVad で捨てる（自分の声の最中の取りこぼしは今と同じ）
+            if (ts && (inWait || forced)) {
+                captureWhileProcessing = true;
+            } else {
+                disableVad('processing utterance');
+            }
             const t0 = Date.now();
             console.log(`▶ State: PROCESSING (${mulawAudio.length} bytes captured)`);
 
@@ -3216,7 +3449,8 @@ fastify.register(async (fastify) => {
             // pause the agent fires "はい" the instant VAD flips, which
             // sounds robotic and impatient.
             // Rotate through the tenant's filler clips so it doesn't sound robotic.
-            const fillerKeys = cfg?.fillerKeys || [];
+            // 待機中はつなぎの「はい」を流さない（保留音の切れ目ごとに「はい」と言わない＝§1-e）
+            const fillerKeys = inWait ? [] : (cfg?.fillerKeys || []);
             const fillerKey = fillerKeys.length ? fillerKeys[haiPatternIndex % fillerKeys.length] : null;
             haiPatternIndex++;
             const fillerPromise = new Promise((resolve) =>
@@ -3233,6 +3467,11 @@ fastify.register(async (fastify) => {
             console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
 
             if (!transcript) {
+                if (inWait) {
+                    logDecision({ event: 'wait_continue', state_before: stateBefore, forced_split: forced, step: '1', action: 'continue_wait' });
+                    continueWait();
+                    return;
+                }
                 // Whisper heard nothing usable — re-prompt (or end if we've
                 // already asked too many times).
                 console.log('Empty transcript — re-prompting');
@@ -3277,16 +3516,30 @@ fastify.register(async (fastify) => {
             // and over). Triggers before we even call Claude, since asking
             // Claude again would just produce the same response.
             // -----------------------------------------------------------------
-            if (recordUserUtterance(transcript)) {
+            // 待機中は数えない（保留音の雑音が同じ文字起こしになる＝§1-e）
+            if (!inWait && recordUserUtterance(transcript)) {
                 await fillerPromise;
                 await endCallWithFarewell('loop_detected');
                 return;
+            }
+
+            const turnMeta = { transcript, inWait, forced, stateBefore };
+            // 手順3＝待機中の相づちだけは Haiku の前に決める（設定が在る通話だけ＝§1-f）
+            if (ts) {
+                const pre = decideBeforeClassifier({ transcript, ts, inWait });
+                if (pre) {
+                    await fillerPromise;
+                    if (state === 'ENDED') return;
+                    await actOnDecision(pre, null, null, turnMeta);
+                    return;
+                }
             }
 
             const claudeT0 = Date.now();
             const decision = await classifyWithClaude(transcript, {
                 company: callParams?.company,
                 contact: callParams?.contact,
+                afterHold: inWait,
             }, cfg.classifierPrompt);
             console.log(
                 `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms): ` +
@@ -3310,18 +3563,26 @@ fastify.register(async (fastify) => {
             await fillerPromise;
             if (state === 'ENDED') return;
 
+            // 設定が在る通話＝新しい判定順（§1-f）。無い通話は下の今の流れ
+            if (ts) {
+                const intentDef = cfg.intentByName.get(decision.intent) || null;
+                const d = decideAfterClassifier({ transcript, intentName: decision.intent, intentDef, ts, inWait });
+                await actOnDecision(d, intentDef, decision, turnMeta);
+                return;
+            }
+
             // The server owns the behaviour — Claude only returns the intent
             // name. Look it up in the tenant's playbook.
             const intent = cfg.intentByName.get(decision.intent);
             if (!intent) {
                 console.log(`Unknown intent "${decision.intent}"; falling back to realtime`);
+                consecutiveEmpty = 0;
                 await switchToRealtime();
                 return;
             }
 
-            // A usable decision means the caller got through — clear the
-            // re-prompt miss counter. `reprompt` is itself a miss, so skip it.
-            if (intent.action !== 'reprompt') consecutiveEmpty = 0;
+            // 聞き返しの回数を0に戻すのは、実際に応答の声を流す・自由会話へ渡す時だけ（段0）。
+            // 以前は関門の前で戻していた＝関門で何度拒否しても毎回「1回目」で、聞き返しが終わらなかった。
 
             if (intent.action === 'reprompt') {
                 // Transcribed, but gibberish/unintelligible — ask to repeat
@@ -3330,6 +3591,7 @@ fastify.register(async (fastify) => {
                 return;
             }
             if (intent.action === 'openai_realtime') {
+                consecutiveEmpty = 0;
                 await switchToRealtime();
                 return;
             }
@@ -3337,6 +3599,7 @@ fastify.register(async (fastify) => {
             // action === 'play_audio'
             if (!intent.audio_key || !cfg.clips.has(intent.audio_key)) {
                 console.error(`[intent] "${intent.name}" has no playable clip; falling back to realtime`);
+                consecutiveEmpty = 0;
                 await switchToRealtime();
                 return;
             }
@@ -3364,11 +3627,14 @@ fastify.register(async (fastify) => {
             // still play the current clip before ending.
             const looped = recordClaudeDecision(intent.audio_key);
 
+            consecutiveEmpty = 0;
             state = 'PLAYING';
             disableVad('playing response');
             await playAudio(intent.audio_key);
 
             if (intent.is_transfer) {
+                // 「おつなぎします」の最中に切れた・こちらが切った＝取次へ進まない（段0）
+                if (aborted || state === 'ENDED') return;
                 // Transfer flow skips farewell — handleTransfer writes
                 // result='transferred' itself.
                 await handleTransfer();
@@ -3595,7 +3861,8 @@ fastify.register(async (fastify) => {
 
             // While we are speaking (or in any non-listening state) we
             // intentionally discard everything: no interruption, no VAD.
-            if (state !== 'LISTENING') return;
+            // 例外＝待機中・6秒で区切った発話の処理の間（何も流していないので、その間の声を捨てない＝§1-d）
+            if (state !== 'LISTENING' && !(state === 'PROCESSING' && (waitCtx || captureWhileProcessing))) return;
 
             // Within the call-start grace window / post-playback delay we
             // also discard inbound audio so spurious noise (e.g. Twilio's
@@ -3644,6 +3911,17 @@ fastify.register(async (fastify) => {
             if (preRoll.length > PREROLL_FRAMES) preRoll.shift();
 
             if (speechActive) speechChunks.push(mulaw);
+
+            // 設定が在る通話だけ＝1発話の上限 6秒。超えたら区切って文字起こしへ回し、末尾1秒を次の頭に重ねる
+            // （「少々お待ちください」の直後に保留音が切れ目なく続くと発話が閉じない＝§1-d）
+            if (ts && speechActive && speechChunks.length >= MAX_UTTERANCE_FRAMES) {
+                const utterance = Buffer.concat(speechChunks);
+                speechChunks = speechChunks.slice(-SPLIT_OVERLAP_FRAMES);
+                console.log(`[vad] forced split (${utterance.length} bytes; carrying ${speechChunks.length}f)`);
+                handleUserUtterance(utterance, { forced: true }).catch((err) =>
+                    console.error('handleUserUtterance error:', err)
+                );
+            }
         };
 
         // -----------------------------------------------------------------
@@ -3731,18 +4009,42 @@ fastify.register(async (fastify) => {
                         // playbook there's nothing to say, so end gracefully.
                         // 声セットは架電した CM の性別で選ぶ（Tom 2026-10-05）＝CM の居ない通話は性別なし
                         // 性別は発信時に載せた operator_gender を使う（DB の往復をあいさつの前に挟まない）。無い時だけ引く
-                        (callParams.operator_gender
-                            ? Promise.resolve(parseVoiceGender(callParams.operator_gender))
-                            : operatorGender(callParams.operator_id || null))
-                            .then((gender) => loadPlaybook(callParams.tenant_id, callParams.project_id || null, gender))
-                            .then((loaded) => {
+                        // 取次のつまみ（transfer_settings）も並行で読む＝行が無い・読めなければ今の挙動（家＝~/sente/sfav_transfer_tuning_plan.md §1-b）
+                        Promise.all([
+                            (callParams.operator_gender
+                                ? Promise.resolve(parseVoiceGender(callParams.operator_gender))
+                                : operatorGender(callParams.operator_id || null))
+                                .then((gender) => loadPlaybook(callParams.tenant_id, callParams.project_id || null, gender)),
+                            // あいさつを待たせない＝1.5秒で読めなければ今の挙動
+                            Promise.race([
+                                loadTransferSettings(callParams.tenant_id, callParams.project_id || null),
+                                new Promise((r) => setTimeout(() => r({ ts: null, error: new Error('timeout') }), TRANSFER_SETTINGS_LOAD_TIMEOUT_MS)),
+                            ]).catch((err) => ({ ts: null, error: err })),
+                        ])
+                            .then(([loaded, settings]) => {
                                 if (!loaded) {
                                     console.error(
                                         `[start] no playbook for tenant ${callParams.tenant_id || '(none)'}; ending`
                                     );
                                     return endCallWithFarewell('error_limit');
                                 }
-                                cfg = loaded;
+                                if (aborted || state === 'ENDED') return;
+                                if (settings?.error) {
+                                    tsFallback = true;
+                                    logDecision({ event: 'fallback', action: String(settings.error.message || settings.error).slice(0, 200) });
+                                }
+                                if (settings?.ts) {
+                                    ts = settings.ts;
+                                    // 声セットのキャッシュは他の通話と共有＝この通話用に複製してプロンプトと語彙ヒントだけ差し替える
+                                    cfg = {
+                                        ...loaded,
+                                        classifierPrompt: buildClassifierPrompt(loaded, ts),
+                                        transcriptionPrompt: buildTranscriptionPrompt(loaded.companyName, loaded.intents, ts),
+                                    };
+                                    console.log(`[transfer-settings] ${ts.scope} v${ts.version} on_wait=${ts.on_wait}`);
+                                } else {
+                                    cfg = loaded;
+                                }
                                 return playGreeting();
                             })
                             .catch((err) => {
@@ -3775,6 +4077,8 @@ fastify.register(async (fastify) => {
 
         connection.on('close', () => {
             console.log(`Twilio WS closed (endReason=${endReason || 'n/a'})`);
+            // 取次が Twilio を <Enqueue> へ切り替えた時の切断は正常（段0）＝それ以外は通話が終わった
+            if (transferPhase !== 'committing' && transferPhase !== 'committed') aborted = true;
             state = 'ENDED';
             currentPlaybackToken = null;
             // If the socket closed before authenticating, free its unauth slot

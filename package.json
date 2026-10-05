@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "node --check index.js"
+    "build": "node --check index.js",
+    "test": "node --test scripts/transfer-bench/*.test.mjs",
+    "sim": "node scripts/transfer-bench/sim/run.mjs"
   },
   "keywords": [],
   "author": "",

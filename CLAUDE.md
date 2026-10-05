@@ -18,7 +18,7 @@
 - worktree の有無は `git worktree list` で見る＝**worktree を切ると、片方で切ったブランチはもう片方でチェックアウトできない。**
 - 秘匿値はリポに無い（`.env.example` のみ）。**本番の値は Railway の環境変数**＝ローカルの `.env` を正だと思わない。`OPENAI_API_KEY` は `outbound call project` の専用鍵（keychain `openai-api-key-aivoice`）＝ログに `Whisper error: 401 … invalid_organization` が出たらこの鍵を疑う（症状＝受付が何を言っても聞き返す）。
 - **本番へ出す＝GitHub の `main` への push**（Railway が `main` を自動デプロイ）＝作業ブランチを早送りで `main` へ。
-- **取次の判定を触る前**＝言い回しは2か所（台本の `call_intents.triggers` と `TRANSFER_EVIDENCE_PATTERNS`）で、足す時は両方／自由会話（`switchToRealtime`）は片道＝取次に戻らない。家＝`~/sente/sfav_operator_voice_sets_spec.md` の罠・AI Voice の家 §3-3「🚀」④。
+- **取次の判定を触る前**＝判定は `transfer-logic.js`（純関数）にある。**会社やプロジェクトに `transfer_settings` の行が在る通話**は、その行の言い回し（取次・取次にしない・待たせる）と「少々お待ち」の扱い（待つ・すぐ取次・聞き返す）で判定し、待機（保留中）に入る。**行が無い通話は今までどおり**＝台本の `call_intents.triggers` と `TRANSFER_EVIDENCE_PATTERNS` の2か所（足す時は両方）。自由会話（`switchToRealtime`）は片道＝取次に戻らない。直したら `npm test`（判定）と `npm run sim`（状態の流れ＝手元で偽物の外部に向けて合成音を流す・電話は鳴らない）を通す。家＝`~/sente/sfav_transfer_tuning_plan.md`・`~/sente/sfav_operator_voice_sets_spec.md` の罠。
 - **取次の後始末は5つの口が同じ handoff を触る**（`/queue-exit`・`finishOverflow`・`onAgentLegFailed`・`/agent-bridge`・`/agent-status`）＝片付ける側は最初の `await` の前に `h.finished` を立て、触る側は `finished` を見て引く（二重に「改めてご連絡」を流す・別の CM を鳴らすのを防ぐ）。保留の上限は `HOLD_MAX_SECONDS`、発信の上限は `CALL_TIME_LIMIT_S`、Twilio に渡す URL は `PUBLIC_BASE_URL`（`https://<host>` の形の時だけ）→ 無ければ Host。直し方の記録＝`~/sente/sente_aivoice_review_20260911.md` ▼2「段2 エンジン」。
 - 作業の先端ブランチと本番への出し方＝家の §3-3「🚀 本番への出し方」（ここに焼かない）。
 - 🔴🔴 **声のファイルは名前と中身の形式が一致しない**＝`call-audio` の名前は全部 `.mp3` だが、`sente` の肉声の中身は m4a（先頭 `ftyp`）。ffmpeg に渡す形式は `detectAudioFormat`（先頭バイト＝mp3／wav／mp4）で決める。**形式を絞る変更は、使用中の全クリップの先頭バイトを数えてから出す**（mp3／wav だけにすると肉声が全部無音になる）。家＝`~/sente/sfav_operator_voice_sets_spec.md` の罠。
