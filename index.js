@@ -384,7 +384,9 @@ async function resolvePlaybookRow(tenantId, projectId, gender = null) {
             const g = parseVoiceGender(r.voice_gender);
             return gender && g === gender ? 0 : !g ? 1 : 2;
         };
-        const ordered = [...rows].sort((a, b) => rank(a) - rank(b));
+        // 同じ順位どうしは 男性 → 女性 で固定（性別が未登録の CM で、鳴るセットが呼ぶたびに変わらないように）
+        const tie = (r) => (r.voice_gender === 'male' ? 0 : r.voice_gender === 'female' ? 1 : 2);
+        const ordered = [...rows].sort((a, b) => rank(a) - rank(b) || tie(a) - tie(b) || String(a.id).localeCompare(String(b.id)));
         if (ordered.length === 1) return ordered[0];
         const { data: clips, error } = await supabase
             .from('audio_clips').select('playbook_id, audio_ready')
@@ -1492,6 +1494,7 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         agent_name: ctx.agent_name || '',
         tenant_id: ctx.tenant_id || '',
         operator_id: ctx.operator_id || '',
+        operator_gender: parseVoiceGender(ctx.operator_gender) || '',
         project_id: ctx.project_id || '',
         contact_id: ctx.contact_id || '',
     });
@@ -2200,7 +2203,8 @@ fastify.post('/dial-tick', async (request, reply) => {
         .limit(1)
         .maybeSingle();
     // 声セットは CM の性別でも選ぶ（Tom 2026-10-05）＝この CM の通話が鳴らすセットで判定する
-    const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null, await operatorGender(userId));
+    const gender = await operatorGender(userId);
+    const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null, gender);
     if (gate) {
         console.log(`[dial-tick] blocked operator=${userId} reason=${gate.reason}`);
         return reply.send({ ok: true, dialed: 0, reason: gate.reason, ...(gate.code ? { code: gate.code } : {}) });
@@ -2247,6 +2251,8 @@ fastify.post('/dial-tick', async (request, reply) => {
             await placeOutboundCall(baseUrl, c, {
                 tenant_id: c.tenant_id,
                 operator_id: userId,
+                // 性別は発信の時に分かっている＝通話に載せて、つながった後のあいさつ前に DB を引かない
+                operator_gender: gender,
                 project_id: c.project_id,
                 contact_id: c.id,
                 from_number: fromByProject.get(c.project_id) || null,
@@ -2508,6 +2514,7 @@ fastify.all('/incoming-call', async (request, reply) => {
     const agent_name = q('agent_name');
     const tenant_id = q('tenant_id');
     const operator_id = q('operator_id');
+    const operator_gender = parseVoiceGender(request.query.operator_gender) || '';
     const project_id = q('project_id');
     const contact_id = q('contact_id');
     const streamUrl = `${publicBaseUrl(request.headers.host).replace(/^http/, 'ws')}/media-stream`;
@@ -2523,6 +2530,7 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="agent_name" value="${agent_name}" />
             <Parameter name="tenant_id" value="${tenant_id}" />
             <Parameter name="operator_id" value="${operator_id}" />
+            <Parameter name="operator_gender" value="${operator_gender}" />
             <Parameter name="project_id" value="${project_id}" />
             <Parameter name="contact_id" value="${contact_id}" />
             <Parameter name="stream_token" value="${issueStreamToken()}" />
@@ -3722,7 +3730,10 @@ fastify.register(async (fastify) => {
                         // Load the tenant's playbook, then greet. Without a
                         // playbook there's nothing to say, so end gracefully.
                         // 声セットは架電した CM の性別で選ぶ（Tom 2026-10-05）＝CM の居ない通話は性別なし
-                        operatorGender(callParams.operator_id || null)
+                        // 性別は発信時に載せた operator_gender を使う（DB の往復をあいさつの前に挟まない）。無い時だけ引く
+                        (callParams.operator_gender
+                            ? Promise.resolve(parseVoiceGender(callParams.operator_gender))
+                            : operatorGender(callParams.operator_id || null))
                             .then((gender) => loadPlaybook(callParams.tenant_id, callParams.project_id || null, gender))
                             .then((loaded) => {
                                 if (!loaded) {
