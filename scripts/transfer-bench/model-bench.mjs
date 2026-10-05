@@ -13,6 +13,8 @@ const AK = process.env.ANTHROPIC_API_KEY;
 const OK = process.env.OPENAI_API_KEY;
 const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID;
 const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+// Vercel の AI Gateway（SENTE のチーム）の鍵＝在れば Jev（typesafe-ai/jev）と、Gateway が出している判定専用モデルを全部測る
+const GW_KEY = process.env.AI_GATEWAY_API_KEY;
 
 // 本番の声セットと同じ例文（「既存の架電先」の雛形）＋SF の会社の既定の設定でプロンプトを組む
 const TRIGGERS = {
@@ -78,11 +80,15 @@ const CRITERIA = Object.fromEntries(NAMES.map((n) => [n,
     n === 'wait' ? `相手がこちらを待たせる・誰かを呼びに行く（例: ${SF_DEFAULT.wait_phrases.join(' / ')}）。断り・不在・質問が含まれていればそちらを優先。「お電話代わりました」など本人が出ている時は選ばない`
         : n === 'transfer' ? `本人が名乗った・取次を明言した・本人が前向きに聞く姿勢を示した（例: ${TRIGGERS.transfer.slice(0, 12).join(' / ')}）。相づちだけ（はい・もしもし・お待たせ）では選ばない`
             : `例: ${TRIGGERS[n].join(' / ')}`]));
-async function systemOne(model, text, afterHold) {
-    const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/run/${model}`, {
+async function systemOne(model, text, afterHold, via = 'cloudflare') {
+    const url = via === 'gateway'
+        ? 'https://ai-gateway.vercel.sh/typesafe/v1/systemone'
+        : `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/run/${model}`;
+    const r = await fetch(url, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${CF_TOKEN}`, 'content-type': 'application/json' },
+        headers: { Authorization: `Bearer ${via === 'gateway' ? GW_KEY : CF_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({
+            ...(via === 'gateway' ? { model } : {}),
             state: `営業電話で、こちら（株式会社セールス・フォージ）が架電先の受付と話している。${afterHold ? '受付に保留にされた後、電話に出た人の発言。' : ''}相手の直近の発言:「${text}」`,
             questions: { intent: { type: 'choice', instructions: '相手の直近の発言に最も当てはまる意図を1つ選ぶ', criteria: CRITERIA } },
         }),
@@ -98,6 +104,14 @@ const ENGINES = {
     luna_none: (t, w) => luna(t, w, 'none'),
     luna_low: (t, w) => luna(t, w, 'low'),
 };
+if (GW_KEY) {
+    // Gateway が出している判定のモデル（Jev 以外も＝例 Laya）を一覧から取る
+    const r = await fetch('https://ai-gateway.vercel.sh/typesafe/v1/models', { headers: { Authorization: `Bearer ${GW_KEY}` } });
+    const j = await r.json().catch(() => ({}));
+    const ids = (j.data || j.models || []).map((m) => m.id || m).filter((x) => typeof x === 'string');
+    console.log(`[gateway] evaluation models: ${ids.join(', ') || '(取れない＝Jev だけ測る)'}`);
+    for (const id of ids.length ? ids : ['typesafe-ai/jev']) ENGINES[`gw:${id}`] = (t, w) => systemOne(id, t, w, 'gateway');
+}
 if (CF_ACCOUNT && CF_TOKEN) {
     ENGINES.jev = (t, w) => systemOne('typesafe/jev', t, w);
     ENGINES.clef = (t, w) => systemOne('@cf/cloudflare/clef', t, w);
