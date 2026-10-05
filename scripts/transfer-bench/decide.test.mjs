@@ -8,7 +8,7 @@ import {
     decideBeforeClassifier, decideAfterClassifier, hasSufficientTransferEvidence,
     buildClassifierPrompt, buildTranscriptionPrompt, settingsHash,
 } from '../../transfer-logic.js';
-import { INTENT_BY_NAME, INTENTS, SF_DEFAULT } from './fixtures.mjs';
+import { INTENT_BY_NAME, INTENTS, SF_DEFAULT, OUTSIDE_WAIT, IN_WAIT } from './fixtures.mjs';
 
 const decide = (transcript, haiku, { ts = SF_DEFAULT, inWait = false } = {}) => {
     const pre = decideBeforeClassifier({ transcript, ts, inWait });
@@ -18,95 +18,11 @@ const decide = (transcript, haiku, { ts = SF_DEFAULT, inWait = false } = {}) => 
     }).action;
 };
 
-// [発話, Haiku の答え, 待機の外での最終の動作（on_wait=wait）]
-// intent＝その意図の声を流して切る（否定）／answer＝答えて聞く
-const OUTSIDE_WAIT = [
-    // 本人・取次の明言 → 取次
-    ['担当者に代わります。', 'transfer', 'transfer'],
-    ['はい、今変わります。', 'transfer', 'transfer'],
-    ['担当の者にお繋ぎいたします。', 'transfer', 'transfer'],
-    ['私が担当ですが。', 'transfer', 'transfer'],
-    ['はい、私が代表の山田です。', 'transfer', 'transfer'],
-    ['責任者の佐藤に代わりますね。', 'transfer', 'transfer'],
-    ['社長ですけど、どういったお話ですか。', 'transfer', 'transfer'],
-    ['あ、私で大丈夫ですよ。お伺いします。', 'transfer', 'transfer'],
-    ['店長の田中ですが。', 'transfer', 'transfer'],
-    ['はい、お電話代わりました、山田です。', 'transfer', 'transfer'],
-    ['あーはいはい、じゃあ代わりますね。', 'transfer', 'transfer'],
-    // これから呼ぶ・待たせる → 待機（Haiku が transfer でも wait でも、迷って realtime でも）
-    ['お繋ぎしますので少々お待ちください。', 'transfer', 'wait_enter'],
-    ['担当に代わりますので少々お待ちください。', 'transfer', 'wait_enter'],
-    ['オーナーいますので、ちょっと呼んできます。', 'transfer', 'wait_enter'],
-    ['ちょっとお待ちくださいね、今呼びます。', 'transfer', 'wait_enter'],
-    ['少々お待ちください。', 'transfer', 'wait_enter'],
-    ['少々お待ちください。', 'wait', 'wait_enter'],
-    ['少々お待ちください。', 'openai_realtime', 'wait_enter'],
-    ['少々お待ちいただけますか。', 'wait', 'wait_enter'],
-    ['お待ちください。', 'transfer', 'wait_enter'],
-    ['確認しますので少々お待ちください。', 'wait', 'wait_enter'],
-    ['ちょっと待ってくださいね。', 'wait', 'wait_enter'],
-    ['少々お待ちくださいませ。', 'reprompt', 'wait_enter'],
-    // 相づち・聞き取れない → 聞き返し
-    ['あ。', 'reprompt', 'reprompt'],
-    ['はい。', 'transfer', 'reprompt'],
-    ['もしもし。', 'reprompt', 'reprompt'],
-    ['お待たせしました。', 'transfer', 'reprompt'],
-    ['すみません、もう一度お願いします。', 'reprompt', 'reprompt'],
-    ['ご視聴ありがとうございました。', 'reprompt', 'reprompt'],
-    ['♪', 'reprompt', 'reprompt'],
-    ['(音楽)', 'reprompt', 'reprompt'],
-    // 質問 → 答える
-    ['どのようなご用件でしょうか。', 'reason', 'answer'],
-    ['どちらの会社様ですか。', 'company', 'answer'],
-    ['アポイントはございますか。', 'appointment', 'answer'],
-    ['折り返しお電話させましょうか。', 'callback_request', 'answer'],
-    ['確認しますので、ご用件を教えてください。', 'reason', 'answer'],
-    // 不在・断り → 切る（待たせる言い回しや引き継ぎの言い回しが混ざっていても否定が勝つ）
-    ['担当者は本日不在にしております。', 'not_available', 'intent'],
-    ['担当は外出中で、夕方には戻ります。', 'callback_scheduled', 'intent'],
-    ['あいにく担当の者が席を外しておりまして。', 'not_available', 'intent'],
-    ['そういうのは結構です。', 'rejected', 'intent'],
-    ['間に合ってますので。', 'rejected', 'intent'],
-    ['営業のお電話はお断りしております。', 'rejected', 'intent'],
-    ['代表は今いないんですよ。', 'not_available', 'intent'],
-    ['社長は出張中です。', 'not_available', 'intent'],
-    ['お断りしますので少々お待ちください。', 'rejected', 'intent'],
-    ['担当者はいません、代わりに伝えます。', 'not_available', 'intent'],
-    ['お電話代わりましたが、お断りします。', 'rejected', 'intent'],
-    // 取次にしない（Haiku が取次と言っても関門で止める）
-    ['代わりに伝えておきます。', 'transfer', 'reprompt'],
-    ['私がですか？', 'transfer', 'reprompt'],
-    ['私が受付です。', 'transfer', 'reprompt'],
-    // 当てはまらない → 自由会話（今どおり）
-    ['担当者がわからないんですけど。', 'openai_realtime', 'realtime'],
-    ['私ではわかりかねます。', 'openai_realtime', 'realtime'],
-    ['資料をメールで送ってもらえますか。', 'openai_realtime', 'realtime'],
-];
-
 for (const [text, haiku, want] of OUTSIDE_WAIT) {
     test(`待機の外: 「${text}」(Haiku=${haiku}) → ${want}`, () => {
         assert.equal(decide(text, haiku), want);
     });
 }
-
-// [発話, Haiku の答え, 待機中の最終の動作（保留明けは締める＝after_wait_strict=true）]
-const IN_WAIT = [
-    ['はい。', 'reprompt', 'continue_wait'],
-    ['もしもし。', 'reprompt', 'continue_wait'],
-    ['お待たせしました。', 'transfer', 'continue_wait'],
-    ['はい、お電話代わりました、山田です。', 'transfer', 'transfer'],
-    ['お待たせしました、担当の山田です。', 'transfer', 'transfer'],
-    ['はい、私が担当ですが。', 'transfer', 'transfer'],
-    ['少々お待ちください。', 'wait', 'continue_wait'],
-    ['すみません、もう少々お待ちください。', 'transfer', 'continue_wait'],
-    ['(音楽)', 'reprompt', 'continue_wait'],
-    ['ご視聴ありがとうございました。', 'openai_realtime', 'continue_wait'],
-    ['申し訳ありません、担当は不在でした。', 'not_available', 'intent'],
-    ['やっぱり結構です。', 'rejected', 'intent'],
-    ['すみません、ご用件をもう一度よろしいですか。', 'reason', 'answer'],
-    ['代わりに伝えておきます。', 'transfer', 'continue_wait'],
-    ['担当が戻りましたらお伝えします。', 'openai_realtime', 'continue_wait'],
-];
 
 for (const [text, haiku, want] of IN_WAIT) {
     test(`待機中: 「${text}」(Haiku=${haiku}) → ${want}`, () => {
