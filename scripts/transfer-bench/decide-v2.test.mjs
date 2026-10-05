@@ -175,3 +175,11 @@ test('DB 142 で移した行（受付の予告は待たせる言い方へ）＝�
     assert.equal(decide('担当の者にお繋ぎいたします。', 'transfer', { ts: migrated }), 'wait_enter');
 });
 
+
+// codex レビュー（版7）＝「担当者です」もどの段でも名乗り
+test('「担当者です」「担当者の山田です」はどの段でも最速の取次', () => {
+    for (const l of ['loose', 'normal', 'strict']) {
+        const ts = normalizeSettings(levelRow(l));
+        for (const t of ['担当者です。', '担当者の山田です。']) assert.equal(decideFastHandover({ transcript: t, ts })?.action, 'transfer_fast', `${l} ${t}`);
+    }
+});

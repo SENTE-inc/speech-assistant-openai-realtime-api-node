@@ -2688,6 +2688,7 @@ fastify.register(async (fastify) => {
         const HOLD_RING_FRAMES = 800;     // 16s ぶんの音を手元に持つ（候補の区間を文字起こしへ回す）
         const SPLIT_OVERLAP_FRAMES = 50;  // 1s＝区切った時に次の発話の頭へ重ねる分
         let speechActive = false;
+        let speechStartedAt = 0; // 今の発話の話し始め（保留音の候補の後に話し始めたかを見る）
         let speechFrames = 0;
         let silenceFrames = 0;
         let speechChunks = [];
@@ -3345,6 +3346,9 @@ fastify.register(async (fastify) => {
             if (transferCommitted || aborted || state === 'ENDED' || state === 'REALTIME') { holdCandidate = null; return; }
             if (Date.now() - c.at > 15000) { holdCandidate = null; return; } // 古い候補は捨てる
             if (state !== 'LISTENING' || pendingUtterance) return; // 処理が終わって聞き取りに戻った時に、もう一度ここへ来る
+            // 候補の区間の後に話し始めた発話がある＝その中身（「担当者はいません」等）を聞いてから決める（codex レビュー 版7 の1）
+            //   保留音そのものも VAD では「話している」になるので、区間より前から続く発話は待たない
+            if (speechActive && speechStartedAt > c.regionEndAt) return;
             holdCandidate = null;
             const announced = !!waitCtx || (announcedAt && Date.now() - announcedAt <= ts.wait_max_seconds * 1000);
             const dec = decideHold({ ts, announced });
@@ -3385,6 +3389,7 @@ fastify.register(async (fastify) => {
 
         const checkHold = async (frames, medianRms) => {
             holdCheckInFlight = true;
+            const regionEndAt = Date.now();
             const seconds = Math.round((frames / 50) * 10) / 10;
             const audio = Buffer.concat(holdRing.slice(-Math.min(frames, HOLD_RING_FRAMES)));
             const res = await transcribeDetailed(audio, cfg?.transcriptionPrompt);
@@ -3395,7 +3400,7 @@ fastify.register(async (fastify) => {
             const base = { event: 'hold_music', hold_seconds: seconds, hold_rms: medianRms, transcript: res.text ?? null, in_wait: !!waitCtx };
             if (!res.ok) { logDecision({ ...base, action: 'stt_error' }); return; }
             if (!isWordless(res.text)) { logDecision({ ...base, action: 'has_words' }); return; }
-            holdCandidate = { seconds, rms: medianRms, text: res.text ?? null, at: Date.now() };
+            holdCandidate = { seconds, rms: medianRms, text: res.text ?? null, at: Date.now(), regionEndAt };
             await tryHoldCommit();
         };
 
@@ -4026,6 +4031,7 @@ fastify.register(async (fastify) => {
                 silenceFrames = 0;
                 if (!speechActive && speechFrames >= SPEECH_START_FRAMES) {
                     speechActive = true;
+                    speechStartedAt = Date.now();
                     // Seed with the pre-roll (frames just before VAD tripped)
                     // so a soft onset like "どう…" isn't clipped. The current
                     // frame is appended below.
