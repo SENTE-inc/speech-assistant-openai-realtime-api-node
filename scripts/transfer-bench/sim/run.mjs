@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import WebSocket from 'ws';
-import { INTENTS, SF_DEFAULT, V2_DEFAULT } from '../fixtures.mjs';
+import { INTENTS, SF_DEFAULT, levelRow } from '../fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../../..');
@@ -311,12 +311,12 @@ const covered = (r, text, min = 0.8) => { const c = r.coverage.find((x) => x.tex
 const haikuFor = (map) => (t) => { for (const [k, v] of map) if (t.includes(k)) return v; return 'reprompt'; };
 const SHORT = { ...SF_DEFAULT, id: '66666666-6666-6666-6666-666666666666', wait_max_seconds: 15 };
 
-const V2 = (over = {}) => ({ ...V2_DEFAULT, ...over });
+const V2 = (level = 'normal') => levelRow(level);
 const holdLines = (r) => r.log.filter((l) => /\[hold\]/.test(l.line));
 const holdEvents = (r) => decisions(r).filter((x) => x.event === 'hold_music');
 
 const SCENARIOS = {
-    // ===== 版6（DB 142）=====
+    // ===== 版6〜7（DB 142・森さんの3段階）=====
     // 受付が何も言わずに保留音 → 4秒＋で取次（声なし）
     v2_hold_without_words: {
         settings: V2(),
@@ -353,34 +353,35 @@ const SCENARIOS = {
             return errs;
         },
     },
-    // 「少々お待ちください」→ 保留音（受付の言葉は「担当者が出るまで待つ」）→ 保留音ではつながず、本人が出たらすぐ
-    v2_words_wait_mode: {
-        settings: V2({ on_words: 'wait' }),
+    // 締める＝言葉なしの保留音ではつながず、本人が名乗ったらすぐ
+    v7_strict_without_words: {
+        settings: V2('strict'),
         timeline: [
-            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'music', ms: 9000 },
+            { kind: 'silence', ms: 6000 }, { kind: 'music', ms: 11000 },
             { kind: 'silence', ms: 1200 }, { kind: 'speech', ms: 1800, text: 'お電話代わりました、山田です。' },
         ],
-        haiku: haikuFor([['少々お待ち', 'wait'], ['代わりました', 'transfer']]),
+        haiku: haikuFor([['代わりました', 'transfer']]),
         maxMs: 35000,
         doneWhen: (log, ev) => ev.some((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')),
         check(r) {
             const errs = [];
-            if (has(r, /\[hold\] .* → transfer/)) errs.push('「担当者が出るまで待つ」なのに保留音で取次した');
+            if (has(r, /\[hold\] .* → transfer/)) errs.push('締めるなのに言葉なしの保留音で取次した');
             if (!has(r, /\[decide\] step=2h action=transfer_fast/)) errs.push('本人の名乗りで最速の取次になっていない');
             if (!resultsSaved(r).includes('transferred')) errs.push(`結果が transferred でない: ${resultsSaved(r)}`);
             return errs;
         },
     },
-    // 記録だけ＝保留音を検知しても取次しない（記録は残る）
-    v2_record_only: {
-        settings: V2({ hold_music_record_only: true }),
-        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'music', ms: 14000 }],
+    // 緩い＝「少々お待ちください」の時点で取次（保留音を待たない）
+    v7_loose_words: {
+        settings: V2('loose'),
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'silence', ms: 1000 }, { kind: 'music', ms: 8000 }],
         haiku: haikuFor([['少々お待ち', 'wait']]),
         maxMs: 26000,
+        doneWhen: (log, ev) => ev.some((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')),
         check(r) {
             const errs = [];
-            if (!holdEvents(r).some((x) => x.action === 'record_only')) errs.push('記録だけの記録が無い');
-            if (resultsSaved(r).includes('transferred') || r.events.some((e) => e.t === 'twilio')) errs.push('記録だけなのに取次した');
+            if (!has(r, /\[decide\] step=7 action=transfer gate=words/)) errs.push('緩いなのに受付の言葉で取次していない');
+            if (!resultsSaved(r).includes('transferred')) errs.push(`結果が transferred でない: ${resultsSaved(r)}`);
             return errs;
         },
     },
@@ -430,17 +431,18 @@ const SCENARIOS = {
             return errs;
         },
     },
-    // 「少々お待ちください」の判定が遅い間に音楽の判定が先に返る＝「担当者が出るまで待つ」なら取次しない（追い越さない＝codex レビュー 4）
-    v2_race_words_wait: {
-        settings: V2({ on_words: 'wait' }),
-        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'silence', ms: 700 }, { kind: 'music', ms: 14000 }],
+    // 「少々お待ちください」の判定が遅い間に音楽の判定が先に返る＝締めるでも「言葉の後」として決める（追い越さない＝codex レビュー 4）
+    v2_race_words_strict: {
+        settings: V2('strict'),
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'silence', ms: 700 }, { kind: 'music', ms: 16000 }],
         haiku: haikuFor([['少々お待ち', 'wait']]),
-        haikuDelayMs: 6000,
-        maxMs: 30000,
+        haikuDelayMs: 11000,
+        maxMs: 35000,
+        doneWhen: (log, ev) => ev.some((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')),
         check(r) {
             const errs = [];
-            if (r.events.some((e) => e.t === 'twilio')) errs.push('「担当者が出るまで待つ」なのに保留音で取次した');
-            if (!holdEvents(r).some((x) => x.action === 'no_transfer' && x.gate === 'words_wait')) errs.push(`保留音を「言葉の後」として決め直していない: ${JSON.stringify(holdEvents(r).map((x) => [x.action, x.gate]))}`);
+            if (holdEvents(r).some((x) => x.gate === 'hold_without_words_off')) errs.push('受付の言葉の判定を追い越して「言葉なし」で決めた');
+            if (!holdEvents(r).some((x) => x.action === 'transfer' && x.gate === 'hold_after_words')) errs.push(`言葉の後の保留音で取次していない: ${JSON.stringify(holdEvents(r).map((x) => [x.action, x.gate]))}`);
             return errs;
         },
     },

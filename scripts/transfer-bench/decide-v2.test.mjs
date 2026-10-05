@@ -1,11 +1,11 @@
-// 版6（DB 142）の判定の試験＝森さんが場面ごとに選ぶ取次（家＝~/sente/sfav_transfer_tuning_plan.md §3-0）。
+// 版6〜7（DB 142）の判定の試験＝取次の判定と、森さんが選ぶ3段階（家＝~/sente/sfav_transfer_tuning_plan.md の「版7」）。
 // 例ごとに最終の動作を決める。Haiku の答えは固定（モデルは呼ばない）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     decideBeforeClassifier, decideFastHandover, decideAfterClassifierV2, decideHold, isWordless, normalizeSettings, settingsHash,
 } from '../../transfer-logic.js';
-import { INTENT_BY_NAME, V2_DEFAULT, SF_DEFAULT } from './fixtures.mjs';
+import { INTENT_BY_NAME, V2_DEFAULT, SF_DEFAULT, levelRow } from './fixtures.mjs';
 
 const decide = (text, haiku, { ts = V2_DEFAULT, inWait = false } = {}) => {
     const fast = decideFastHandover({ transcript: text, ts });
@@ -106,14 +106,31 @@ test('言葉なしの判定＝空と音楽の空耳だけ', () => {
     for (const s of ['', null, 'ご視聴ありがとうございました。', '♪', '(音楽)']) assert.equal(isWordless(s), true, String(s));
     for (const s of ['少々お待ちください。', '担当者をお呼びしております。', 'もしもし']) assert.equal(isWordless(s), false, s);
 });
-test('DB の行 → v2 の正規化（on_words が空なら v1）と hash', () => {
+test('DB の行 → 正規化（level が空なら段1）と hash', () => {
     const v1 = normalizeSettings({ id: 'a', on_wait: 'wait', transfer_phrases: [], block_phrases: [], wait_phrases: [], wait_max_seconds: 90, after_wait_strict: true, version: 1 });
     assert.equal(v1.v2, false);
-    const v2 = normalizeSettings({ id: 'a', on_wait: 'wait', on_words: 'hold', hold_music_seconds: 6, hold_music_record_only: true, handover_phrases: ['私が担当'], transfer_phrases: [], block_phrases: [], wait_phrases: [], wait_max_seconds: 90, after_wait_strict: true, version: 1 });
-    assert.equal(v2.v2, true);
-    assert.equal(v2.hold_music_seconds, 6);
-    assert.notEqual(settingsHash(v2), settingsHash({ ...v2, on_words: 'wait' }));
-    assert.equal(settingsHash(v1), settingsHash({ ...v1, on_words: 'wait' })); // v1 の hash は版6の項目で変わらない
+    const n = normalizeSettings(levelRow('normal'));
+    assert.equal(n.v2, true);
+    assert.equal(n.hold_music_record_only, false);
+    assert.equal(normalizeSettings({ ...levelRow('normal'), level: 'unknown', on_wait: 'wait' }).v2, false); // 知らない段は段1で動く
+    assert.notEqual(settingsHash(n), settingsHash(normalizeSettings(levelRow('strict'))));
+    assert.equal(settingsHash(v1), settingsHash({ ...v1, on_words: 'wait' })); // 段1の hash は版7の項目で変わらない
+});
+
+// 版7＝3段階（Tom 2026-10-06）
+test('3段階＝緩いは言葉ですぐ・ふつうは保留音で・締めるは言葉の後の保留音だけ', () => {
+    const [loose, normal, strict] = ['loose', 'normal', 'strict'].map((l) => normalizeSettings(levelRow(l)));
+    assert.equal(decide('少々お待ちください。', 'wait', { ts: loose }), 'transfer');
+    assert.equal(decide('少々お待ちください。', 'wait', { ts: normal }), 'wait_enter');
+    assert.equal(decide('少々お待ちください。', 'wait', { ts: strict }), 'wait_enter');
+    for (const ts of [loose, normal, strict]) assert.equal(decideHold({ ts, announced: true }).transfer, ts !== loose);
+    assert.equal(decideHold({ ts: loose, announced: false }).transfer, true);
+    assert.equal(decideHold({ ts: normal, announced: false }).transfer, true);
+    assert.equal(decideHold({ ts: strict, announced: false }).transfer, false);
+    assert.ok(loose.hold_music_seconds < normal.hold_music_seconds && normal.hold_music_seconds < strict.hold_music_seconds);
+    // 保留明けの「はい」だけ＝緩いはつなぐ・ほかはつながない
+    assert.equal(decide('はい。', 'reprompt', { ts: loose, inWait: true }), 'transfer');
+    assert.notEqual(decide('はい。', 'reprompt', { ts: strict, inWait: true }), 'transfer');
 });
 
 // ===== codex レビュー（2026-10-05 夜）の反例 =====

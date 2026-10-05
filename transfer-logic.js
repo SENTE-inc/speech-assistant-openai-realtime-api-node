@@ -177,26 +177,52 @@ export function decideAfterClassifier({ transcript, intentName, intentDef, ts, i
 // 設定の行 → 判定に使う形・中身の hash
 // =====================================================================
 
+// 版7（DB 142）＝森さんは「緩い／ふつう／締める」を1つ選ぶだけ（Tom 2026-10-06「どれくらいの取次か森が編集できるように」）。
+//   各段の中身はここ1か所（画面にも DB にも持たない）。家＝~/sente/sfav_transfer_tuning_plan.md の「版7」
+//   on_words＝受付が「少々お待ち」「担当に代わります」と言った時：transfer＝すぐつなぐ／hold＝その後の保留音でつなぐ
+//   on_hold_without_words＝受付が何も言わずに保留音にした時につなぐか／hold_music_seconds＝保留音とみなす長さ
+export const TRANSFER_LEVELS = {
+    loose: { on_words: 'transfer', on_hold_without_words: true, hold_music_seconds: 2, after_wait_strict: false },
+    normal: { on_words: 'hold', on_hold_without_words: true, hold_music_seconds: 4, after_wait_strict: true },
+    strict: { on_words: 'hold', on_hold_without_words: false, hold_music_seconds: 8, after_wait_strict: true },
+};
+export const LEVEL_PHRASES = {
+    handover_phrases: ['私が担当', '担当です', '代わりました', '替わりました', '変わりました', '代表です', '私が代表', '社長です', '店長です', '責任者です', '本人です', '私で大丈夫', '担当の＊です', '代表の＊です', '社長の＊です', '店長の＊です', '責任者の＊です', 'オーナーの＊です'],
+    transfer_phrases: ['詳しく聞かせて', '詳しく聞きたい', '興味があります', '興味あります', '聞かせてください'],
+    wait_phrases: ['少々お待ち', 'お待ちください', 'お待ちいただけ', 'ちょっと待って', '確認します', '呼んできます', '今呼びます', '呼びますので', '担当に代わ', '担当者に代わ', 'お繋ぎ', 'おつなぎ', '代わります', '替わります', '変わります'],
+    block_phrases: ['代わりに伝え', '代わりに承', '代わりにご用件', '代わりにお伺い', '代わりにお聞き'],
+};
+
 export function normalizeSettings(row) {
     if (!row) return null;
-    return {
+    const base = {
         id: row.id,
         scope: row.project_id ? 'project' : 'tenant',
         version: row.version,
+        wait_max_seconds: row.wait_max_seconds || 90,
+    };
+    const preset = TRANSFER_LEVELS[row.level];
+    if (preset) {
+        return {
+            ...base,
+            level: row.level,
+            v2: true,
+            on_wait: 'transfer',
+            on_handover: true,
+            hold_music_record_only: false,
+            ...LEVEL_PHRASES,
+            ...preset,
+        };
+    }
+    // level が空の行＝段1（DB 140）の on_wait で動く（戻し口）
+    return {
+        ...base,
         transfer_phrases: row.transfer_phrases || [],
         block_phrases: row.block_phrases || [],
         wait_phrases: row.wait_phrases || [],
         on_wait: row.on_wait,
-        wait_max_seconds: row.wait_max_seconds,
         after_wait_strict: !!row.after_wait_strict,
-        // 版6（DB 142）＝場面ごとの選び方。on_words が空なら v2=false＝段1の on_wait で動く
-        v2: !!row.on_words,
-        on_words: row.on_words || null,
-        on_hold_without_words: row.on_hold_without_words !== false,
-        on_handover: row.on_handover !== false,
-        hold_music_seconds: row.hold_music_seconds || 4,
-        hold_music_record_only: row.hold_music_record_only !== false,
-        handover_phrases: row.handover_phrases || [],
+        v2: false,
     };
 }
 
@@ -204,9 +230,9 @@ export function settingsHash(ts) {
     const body = JSON.stringify({
         transfer_phrases: ts.transfer_phrases, block_phrases: ts.block_phrases, wait_phrases: ts.wait_phrases,
         on_wait: ts.on_wait, wait_max_seconds: ts.wait_max_seconds, after_wait_strict: ts.after_wait_strict,
-        // 版6の項目は v2 の行だけ hash に入れる（段1の行の hash は変えない）
+        // 版7の項目は v2 の行だけ hash に入れる（段1の行の hash は変えない）
         ...(ts.v2 ? {
-            on_words: ts.on_words, on_hold_without_words: ts.on_hold_without_words, on_handover: ts.on_handover,
+            level: ts.level, on_words: ts.on_words, on_hold_without_words: ts.on_hold_without_words, on_handover: ts.on_handover,
             hold_music_seconds: ts.hold_music_seconds, hold_music_record_only: ts.hold_music_record_only,
             handover_phrases: ts.handover_phrases,
         } : {}),

@@ -3349,9 +3349,8 @@ fastify.register(async (fastify) => {
             const announced = !!waitCtx || (announcedAt && Date.now() - announcedAt <= ts.wait_max_seconds * 1000);
             const dec = decideHold({ ts, announced });
             const base = { event: 'hold_music', hold_seconds: c.seconds, hold_rms: c.rms, transcript: c.text, in_wait: !!waitCtx, gate: dec.reason };
-            console.log(`[hold] music ${c.seconds}s rms=${c.rms} announced=${!!announced} → ${dec.transfer ? (ts.hold_music_record_only ? 'record_only' : 'transfer') : dec.reason}`);
+            console.log(`[hold] music ${c.seconds}s rms=${c.rms} announced=${!!announced} → ${dec.transfer ? 'transfer' : dec.reason}`);
             if (!dec.transfer) { logDecision({ ...base, action: 'no_transfer' }); return; }
-            if (ts.hold_music_record_only) { logDecision({ ...base, action: 'record_only' }); return; }
             logDecision({ ...base, action: 'transfer' });
             await commitTransfer('hold');
         };
@@ -4190,7 +4189,7 @@ fastify.register(async (fastify) => {
                                         classifierPrompt: buildClassifierPrompt(loaded, ts),
                                         transcriptionPrompt: buildTranscriptionPrompt(loaded.companyName, loaded.intents, ts),
                                     };
-                                    console.log(`[transfer-settings] ${ts.scope} v${ts.version} on_wait=${ts.on_wait}`);
+                                    console.log(`[transfer-settings] ${ts.scope} v${ts.version} ${ts.level ? `level=${ts.level}` : `on_wait=${ts.on_wait}`}`);
                                 } else {
                                     cfg = loaded;
                                 }

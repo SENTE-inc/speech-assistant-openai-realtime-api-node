@@ -1,3 +1,4 @@
+import { normalizeSettings } from '../../transfer-logic.js';
 // 取次の判定の試験に使う物＝意図の行（本番の「既存の架電先」の声セットと同じ形・2026-10-05 に DB から写した）と、
 // SF の会社の既定に入れる設定（DB 140 の後に入れる行と同じ中身＝seed-sf-default.sql と揃える）。
 // 家＝~/sente/sfav_transfer_tuning_plan.md §1-h
@@ -121,19 +122,6 @@ export const IN_WAIT = [
     ['担当が戻りましたらお伝えします。', 'openai_realtime', 'continue_wait'],
 ];
 
-// 版6（DB 142）の既定＝受付の言葉は「保留音が鳴ったらつなぐ」・言葉なしの保留音はつなぐ・本人の名乗りはすぐつなぐ・はい/もしもしはつながない
-export const V2_DEFAULT = {
-    ...SF_DEFAULT,
-    id: '77777777-7777-7777-7777-777777777777',
-    v2: true,
-    on_wait: 'transfer',
-    on_words: 'hold',
-    on_hold_without_words: true,
-    on_handover: true,
-    hold_music_seconds: 4,
-    hold_music_record_only: false,
-    handover_phrases: ['私が担当', '担当です', '代わりました', '替わりました', '変わりました', '代表です', '私が代表', '社長です', '店長です', '責任者です', '本人です', '私で大丈夫', '担当の＊です', '代表の＊です', '社長の＊です', '店長の＊です', '責任者の＊です', 'オーナーの＊です'],
-    transfer_phrases: ['詳しく聞かせて', '詳しく聞きたい', '興味があります', '興味あります', '聞かせてください'],
-    wait_phrases: ['少々お待ち', 'お待ちください', 'お待ちいただけ', 'ちょっと待って', '確認します', '呼んできます', '今呼びます', '呼びますので', '担当に代わ', '担当者に代わ', 'お繋ぎ', 'おつなぎ', '代わります', '替わります', '変わります'],
-};
-
+// 版7（DB 142）の既定＝「ふつう」の段（中身は transfer-logic.js の TRANSFER_LEVELS／LEVEL_PHRASES）
+export const levelRow = (level) => ({ id: '77777777-7777-7777-7777-777777777777', version: 1, wait_max_seconds: 90, level });
+export const V2_DEFAULT = normalizeSettings(levelRow('normal'));
