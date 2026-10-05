@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import WebSocket from 'ws';
 import { INTENTS, SF_DEFAULT, levelRow } from '../fixtures.mjs';
+import { TRANSFER_LEVELS } from '../../../transfer-logic.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../../..');
@@ -333,7 +334,7 @@ const SCENARIOS = {
             const rings = r.events.filter((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')).length;
             if (rings !== 1) errs.push(`CM を ${rings} 回呼んだ（1回のはず）`);
             const h = holdEvents(r).find((x) => x.action === 'transfer');
-            if (!h || !(h.hold_seconds >= 4)) errs.push(`記録に保留音の秒数が無い: ${JSON.stringify(h)}`);
+            if (!h || !(h.hold_seconds >= TRANSFER_LEVELS.normal.hold_music_seconds)) errs.push(`記録に保留音の秒数が無い: ${JSON.stringify(h)}`);
             return errs;
         },
     },

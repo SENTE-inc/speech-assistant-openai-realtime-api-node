@@ -183,8 +183,8 @@ export function decideAfterClassifier({ transcript, intentName, intentDef, ts, i
 //   on_hold_without_words＝受付が何も言わずに保留音にした時につなぐか／hold_music_seconds＝保留音とみなす長さ
 export const TRANSFER_LEVELS = {
     loose: { on_words: 'transfer', on_hold_without_words: true, hold_music_seconds: 2, after_wait_strict: false },
-    normal: { on_words: 'hold', on_hold_without_words: true, hold_music_seconds: 4, after_wait_strict: true },
-    strict: { on_words: 'hold', on_hold_without_words: false, hold_music_seconds: 8, after_wait_strict: true },
+    normal: { on_words: 'hold', on_hold_without_words: true, hold_music_seconds: 3, after_wait_strict: true },
+    strict: { on_words: 'hold', on_hold_without_words: false, hold_music_seconds: 6, after_wait_strict: true },
 };
 export const LEVEL_PHRASES = {
     handover_phrases: ['私が担当', '担当です', '担当者です', '担当者の＊です', '代わりました', '替わりました', '変わりました', '代表です', '私が代表', '社長です', '店長です', '責任者です', '本人です', '私で大丈夫', '担当の＊です', '代表の＊です', '社長の＊です', '店長の＊です', '責任者の＊です', 'オーナーの＊です'],
