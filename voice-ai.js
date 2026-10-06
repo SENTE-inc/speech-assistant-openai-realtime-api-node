@@ -149,9 +149,11 @@ export async function proposeScript(anthropic, input) {
 const VOICE_STABILITY = 0.3;
 const VOICE_TEMPO = 1.1;
 
-// 文の終わりの「ます」だけ（「ますか」「ますので」は触らない）
+// 文の終わりの「ます」→「ますぅ」・「か」→「かぁ」だけ（「ますので」など文の途中は触らない）〔Tom「かもかぁにできる？」〕
 export function softenEndings(text) {
-    return String(text).replace(/ます(?=[。．！!]|\s*$)/g, 'ますぅ');
+    return String(text)
+        .replace(/ます(?=[。．！!]|\s*$)/g, 'ますぅ')
+        .replace(/か(?=[。．？?！!]|\s*$)/g, 'かぁ');
 }
 
 function speedUp(mp3) {
