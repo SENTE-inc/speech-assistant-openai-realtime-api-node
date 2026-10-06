@@ -2949,7 +2949,10 @@ fastify.register(async (fastify) => {
             for (const t of answerTimers) clearTimeout(t);
             answerTimers = [];
         };
-        // つながったら聞き始め、相手の第一声が終わってからあいさつ（2.5秒だれも話さない・8秒たっても流す）
+        // つながったら（start の時点から）聞き始め、相手の第一声が終わってからあいさつ（2.5秒だれも話さない・8秒たっても流す）。
+        // 声セットの読込が終わるまではあいさつを持ち越す（greetPending）＝読込の間の名乗りも捨てない（codex レビュー）
+        let greetReady = false;
+        let greetPending = null;
         const awaitAnswer = () => {
             if (aborted || state === 'ENDED') return;
             state = 'AWAIT_ANSWER';
@@ -2964,11 +2967,43 @@ fastify.register(async (fastify) => {
                 if (state === 'AWAIT_ANSWER' && !speechActive) greetAfterAnswer('quiet');
             }, ANSWER_QUIET_MS));
             answerTimers.push(setTimeout(() => {
-                if (state === 'AWAIT_ANSWER') greetAfterAnswer('max');
+                if (state !== 'AWAIT_ANSWER') return;
+                // 話し続けている（留守電の案内など）＝そこまでの音も留守電の判定に回す
+                if (speechActive && speechChunks.length) checkAnswerUtterance(Buffer.concat(speechChunks));
+                greetAfterAnswer('max');
             }, ANSWER_MAX_MS));
+        };
+        // 声セットを読み終えた＝持ち越したあいさつを流す（無言で持ち越した後に相手が話し始めていたら、その声の終わりを待つ）
+        const answerReady = () => {
+            greetReady = true;
+            if (state !== 'AWAIT_ANSWER' || !greetPending) return;
+            if (greetPending === 'quiet' && speechActive) { greetPending = null; return; }
+            greetAfterAnswer(greetPending);
+        };
+        // 第一声を文字起こしして残す＋留守電の案内なら、あいさつを止めて黙って切る（今までどおり留守電に声を残さない）
+        const checkAnswerUtterance = (audio) => {
+            if (audio.length < MIN_UTTERANCE_BYTES) return;
+            transcribeWhisper(audio, cfg?.transcriptionPrompt)
+                .then((t) => {
+                    if (!t) return;
+                    saveTranscript('user', t);
+                    const vm = (cfg?.voicemailPatterns || []).find((p) => t.includes(p));
+                    if (vm && state !== 'ENDED' && !transferCommitted) {
+                        console.log(`[voicemail] first utterance matched "${vm}"; hanging up without farewell`);
+                        currentPlaybackToken = ++markCounter;
+                        clearTwilioBuffer();
+                        endCallWithFarewell('voicemail', { playFarewell: false }).catch(() => {});
+                    }
+                })
+                .catch((err) => console.error('[answer] transcribe failed:', err));
         };
         const greetAfterAnswer = (why) => {
             if (state !== 'AWAIT_ANSWER') return;
+            if (!greetReady) {
+                greetPending = greetPending || why;
+                return;
+            }
+            greetPending = null;
             clearAnswerTimers();
             console.log(`[answer] greeting after ${why}`);
             playGreeting().catch((err) => {
@@ -3167,6 +3202,7 @@ fastify.register(async (fastify) => {
                 return;
             }
             aborted = true;
+            clearAnswerTimers();
             if (state === 'ENDED') {
                 console.log(`[end] endCallWithFarewell(${reason}) called but state=ENDED already; ignoring`);
                 return;
@@ -3391,7 +3427,8 @@ fastify.register(async (fastify) => {
             if (!c) return;
             if (transferCommitted || aborted || state === 'ENDED' || state === 'REALTIME') { holdCandidate = null; return; }
             if (Date.now() - c.at > 15000) { holdCandidate = null; return; } // 古い候補は捨てる
-            if (state !== 'LISTENING' || pendingUtterance) return; // 処理が終わって聞き取りに戻った時に、もう一度ここへ来る
+            // carryAudio＝切れ端の続きを聞いている途中（つないだ発話を判定してから決める＝2026-10-06 codex レビュー）
+            if (state !== 'LISTENING' || pendingUtterance || carryAudio) return; // 処理が終わって聞き取りに戻った時に、もう一度ここへ来る
             // 候補の区間の後に話し始めた発話がある＝その中身（「担当者はいません」等）を聞いてから決める（codex レビュー 版7 の1）
             //   保留音そのものも VAD では「話している」になるので、区間より前から続く発話は待たない
             if (speechActive && speechStartedAt > c.regionEndAt) return;
@@ -3720,9 +3757,16 @@ fastify.register(async (fastify) => {
             // Claude again would just produce the same response.
             // -----------------------------------------------------------------
             // 待機中は数えない（保留音の雑音が同じ文字起こしになる＝§1-e）
+            // 捨てた切れ端は同じ発話の繰り返しの数から外す（つないだ発話で数え直す＝codex レビュー）
+            const recorded = !inWait;
+            const staleTurn = () => {
+                if (!stale()) return false;
+                if (recorded && recentUserUtterances[recentUserUtterances.length - 1] === transcript) recentUserUtterances.pop();
+                return true;
+            };
             if (!inWait && recordUserUtterance(transcript)) {
                 await fillerPromise;
-                if (stale()) return;
+                if (staleTurn()) return;
                 await endCallWithFarewell('loop_detected');
                 return;
             }
@@ -3738,7 +3782,7 @@ fastify.register(async (fastify) => {
                 const pre = decideBeforeClassifier({ transcript, ts, inWait });
                 if (pre) {
                     await fillerPromise;
-                    if (state === 'ENDED' || stale()) return;
+                    if (state === 'ENDED' || staleTurn()) return;
                     await actOnDecision(pre, null, null, turnMeta);
                     return;
                 }
@@ -3754,7 +3798,7 @@ fastify.register(async (fastify) => {
                 `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms): ` +
                     `intent=${decision.intent ?? '(none)'}${decision.callback_info ? ' callback_info=(set)' : ''}`
             );
-            if (stale()) return;
+            if (staleTurn()) return;
 
             // -----------------------------------------------------------------
             // C-1 — Claude API failure. classifyWithClaude already retries
@@ -3765,14 +3809,14 @@ fastify.register(async (fastify) => {
             if (decision.reason === 'classifier_error') {
                 console.log('[claude] classifier_error after retries; ending call');
                 await fillerPromise;
-                if (stale()) return;
+                if (staleTurn()) return;
                 await endCallWithFarewell('error_limit');
                 return;
             }
 
             // Filler must complete before we play the real response.
             await fillerPromise;
-            if (state === 'ENDED' || stale()) return;
+            if (state === 'ENDED' || staleTurn()) return;
 
             // 設定が在る通話＝新しい判定順（§1-f）。無い通話は下の今の流れ
             if (ts) {
@@ -4113,6 +4157,7 @@ fastify.register(async (fastify) => {
                         carryAudio = mergeTurn.audio;
                         mergeTurn = null;
                         liveTurn = 0;
+                        currentPlaybackToken = ++markCounter; // 読み込み中のつなぎの「はい」を止める（送り終えた分はそのまま流れる）
                         captureWhileProcessing = false;
                         state = 'LISTENING';
                         console.log(`[merge] caller continued while processing; re-judging with the previous ${carryAudio.length} bytes`);
@@ -4129,11 +4174,7 @@ fastify.register(async (fastify) => {
                     if (state === 'AWAIT_ANSWER') {
                         // 相手の第一声（「はい、◯◯です」・録音の案内）＝判定はせず、記録だけ残してあいさつへ
                         greetAfterAnswer('answered');
-                        if (utterance.length >= MIN_UTTERANCE_BYTES) {
-                            transcribeWhisper(utterance, cfg?.transcriptionPrompt)
-                                .then((t) => { if (t) saveTranscript('user', t); })
-                                .catch((err) => console.error('[answer] transcribe failed:', err));
-                        }
+                        checkAnswerUtterance(utterance);
                     } else if (utterance.length >= MIN_UTTERANCE_BYTES || carryAudio) {
                         handleUserUtterance(utterance).catch((err) =>
                             console.error('handleUserUtterance error:', err)
@@ -4248,6 +4289,8 @@ fastify.register(async (fastify) => {
                         // 声セットは架電した CM の性別で選ぶ（Tom 2026-10-05）＝CM の居ない通話は性別なし
                         // 性別は発信時に載せた operator_gender を使う（DB の往復をあいさつの前に挟まない）。無い時だけ引く
                         // 取次のつまみ（transfer_settings）も並行で読む＝行が無い・読めなければ今の挙動（家＝~/sente/sfav_transfer_tuning_plan.md §1-b）
+                        // 読んでいる間から相手の第一声を聞く（あいさつは読み終えてから＝answerReady）
+                        awaitAnswer();
                         Promise.all([
                             (callParams.operator_gender
                                 ? Promise.resolve(parseVoiceGender(callParams.operator_gender))
@@ -4283,7 +4326,7 @@ fastify.register(async (fastify) => {
                                 } else {
                                     cfg = loaded;
                                 }
-                                return awaitAnswer();
+                                return answerReady();
                             })
                             .catch((err) => {
                                 console.error('[start] playbook load / greeting failed:', err);
@@ -4319,6 +4362,7 @@ fastify.register(async (fastify) => {
             console.log(`Twilio WS closed (endReason=${endReason || 'n/a'})`);
             // 取次が Twilio を <Enqueue> へ切り替えた時の切断は正常（段0）＝それ以外は通話が終わった
             if (transferPhase !== 'committing' && transferPhase !== 'committed') aborted = true;
+            clearAnswerTimers();
             state = 'ENDED';
             currentPlaybackToken = null;
             // If the socket closed before authenticating, free its unauth slot

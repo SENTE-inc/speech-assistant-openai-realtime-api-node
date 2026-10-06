@@ -675,6 +675,20 @@ const SCENARIOS = {
             return errs;
         },
     },
+    // 第一声が留守電の案内＝あいさつを止めて黙って切る（結果は voicemail）
+    answer_voicemail: {
+        settings: V2(),
+        timeline: [{ kind: 'silence', ms: 300 }, { kind: 'speech', ms: 2000, text: 'ただいま電話に出ることができません。' }, { kind: 'silence', ms: 6000 }],
+        haiku: () => 'reprompt',
+        maxMs: 12000,
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[voicemail\] first utterance matched/)) errs.push('第一声の留守電の案内を見つけていない');
+            if (!resultsSaved(r).includes('voicemail')) errs.push(`結果が voicemail でない: ${resultsSaved(r)}`);
+            if (has(r, /Playing farewell/)) errs.push('留守電に締めのあいさつを残した');
+            return errs;
+        },
+    },
     // だれも話さない＝2.5秒であいさつ
     answer_quiet: {
         settings: V2(),
