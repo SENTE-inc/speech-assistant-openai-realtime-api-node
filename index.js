@@ -2659,6 +2659,7 @@ fastify.register(async (fastify) => {
         let mergeTurn = null;   // { turn, audio }＝つなぎ直してよい判定（待機中・6秒で区切った発話は今の持ち越しの形のまま）
         // 切れ端の上限＝先読み0.3秒＋閉じる0.5秒＋話した0.5秒（8kHz μ-law＝1秒8,000バイト）。KWK の「あ」は 5,120 バイト
         const MERGE_MAX_FRAGMENT_BYTES = 10400;
+        let lastRecorded = null; // { turn, text }＝同じ発話の繰り返しの数に最後に入れた発話（捨てた切れ端を外すため）
         // あいさつは相手の第一声が終わってから流す（2026-10-06 Tom「最初は向こうが名乗るだろうから、それを待ってから自己紹介」＝声セットの家 D7 を覆した）
         // 💥 森さんの試しの電話＝電話の録音の案内とあいさつが重なり、想定外の返事から自由会話へ落ちた
         const ANSWER_QUIET_MS = 2500; // だれも話さなければこの時間であいさつ
@@ -2976,9 +2977,26 @@ fastify.register(async (fastify) => {
         // 声セットを読み終えた＝持ち越したあいさつを流す（無言で持ち越した後に相手が話し始めていたら、その声の終わりを待つ）
         const answerReady = () => {
             greetReady = true;
+            // 読み終える前に文字起こしが終わった第一声＝ここで留守電の判定をやり直す
+            if (answerText != null) {
+                const t = answerText;
+                answerText = null;
+                if (judgeAnswerVoicemail(t)) return;
+            }
             if (state !== 'AWAIT_ANSWER' || !greetPending) return;
-            if (greetPending === 'quiet' && speechActive) { greetPending = null; return; }
+            // 相手がまた話している＝その声の終わりを待つ（8秒の上限だけはそのまま流す）
+            if (greetPending !== 'max' && speechActive) { greetPending = null; return; }
             greetAfterAnswer(greetPending);
+        };
+        let answerText = null; // 声セットを読み終える前に文字起こしが終わった第一声
+        const judgeAnswerVoicemail = (t) => {
+            const vm = (cfg?.voicemailPatterns || []).find((p) => t.includes(p));
+            if (!vm || state === 'ENDED' || transferCommitted) return false;
+            console.log(`[voicemail] first utterance matched "${vm}"; hanging up without farewell`);
+            currentPlaybackToken = ++markCounter;
+            clearTwilioBuffer();
+            endCallWithFarewell('voicemail', { playFarewell: false }).catch(() => {});
+            return true;
         };
         // 第一声を文字起こしして残す＋留守電の案内なら、あいさつを止めて黙って切る（今までどおり留守電に声を残さない）
         const checkAnswerUtterance = (audio) => {
@@ -2987,13 +3005,8 @@ fastify.register(async (fastify) => {
                 .then((t) => {
                     if (!t) return;
                     saveTranscript('user', t);
-                    const vm = (cfg?.voicemailPatterns || []).find((p) => t.includes(p));
-                    if (vm && state !== 'ENDED' && !transferCommitted) {
-                        console.log(`[voicemail] first utterance matched "${vm}"; hanging up without farewell`);
-                        currentPlaybackToken = ++markCounter;
-                        clearTwilioBuffer();
-                        endCallWithFarewell('voicemail', { playFarewell: false }).catch(() => {});
-                    }
+                    if (!greetReady) { answerText = t; return; } // 読み終えてから判定する（answerReady）
+                    judgeAnswerVoicemail(t);
                 })
                 .catch((err) => console.error('[answer] transcribe failed:', err));
         };
@@ -3757,13 +3770,9 @@ fastify.register(async (fastify) => {
             // Claude again would just produce the same response.
             // -----------------------------------------------------------------
             // 待機中は数えない（保留音の雑音が同じ文字起こしになる＝§1-e）
-            // 捨てた切れ端は同じ発話の繰り返しの数から外す（つないだ発話で数え直す＝codex レビュー）
-            const recorded = !inWait;
-            const staleTurn = () => {
-                if (!stale()) return false;
-                if (recorded && recentUserUtterances[recentUserUtterances.length - 1] === transcript) recentUserUtterances.pop();
-                return true;
-            };
+            // 捨てた切れ端は同じ発話の繰り返しの数から外す＝続きが始まった瞬間に外す（つないだ発話の判定より先＝codex レビュー）
+            const staleTurn = stale;
+            if (!inWait) lastRecorded = { turn, text: transcript };
             if (!inWait && recordUserUtterance(transcript)) {
                 await fillerPromise;
                 if (staleTurn()) return;
@@ -4155,6 +4164,11 @@ fastify.register(async (fastify) => {
                     // 処理中に相手の続きが始まった＝その判定は捨てて、閉じた後に前の切れ端とつないで判定し直す
                     if (state === 'PROCESSING' && !waitCtx && mergeTurn && mergeTurn.turn === liveTurn) {
                         carryAudio = mergeTurn.audio;
+                        if (lastRecorded?.turn === mergeTurn.turn) {
+                            const i = recentUserUtterances.lastIndexOf(lastRecorded.text);
+                            if (i >= 0) recentUserUtterances.splice(i, 1);
+                            lastRecorded = null;
+                        }
                         mergeTurn = null;
                         liveTurn = 0;
                         currentPlaybackToken = ++markCounter; // 読み込み中のつなぎの「はい」を止める（送り終えた分はそのまま流れる）
