@@ -9,7 +9,9 @@
 // 保存した音は source='elevenlabs'＝台本更新（/provision-playbook）と「AI音声にする」（/clip-audio）で上書きしない（recorded と同じ守り）。
 
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fetch from 'node-fetch';
+import ffmpegStatic from 'ffmpeg-static';
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_v3';
@@ -141,6 +143,32 @@ export async function proposeScript(anthropic, input) {
     return { parsed: JSON.parse(text), refused: false, resp };
 }
 
+// 読み方＝森さんが選んだ「B」（2026-10-06・家＝声セットの家 📍）＝語尾の「ます」に小さい母音・揺れを大きめ・作った後に1.1倍速。
+// 画面と DB の文は「なっております。」のまま＝ElevenLabs に渡す時だけ「ますぅ」にする（Tom「なっておりますで入れたら勝手にますぅに」）。
+// eleven_v4 は voice_settings.speed を無視する＝速さは作った後に ffmpeg の atempo（声の高さは変えない）。
+const VOICE_STABILITY = 0.3;
+const VOICE_TEMPO = 1.1;
+
+// 文の終わりの「ます」だけ（「ますか」「ますので」は触らない）
+export function softenEndings(text) {
+    return String(text).replace(/ます(?=[。．！!]|\s*$)/g, 'ますぅ');
+}
+
+function speedUp(mp3) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn(ffmpegStatic || 'ffmpeg',
+            ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-filter:a', `atempo=${VOICE_TEMPO}`, '-b:a', '128k', '-f', 'mp3', 'pipe:1'],
+            { stdio: ['pipe', 'pipe', 'pipe'] });
+        const out = [];
+        let err = '';
+        proc.stdout.on('data', (d) => out.push(d));
+        proc.stderr.on('data', (d) => { err += d; });
+        proc.on('error', reject);
+        proc.on('close', (code) => (code === 0 ? resolve(Buffer.concat(out)) : reject(new Error(`ffmpeg atempo ${code}: ${err.slice(0, 200)}`))));
+        proc.stdin.end(mp3);
+    });
+}
+
 // ElevenLabs で1テイク（mp3 のバイト列）。1回＝1本・毎回課金（2本目も課金される＝声セットの家 ⏳）
 export async function elevenTts(text, voiceId) {
     const res = await fetch(
@@ -148,7 +176,7 @@ export async function elevenTts(text, voiceId) {
         {
             method: 'POST',
             headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
-            body: JSON.stringify({ text, model_id: ELEVENLABS_MODEL, language_code: 'ja', voice_settings: { stability: 0.5 } }),
+            body: JSON.stringify({ text: softenEndings(text), model_id: ELEVENLABS_MODEL, language_code: 'ja', voice_settings: { stability: VOICE_STABILITY } }),
             signal: AbortSignal.timeout(60000),
         },
     );
@@ -156,7 +184,7 @@ export async function elevenTts(text, voiceId) {
         const detail = await res.text().catch(() => '');
         throw new Error(`ElevenLabs ${res.status}: ${detail.slice(0, 200)}`);
     }
-    return Buffer.from(await res.arrayBuffer());
+    return speedUp(Buffer.from(await res.arrayBuffer()));
 }
 
 export function registerVoiceAi(fastify, deps) {
