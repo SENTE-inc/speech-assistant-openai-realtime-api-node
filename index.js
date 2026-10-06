@@ -2630,7 +2630,7 @@ fastify.register(async (fastify) => {
         let cfg = null;
 
         // State machine
-        // 'INITIAL' | 'PLAYING' | 'LISTENING' | 'PROCESSING' | 'REALTIME' | 'ENDED'
+        // 'INITIAL' | 'AWAIT_ANSWER' | 'PLAYING' | 'LISTENING' | 'PROCESSING' | 'REALTIME' | 'ENDED'
         let state = 'INITIAL';
 
         // Realtime fallback
@@ -2651,6 +2651,19 @@ fastify.register(async (fastify) => {
         let pendingUtterance = null; // { audio, forced }
         // 処理している間も音を受け続ける（待機中と、6秒で区切った発話の処理中）＝§1-d
         let captureWhileProcessing = false;
+        // 処理中に相手の続きの言葉が来た時のつなぎ（2026-10-06 Tom go）＝「あ、」で閉じた発話の判定を捨てて、続きとつないで判定し直す。
+        // 💥 KWK の試しの電話＝「あ」＋0.5秒の間で発話を閉じ、処理中に来た「用件はなんですか？」を捨てて聞き返しを繰り返した
+        let carryAudio = null;  // 捨てた判定の発話（次に閉じる発話の頭へつなぐ）
+        let turnSeq = 0;        // 発話ごとの番号
+        let liveTurn = 0;       // いま生きている判定の番号（つなぎ直した判定は 0 で止まる）
+        let mergeTurn = null;   // { turn, audio }＝つなぎ直してよい判定（待機中・6秒で区切った発話は今の持ち越しの形のまま）
+        // 切れ端の上限＝先読み0.3秒＋閉じる0.5秒＋話した0.5秒（8kHz μ-law＝1秒8,000バイト）。KWK の「あ」は 5,120 バイト
+        const MERGE_MAX_FRAGMENT_BYTES = 10400;
+        // あいさつは相手の第一声が終わってから流す（2026-10-06 Tom「最初は向こうが名乗るだろうから、それを待ってから自己紹介」＝声セットの家 D7 を覆した）
+        // 💥 森さんの試しの電話＝電話の録音の案内とあいさつが重なり、想定外の返事から自由会話へ落ちた
+        const ANSWER_QUIET_MS = 2500; // だれも話さなければこの時間であいさつ
+        const ANSWER_MAX_MS = 8000;   // 相手が話し続けても（録音の案内など）この時間であいさつ
+        let answerTimers = [];
         // 設定を読めず今の挙動で動いた通話（判定の記録に event=fallback を1行残す）
         let tsFallback = false;
         // 取次と終了の取り合い（段0）＝aborted は「切れた／こちらが切った」。
@@ -2932,8 +2945,41 @@ fastify.register(async (fastify) => {
         // -----------------------------------------------------------------
         // Greeting flow (single clip)
         // -----------------------------------------------------------------
+        const clearAnswerTimers = () => {
+            for (const t of answerTimers) clearTimeout(t);
+            answerTimers = [];
+        };
+        // つながったら聞き始め、相手の第一声が終わってからあいさつ（2.5秒だれも話さない・8秒たっても流す）
+        const awaitAnswer = () => {
+            if (aborted || state === 'ENDED') return;
+            state = 'AWAIT_ANSWER';
+            if (vadEnableTimer) {
+                clearTimeout(vadEnableTimer);
+                vadEnableTimer = null;
+            }
+            resetVadCapture();
+            vadEnabled = true;
+            console.log('▶ State: AWAIT_ANSWER');
+            answerTimers.push(setTimeout(() => {
+                if (state === 'AWAIT_ANSWER' && !speechActive) greetAfterAnswer('quiet');
+            }, ANSWER_QUIET_MS));
+            answerTimers.push(setTimeout(() => {
+                if (state === 'AWAIT_ANSWER') greetAfterAnswer('max');
+            }, ANSWER_MAX_MS));
+        };
+        const greetAfterAnswer = (why) => {
+            if (state !== 'AWAIT_ANSWER') return;
+            clearAnswerTimers();
+            console.log(`[answer] greeting after ${why}`);
+            playGreeting().catch((err) => {
+                console.error('[answer] greeting failed:', err);
+                endCallWithFarewell('error_limit').catch(() => {});
+            });
+        };
+
         const playGreeting = async () => {
             if (aborted || state === 'ENDED') return; // 読込の間に切れた
+            clearAnswerTimers();
             state = 'PLAYING';
             disableVad('playing greeting');
             if (cfg?.greetingKey) await playAudio(cfg.greetingKey);
@@ -3555,13 +3601,28 @@ fastify.register(async (fastify) => {
                 return;
             }
             if (state !== 'LISTENING') return; // PLAYING／PROCESSING／ENDED／REALTIME／INITIAL は受けない
+            if (carryAudio) {
+                mulawAudio = Buffer.concat([carryAudio, mulawAudio]);
+                carryAudio = null;
+                console.log(`[merge] joined with the previous fragment (${mulawAudio.length} bytes)`);
+            }
+            const turn = ++turnSeq;
+            liveTurn = turn;
+            // 処理中に相手の続きが始まると liveTurn が変わる＝この判定は以後なにもしない（つないだ発話の判定に任せる）
+            const stale = () => liveTurn !== turn;
             const inWait = !!waitCtx;
             const stateBefore = state;
             state = 'PROCESSING';
-            // 待機中と、6秒で区切った発話（設定が在る通話）は VAD を止めない＝処理している間の声も受け続ける。
+            // 待機中と、6秒で区切った発話（設定が在る通話）は VAD を止めない＝処理している間の声も受け続ける（持ち越し）。
+            // 短い切れ端（「あ」「えー」＝話した分が0.5秒ほど）も止めない＝続きが来たら判定を捨ててつなぎ直す。
+            // それ以外（文になっている発話）は今までどおり止める＝直後の保留音で判定を捨てない。
             // 応答を流す時は disableVad で捨てる（自分の声の最中の取りこぼしは今と同じ）
+            mergeTurn = null;
             if (ts && (inWait || forced)) {
                 captureWhileProcessing = true;
+            } else if (mulawAudio.length <= MERGE_MAX_FRAGMENT_BYTES) {
+                captureWhileProcessing = true;
+                mergeTurn = { turn, audio: mulawAudio };
             } else {
                 disableVad('processing utterance');
             }
@@ -3588,7 +3649,7 @@ fastify.register(async (fastify) => {
             const startFiller = (delayMs) => new Promise((resolve) =>
                 setTimeout(resolve, delayMs)
             ).then(() => {
-                if (state === 'ENDED' || !fillerKey || transferCommitted) return;
+                if (state === 'ENDED' || !fillerKey || transferCommitted || stale()) return;
                 return playAudio(fillerKey);
             }).catch((err) => console.error('Filler playback error:', err));
             // 版6（v2）＝「はい」は中身を聞いてから決める＝担当者本人の名乗りなら流さない（Tom「『はい』なしで取次」）
@@ -3600,6 +3661,7 @@ fastify.register(async (fastify) => {
 
             const transcript = await whisperPromise;
             console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
+            if (stale()) return;
             let fast = null;
             if (v2) {
                 fast = transcript ? decideFastHandover({ transcript, ts }) : null;
@@ -3616,7 +3678,7 @@ fastify.register(async (fastify) => {
                 // already asked too many times).
                 console.log('Empty transcript — re-prompting');
                 await fillerPromise;
-                if (state === 'ENDED') return;
+                if (state === 'ENDED' || stale()) return;
                 await repromptOrEnd();
                 return;
             }
@@ -3647,6 +3709,7 @@ fastify.register(async (fastify) => {
                 console.log(`[user_hangup] detected keyword "${hangupHit}"; playing farewell`);
                 // Let the filler "はい" land first so it doesn't get clipped.
                 await fillerPromise;
+                if (stale()) return;
                 await endCallWithFarewell('user_hangup');
                 return;
             }
@@ -3659,6 +3722,7 @@ fastify.register(async (fastify) => {
             // 待機中は数えない（保留音の雑音が同じ文字起こしになる＝§1-e）
             if (!inWait && recordUserUtterance(transcript)) {
                 await fillerPromise;
+                if (stale()) return;
                 await endCallWithFarewell('loop_detected');
                 return;
             }
@@ -3674,7 +3738,7 @@ fastify.register(async (fastify) => {
                 const pre = decideBeforeClassifier({ transcript, ts, inWait });
                 if (pre) {
                     await fillerPromise;
-                    if (state === 'ENDED') return;
+                    if (state === 'ENDED' || stale()) return;
                     await actOnDecision(pre, null, null, turnMeta);
                     return;
                 }
@@ -3690,6 +3754,7 @@ fastify.register(async (fastify) => {
                 `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms): ` +
                     `intent=${decision.intent ?? '(none)'}${decision.callback_info ? ' callback_info=(set)' : ''}`
             );
+            if (stale()) return;
 
             // -----------------------------------------------------------------
             // C-1 — Claude API failure. classifyWithClaude already retries
@@ -3700,13 +3765,14 @@ fastify.register(async (fastify) => {
             if (decision.reason === 'classifier_error') {
                 console.log('[claude] classifier_error after retries; ending call');
                 await fillerPromise;
+                if (stale()) return;
                 await endCallWithFarewell('error_limit');
                 return;
             }
 
             // Filler must complete before we play the real response.
             await fillerPromise;
-            if (state === 'ENDED') return;
+            if (state === 'ENDED' || stale()) return;
 
             // 設定が在る通話＝新しい判定順（§1-f）。無い通話は下の今の流れ
             if (ts) {
@@ -4015,7 +4081,8 @@ fastify.register(async (fastify) => {
             // While we are speaking (or in any non-listening state) we
             // intentionally discard everything: no interruption, no VAD.
             // 例外＝待機中・6秒で区切った発話の処理の間（何も流していないので、その間の声を捨てない＝§1-d）
-            if (state !== 'LISTENING' && !(state === 'PROCESSING' && (waitCtx || captureWhileProcessing))) return;
+            // 例外2＝あいさつ前に相手の第一声を待っている間（AWAIT_ANSWER）
+            if (state !== 'LISTENING' && state !== 'AWAIT_ANSWER' && !(state === 'PROCESSING' && (waitCtx || captureWhileProcessing))) return;
 
             // Within the call-start grace window / post-playback delay we
             // also discard inbound audio so spurious noise (e.g. Twilio's
@@ -4041,6 +4108,15 @@ fastify.register(async (fastify) => {
                     // the caller is engaged.
                     lastSpeechAt = Date.now();
                     console.log(`[vad] speech start (rms=${rms.toFixed(0)}, preroll=${speechChunks.length}f)`);
+                    // 処理中に相手の続きが始まった＝その判定は捨てて、閉じた後に前の切れ端とつないで判定し直す
+                    if (state === 'PROCESSING' && !waitCtx && mergeTurn && mergeTurn.turn === liveTurn) {
+                        carryAudio = mergeTurn.audio;
+                        mergeTurn = null;
+                        liveTurn = 0;
+                        captureWhileProcessing = false;
+                        state = 'LISTENING';
+                        console.log(`[merge] caller continued while processing; re-judging with the previous ${carryAudio.length} bytes`);
+                    }
                 }
             } else {
                 speechFrames = 0;
@@ -4050,7 +4126,15 @@ fastify.register(async (fastify) => {
                     const utterance = Buffer.concat(speechChunks);
                     speechChunks = [];
                     console.log(`[vad] speech end (${utterance.length} bytes)`);
-                    if (utterance.length >= MIN_UTTERANCE_BYTES) {
+                    if (state === 'AWAIT_ANSWER') {
+                        // 相手の第一声（「はい、◯◯です」・録音の案内）＝判定はせず、記録だけ残してあいさつへ
+                        greetAfterAnswer('answered');
+                        if (utterance.length >= MIN_UTTERANCE_BYTES) {
+                            transcribeWhisper(utterance, cfg?.transcriptionPrompt)
+                                .then((t) => { if (t) saveTranscript('user', t); })
+                                .catch((err) => console.error('[answer] transcribe failed:', err));
+                        }
+                    } else if (utterance.length >= MIN_UTTERANCE_BYTES || carryAudio) {
                         handleUserUtterance(utterance).catch((err) =>
                             console.error('handleUserUtterance error:', err)
                         );
@@ -4199,7 +4283,7 @@ fastify.register(async (fastify) => {
                                 } else {
                                     cfg = loaded;
                                 }
-                                return playGreeting();
+                                return awaitAnswer();
                             })
                             .catch((err) => {
                                 console.error('[start] playbook load / greeting failed:', err);

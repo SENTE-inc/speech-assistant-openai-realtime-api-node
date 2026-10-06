@@ -657,6 +657,77 @@ const SCENARIOS = {
             return errs;
         },
     },
+    // ===== 2026-10-06 試しの電話の直し（Tom go）=====
+    // 相手が先に名乗る＝名乗りが終わってからあいさつ（名乗りの上に重ねない）
+    answer_first: {
+        settings: V2(),
+        timeline: [{ kind: 'silence', ms: 300 }, { kind: 'speech', ms: 1500, text: 'はい、テスト株式会社です。' }, { kind: 'silence', ms: 6000 }],
+        haiku: () => 'reprompt',
+        maxMs: 12000,
+        doneWhen: (log) => log.some((l) => /✓ Finished greeting/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[answer\] greeting after answered/)) errs.push('名乗りの終わりであいさつしていない');
+            const end = r.log.findIndex((l) => /\[vad\] speech end/.test(l.line));
+            const greet = r.log.findIndex((l) => /Playing greeting/.test(l.line));
+            if (!(end >= 0 && greet > end)) errs.push('名乗りの途中であいさつを流した');
+            if (!r.events.some((e) => e.t === 'POST' && e.table === 'call_transcripts' && e.payload?.role === 'user')) errs.push('名乗りの文字起こしを残していない');
+            return errs;
+        },
+    },
+    // だれも話さない＝2.5秒であいさつ
+    answer_quiet: {
+        settings: V2(),
+        timeline: [{ kind: 'silence', ms: 6000 }],
+        haiku: () => 'reprompt',
+        maxMs: 8000,
+        doneWhen: (log) => log.some((l) => /✓ Finished greeting/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[answer\] greeting after quiet/)) errs.push('無言の時に 2.5秒であいさつしていない');
+            return errs;
+        },
+    },
+    // 「あ、」＋間＋「用件はなんですか？」＝切れ端の判定を捨てて、つないで判定（KWK の試しの電話）
+    merge_fragment: {
+        settings: V2(),
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 300, text: 'あ、' }, { kind: 'silence', ms: 900 },
+            { kind: 'speech', ms: 1500, text: '用件はなんですか？' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: haikuFor([['用件', 'reason']]),
+        haikuDelayMs: 1200,
+        maxMs: 20000,
+        doneWhen: (log) => log.some((l) => /✓ Finished reason/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[merge\] caller continued/)) errs.push('処理中の続きの言葉で判定を捨てていない');
+            if (!r.sttTexts.includes('あ、用件はなんですか？')) errs.push(`つないだ発話を文字起こししていない: ${JSON.stringify(r.sttTexts)}`);
+            if (!has(r, /Playing reason/)) errs.push('用件の答えを流していない');
+            if (has(r, /Playing pardon/)) errs.push('聞き返しを流した');
+            const e = covered(r, '用件はなんですか？'); if (e) errs.push(e);
+            return errs;
+        },
+    },
+    // 同じ形を設定なしの通話で
+    merge_fragment_legacy: {
+        settings: null,
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 300, text: 'あ、' }, { kind: 'silence', ms: 900 },
+            { kind: 'speech', ms: 1500, text: '用件はなんですか？' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: haikuFor([['用件', 'reason']]),
+        haikuDelayMs: 1200,
+        maxMs: 20000,
+        doneWhen: (log) => log.some((l) => /✓ Finished reason/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[merge\] caller continued/)) errs.push('処理中の続きの言葉で判定を捨てていない');
+            if (!has(r, /Playing reason/)) errs.push('用件の答えを流していない');
+            if (has(r, /Playing pardon/)) errs.push('聞き返しを流した');
+            return errs;
+        },
+    },
     // 段0（設定なしでも）＝関門で取次を拒否した回も聞き返しの1回に数える → 3回目で切る
     legacy_gate_reject_counts: {
         settings: null,
