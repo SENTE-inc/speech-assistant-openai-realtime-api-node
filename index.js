@@ -3596,15 +3596,14 @@ fastify.register(async (fastify) => {
             if (d.action === 'continue_wait') { continueWait(); return; }
             if (d.action === 'wait_enter') { enterWait(); return; } // つなぎの「はい」はこの発話の処理で流れた＝足さない
             if (d.action === 'reprompt') { await repromptOrEnd(); return; }
-            if (d.action === 'realtime') { consecutiveEmpty = 0; await switchToRealtime(); return; }
+            if (d.action === 'realtime') { await fallbackToAgent('no scripted answer'); return; }
 
             if (d.action === 'transfer') {
                 leaveWait('transfer'); // 「おつなぎします」の最中に待機の期限で切らない
                 const tIntent = intentDef?.is_transfer ? intentDef : cfg.intents.find((i) => i.is_transfer);
                 if (!tIntent?.audio_key || !cfg.clips.has(tIntent.audio_key)) {
-                    console.error('[intent] transfer has no playable clip; falling back to realtime');
-                    consecutiveEmpty = 0;
-                    await switchToRealtime();
+                    console.error('[intent] transfer has no playable clip');
+                    await fallbackToAgent('no playable clip');
                     return;
                 }
                 await commitTransfer('transfer', { clipKey: tIntent.audio_key });
@@ -3615,8 +3614,7 @@ fastify.register(async (fastify) => {
             if (!intentDef?.audio_key || !cfg.clips.has(intentDef.audio_key)) {
                 console.error(`[intent] "${intentDef?.name}" has no playable clip`);
                 if (meta.inWait) { continueWait(); return; }
-                consecutiveEmpty = 0;
-                await switchToRealtime();
+                await fallbackToAgent('no playable clip');
                 return;
             }
             const looped = waitCtx ? false : recordClaudeDecision(intentDef.audio_key);
@@ -3839,9 +3837,8 @@ fastify.register(async (fastify) => {
             // name. Look it up in the tenant's playbook.
             const intent = cfg.intentByName.get(decision.intent);
             if (!intent) {
-                console.log(`Unknown intent "${decision.intent}"; falling back to realtime`);
-                consecutiveEmpty = 0;
-                await switchToRealtime();
+                console.log(`Unknown intent "${decision.intent}"`);
+                await fallbackToAgent('unknown intent');
                 return;
             }
 
@@ -3855,16 +3852,14 @@ fastify.register(async (fastify) => {
                 return;
             }
             if (intent.action === 'openai_realtime') {
-                consecutiveEmpty = 0;
-                await switchToRealtime();
+                await fallbackToAgent('no scripted answer');
                 return;
             }
 
             // action === 'play_audio'
             if (!intent.audio_key || !cfg.clips.has(intent.audio_key)) {
-                console.error(`[intent] "${intent.name}" has no playable clip; falling back to realtime`);
-                consecutiveEmpty = 0;
-                await switchToRealtime();
+                console.error(`[intent] "${intent.name}" has no playable clip`);
+                await fallbackToAgent('no playable clip');
                 return;
             }
 
@@ -3943,8 +3938,19 @@ fastify.register(async (fastify) => {
         };
 
         // -----------------------------------------------------------------
-        // OpenAI Realtime fallback
+        // 台本で答えられない時＝CM へつなぐ（2026-10-06 Tom「困ったらcmに接続」・森さん「AIが喋り続けるが一番不信感は出そう」→ Tom「fallbackのgptやめるか」）
+        // 💥 森さんへの試しの電話＝自由会話（GPT）が無音・雑音に返し続けて「死ぬほど暴走」した。以前の自由会話は下の switchToRealtime（呼び手なし＝戻す時の控え）
         // -----------------------------------------------------------------
+        const fallbackToAgent = async (why) => {
+            consecutiveEmpty = 0;
+            console.log(`[fallback] ${why} → CM（自由会話は使わない）`);
+            await commitTransfer('fallback');
+        };
+
+        // -----------------------------------------------------------------
+        // OpenAI Realtime fallback（2026-10-06 から呼び手なし）
+        // -----------------------------------------------------------------
+        // eslint-disable-next-line no-unused-vars
         const switchToRealtime = async () => {
             console.log('▶ Switching to OpenAI Realtime mode');
             state = 'REALTIME';

@@ -723,6 +723,35 @@ const SCENARIOS = {
             return errs;
         },
     },
+    // 台本で答えられない返事＝自由会話（GPT）へ行かず CM へ（Tom「困ったらcmに接続」）
+    fallback_to_agent: {
+        settings: V2(),
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: 'えっと、それってどういう仕組みなんですか？' }, { kind: 'silence', ms: 8000 }],
+        haiku: () => 'openai_realtime',
+        maxMs: 20000,
+        doneWhen: (log, ev) => ev.some((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[fallback\] no scripted answer → CM/)) errs.push('答えられない返事で CM へつないでいない');
+            if (has(r, /Switching to OpenAI Realtime/)) errs.push('自由会話へ入った');
+            const rings = r.events.filter((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')).length;
+            if (rings !== 1) errs.push(`CM を ${rings} 回呼んだ（1回のはず）`);
+            return errs;
+        },
+    },
+    fallback_to_agent_legacy: {
+        settings: null,
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: 'えっと、それってどういう仕組みなんですか？' }, { kind: 'silence', ms: 8000 }],
+        haiku: () => 'openai_realtime',
+        maxMs: 20000,
+        doneWhen: (log, ev) => ev.some((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[fallback\] no scripted answer → CM/)) errs.push('答えられない返事で CM へつないでいない');
+            if (has(r, /Switching to OpenAI Realtime/)) errs.push('自由会話へ入った');
+            return errs;
+        },
+    },
     // 同じ形を設定なしの通話で
     merge_fragment_legacy: {
         settings: null,
