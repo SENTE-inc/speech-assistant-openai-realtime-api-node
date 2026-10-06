@@ -2999,9 +2999,10 @@ fastify.register(async (fastify) => {
             return true;
         };
         // 第一声を文字起こしして残す＋留守電の案内なら、あいさつを止めて黙って切る（今までどおり留守電に声を残さない）
+        let answerCheckPromise = null; // 第一声の文字起こし＋留守電の判定（終わるまで CM へのつなぎを待たせる）
         const checkAnswerUtterance = (audio) => {
             if (audio.length < MIN_UTTERANCE_BYTES) return;
-            transcribeWhisper(audio, cfg?.transcriptionPrompt)
+            const p = transcribeWhisper(audio, cfg?.transcriptionPrompt)
                 .then((t) => {
                     if (!t) return;
                     saveTranscript('user', t);
@@ -3009,6 +3010,8 @@ fastify.register(async (fastify) => {
                     judgeAnswerVoicemail(t);
                 })
                 .catch((err) => console.error('[answer] transcribe failed:', err));
+            answerCheckPromise = p;
+            p.finally(() => { if (answerCheckPromise === p) answerCheckPromise = null; });
         };
         const greetAfterAnswer = (why) => {
             if (state !== 'AWAIT_ANSWER') return;
@@ -3614,6 +3617,8 @@ fastify.register(async (fastify) => {
             if (!intentDef?.audio_key || !cfg.clips.has(intentDef.audio_key)) {
                 console.error(`[intent] "${intentDef?.name}" has no playable clip`);
                 if (meta.inWait) { continueWait(); return; }
+                // 切る意図（断り・不在・折り返し）は声が無くても切る＝CM へつながない（codex レビュー）
+                if (intentDef?.end_call) { await endCallWithFarewell(intentDef.end_reason || 'rejected'); return; }
                 await fallbackToAgent('no playable clip');
                 return;
             }
@@ -3857,8 +3862,18 @@ fastify.register(async (fastify) => {
             }
 
             // action === 'play_audio'
+            // 取次の証拠の関門は声の有無より先（声が欠けた取次で関門を迂回しない＝codex レビュー）
+            if (intent.is_transfer && !hasSufficientTransferEvidence(transcript)) {
+                console.log(
+                    `[transfer-guard] blocked transfer on insufficient evidence ` +
+                        `(${transcript.length} chars); reprompting instead`
+                );
+                await repromptOrEnd();
+                return;
+            }
             if (!intent.audio_key || !cfg.clips.has(intent.audio_key)) {
                 console.error(`[intent] "${intent.name}" has no playable clip`);
+                if (intent.end_call) { await endCallWithFarewell(intent.end_reason || 'rejected'); return; }
                 await fallbackToAgent('no playable clip');
                 return;
             }
@@ -3943,6 +3958,11 @@ fastify.register(async (fastify) => {
         // -----------------------------------------------------------------
         const fallbackToAgent = async (why) => {
             consecutiveEmpty = 0;
+            // 第一声の留守電の判定がまだ＝その結果を待つ（留守電へ CM をつながない＝codex レビュー）
+            if (answerCheckPromise) {
+                await answerCheckPromise;
+                if (aborted || state === 'ENDED') return;
+            }
             console.log(`[fallback] ${why} → CM（自由会話は使わない）`);
             await commitTransfer('fallback');
         };
