@@ -26,7 +26,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Blob } from 'node:buffer';
 import crypto from 'node:crypto';
-import { registerVoiceAi } from './voice-ai.js';
+import { registerVoiceAi, makeNameAudio, DECIDED_VOICE_BY_GENDER } from './voice-ai.js';
 
 dotenv.config();
 
@@ -314,7 +314,8 @@ function convertMp3ToMulaw(mp3Buffer, label = '') {
 async function getAudioBuffer(cfg, key) {
     const clip = cfg.clips.get(key);
     if (!clip) throw new Error(`unknown clip key "${key}" for tenant ${cfg.tenantId}`);
-    const path = cfg.audioBasePath ? `${cfg.audioBasePath}/${clip.filename}` : clip.filename;
+    // fullPath＝声セットの外の音（CM の名前＝user_profiles.spoken_name_audio_path）
+    const path = clip.fullPath || (cfg.audioBasePath ? `${cfg.audioBasePath}/${clip.filename}` : clip.filename);
     if (audioCache.has(path)) return audioCache.get(path);
 
     const mp3 = await fetchClip(path);
@@ -373,6 +374,64 @@ async function operatorGender(userId) {
         return null;
     }
     return parseVoiceGender(data?.gender);
+}
+
+// CM の名前の音声（2026-10-07 Tom「アカウントが作られたタイミングで男女えらんで、そのタイミングで名前の音声作ればいいじゃん」）
+//   名前（user_profiles.spoken_name）と性別の声で「◯◯と申します。」を1本作って持たせる＝名前か声が変わった時だけ作り直す
+//   呼び手＝/cm-name（画面が名前を保存した時・招待を受けた時）と /dial-tick の関門（作り損ねの拾い）
+const cmNameInflight = new Map(); // userId -> Promise（同じ CM を同時に2回作らない）
+async function ensureCmNameAudio(userId) {
+    if (!userId) return { ok: false, reason: 'no_user' };
+    if (cmNameInflight.has(userId)) return cmNameInflight.get(userId);
+    const p = (async () => {
+        const { data: u, error } = await supabase
+            .from('user_profiles')
+            .select('id, tenant_id, gender, spoken_name, spoken_name_audio_path, spoken_name_audio_key')
+            .eq('id', userId)
+            .maybeSingle();
+        if (error || !u) return { ok: false, reason: 'lookup_failed' };
+        const gender = parseVoiceGender(u.gender);
+        if (!u.spoken_name || !gender) return { ok: false, reason: 'no_name' };
+        const audioKey = `${DECIDED_VOICE_BY_GENDER[gender]}|${u.spoken_name}`;
+        if (u.spoken_name_audio_path && u.spoken_name_audio_key === audioKey) {
+            return { ok: true, path: u.spoken_name_audio_path, text: `${u.spoken_name}と申します。` };
+        }
+        const { data: t } = await supabase.from('tenants').select('slug').eq('id', u.tenant_id).maybeSingle();
+        if (!t?.slug) return { ok: false, reason: 'no_tenant' };
+        const { mp3 } = await makeNameAudio(u.spoken_name, gender);
+        // 名前を変えるたびに別の path＝通話の音のキャッシュ（path が鍵）に古い名前が残らない
+        const path = `${t.slug}/_names/${u.id}-${Date.now()}.mp3`;
+        const { error: upErr } = await supabase.storage.from(AUDIO_BUCKET).upload(path, mp3, { contentType: 'audio/mpeg', upsert: false });
+        if (upErr) throw new Error(`name audio upload failed: ${upErr.message}`);
+        // 作っている間に名前が変わっていたら書かない（次の呼び出しで新しい名前を作る）
+        const { data: upd, error: updErr } = await supabase
+            .from('user_profiles')
+            .update({ spoken_name_audio_path: path, spoken_name_audio_key: audioKey })
+            .eq('id', u.id).eq('spoken_name', u.spoken_name).eq('gender', gender)
+            .select('id');
+        if (updErr || !upd?.length) {
+            await supabase.storage.from(AUDIO_BUCKET).remove([path]).catch(() => {});
+            return { ok: false, reason: updErr ? 'update_failed' : 'changed_meanwhile' };
+        }
+        if (u.spoken_name_audio_path && u.spoken_name_audio_path !== path) {
+            await supabase.storage.from(AUDIO_BUCKET).remove([u.spoken_name_audio_path]).catch(() => {});
+        }
+        console.log(`[cm-name] made ${path}`);
+        return { ok: true, path, text: `${u.spoken_name}と申します。` };
+    })().catch((err) => {
+        console.error('[cm-name] failed:', err.message || err);
+        return { ok: false, reason: 'make_failed' };
+    }).finally(() => cmNameInflight.delete(userId));
+    cmNameInflight.set(userId, p);
+    return p;
+}
+
+// 通話の声セットに CM の名前の音をのせる（name_lead が在る声セットだけ・キャッシュの cfg は他の通話と共有＝複製する）
+function withCmName(cfg, name) {
+    if (!cfg?.clips?.has('name_lead') || !name?.path) return cfg;
+    const clips = new Map(cfg.clips);
+    clips.set('cm_name', { key: 'cm_name', clip_type: 'response', filename: '', fullPath: name.path, text: name.text });
+    return { ...cfg, clips };
 }
 
 async function resolvePlaybookRow(tenantId, projectId, gender = null) {
@@ -1056,10 +1115,16 @@ function verifyProvisionSecret(req) {
 // Structural template. `key` is the contract with the dashboard setup form,
 // which supplies the text for each key. Mirrors the proven demo/sente layout.
 const CLIP_TEMPLATE = [
+    // 名乗りは CM 本人の名前（2026-10-07 Tom）＝あいさつ＝name_lead（「お世話になっております。◯◯の」）→ CM の名前の音声 → greeting（用件〜取次の頼み）
+    //   name_lead が在る声セットだけ名前をつなぐ（無い声セット＝それまでの形＝greeting 1本で名乗りまで言う）
+    { key: 'name_lead',        clip_type: 'response', filename: '00_name_lead.mp3',        sort_order: 0 },
     { key: 'greeting',         clip_type: 'greeting', filename: '01_greeting.mp3',         sort_order: 1 },
     { key: 'reason',           clip_type: 'response', filename: '04_reason.mp3',           sort_order: 2 },
-    // 社名と担当は1本（D8）＝「社名は？」「どなたですか？」の両方にこれで答える
+    // 社名と担当は1本（D8）＝「社名は？」「どなたですか？」の両方にこれで答える（name_lead の声セットでは後ろに CM の名前をつなぐ）
     { key: 'company',          clip_type: 'response', filename: '05_company.mp3',          sort_order: 3 },
+    // 受付の答え2本（2026-10-07 Tom「1足す」）＝宛先を聞かれた／資料を送ってと言われた（送付先は CM が伺う＝then_agent）
+    { key: 'addressee',        clip_type: 'response', filename: '06_addressee.mp3',        sort_order: 4 },
+    { key: 'send_material',    clip_type: 'response', filename: '08_send_material.mp3',    sort_order: 10 },
     { key: 'appointment',      clip_type: 'response', filename: '07_appointment.mp3',      sort_order: 5 },
     { key: 'transfer_success', clip_type: 'response', filename: '09_transfer_success.mp3', sort_order: 6 },
     { key: 'callback_request', clip_type: 'response', filename: '11_callback_request.mp3', sort_order: 7 },
@@ -1076,15 +1141,19 @@ const INTENT_TEMPLATE = [
     { name: 'transfer', audio_key: 'transfer_success', is_transfer: true, sort_order: 1,
         triggers: ['お繋ぎします', '少々お待ち', '担当者に代わります', '私が担当です', '代表です', '私が代表です', '社長です', '興味があります', '詳しく聞かせてください', '担当に代わります', '担当に変わります', '今変わります'] },
     { name: 'reason', audio_key: 'reason', sort_order: 2,
-        triggers: ['どのようなご用件', '何のご用件', 'どういったご提案'] },
+        triggers: ['どのようなご用件', '何のご用件', 'どういったご提案', '営業のお電話ですか', '営業ですか', 'セールスですか'] },
     { name: 'company', audio_key: 'company', sort_order: 3,
         triggers: ['どちらの会社', 'どこの会社', '会社名は'] },
     { name: 'who', audio_key: 'company', sort_order: 4,
-        triggers: ['どなた様', 'お名前は', '担当者のお名前'] },
+        triggers: ['どなた様', 'お名前は', 'お名前をもう一度'] },
+    { name: 'addressee', audio_key: 'addressee', sort_order: 12,
+        triggers: ['どなた宛て', 'どちら宛て', '誰宛て', '担当者のお名前は分かりますか', 'お名前はご存知ですか', 'どの部署の'] },
+    { name: 'material_request', audio_key: 'send_material', then_agent: true, sort_order: 13,
+        triggers: ['資料を送ってください', 'メールで送ってください', '資料をお送りいただけますか', 'メールでお願いします', 'ホームページから問い合わせて'] },
     { name: 'appointment', audio_key: 'appointment', sort_order: 5,
         triggers: ['アポイントは', 'お約束は', 'ご予約は'] },
     { name: 'callback_request', audio_key: 'callback_request', sort_order: 6,
-        triggers: ['折り返しましょうか', '後ほど', 'またかけ直して'] },
+        triggers: ['折り返しましょうか', '後ほど', 'またかけ直して', '折り返しますので', 'お電話番号を', '番号を教えて', 'ご連絡先を'] },
     { name: 'callback_scheduled', audio_key: 'callback_request', end_call: true, end_reason: 'callback_scheduled', wants_callback_info: true, sort_order: 7,
         triggers: ['夕方には戻ります', '16時頃戻ります', '明日には戻ります', '担当者は不在だが戻り時間が明示されている'] },
     { name: 'not_available', audio_key: 'sorry_disturb', end_call: true, end_reason: 'not_available', sort_order: 8,
@@ -1233,7 +1302,7 @@ fastify.post('/provision-playbook', async (request, reply) => {
         playbook_id: playbookId, tenant_id, name: i.name, action: i.action || 'play_audio',
         audio_key: i.audio_key, triggers: i.triggers, is_transfer: !!i.is_transfer,
         end_call: !!i.end_call, end_reason: i.end_reason ?? null,
-        wants_callback_info: !!i.wants_callback_info, sort_order: i.sort_order, active: true,
+        wants_callback_info: !!i.wants_callback_info, then_agent: !!i.then_agent, sort_order: i.sort_order, active: true,
     }));
     const { error: intErr } = await supabase.from('call_intents').insert(intentRows);
     if (intErr) {
@@ -2163,7 +2232,7 @@ registerVoiceAi(fastify, {
 // CM がタブを閉じれば叩かれなくなる＝架電も止まる（サーバ側に常駐の仕組みを持たない）。
 // ---------------------------------------------------------------------
 // 止めた理由（reason＝画面にそのまま出す文）と、声セットが揃っていないせいで止めた時だけ code（VOICE_NOT_READY）。
-async function voiceSetGate(tenantId, projectId, gender = null) {
+async function voiceSetGate(tenantId, projectId, gender = null, userId = null) {
     const { data: pb, error } = await resolvePlaybookRow(tenantId, projectId, gender);
     if (error) {
         console.error('[dial-tick] playbook lookup failed:', error.message);
@@ -2171,7 +2240,7 @@ async function voiceSetGate(tenantId, projectId, gender = null) {
     }
     if (!pb) return { reason: '台本がありません（Voice Setup で台本と音声を設定してください）', code: VOICE_NOT_READY };
     const { data: clips, error: clipErr } = await supabase
-        .from('audio_clips').select('audio_ready').eq('playbook_id', pb.id).eq('active', true);
+        .from('audio_clips').select('key, audio_ready').eq('playbook_id', pb.id).eq('active', true);
     if (clipErr) {
         console.error('[dial-tick] clip audio check failed:', clipErr.message);
         return { reason: '音声を確かめられませんでした' };
@@ -2179,8 +2248,28 @@ async function voiceSetGate(tenantId, projectId, gender = null) {
     if (!clips || clips.length === 0) return { reason: 'セリフが1件もありません（Voice Setup で台本を作ってください）', code: VOICE_NOT_READY };
     const missing = clips.filter((c) => !c.audio_ready).length;
     if (missing > 0) return { reason: `音声が未設定のセリフが ${missing} 件あるため架電できません`, code: VOICE_NOT_READY };
+    // 名前で名乗る声セット＝架電する CM の名前の音声が要る（無いと「◯◯の」の後に名前が入らない）
+    if (clips.some((c) => c.key === 'name_lead')) {
+        const name = await ensureCmNameAudio(userId);
+        if (!name.ok) {
+            return name.reason === 'no_name'
+                ? { reason: '名乗る名前が未登録です（Company › メンバーで名前を入れてください）', code: VOICE_NOT_READY }
+                : { reason: '名乗る名前の音声を用意できませんでした' };
+        }
+    }
     return null;
 }
+
+// CM の名前の音声を作る（画面が名前・性別を保存した時と、招待を受けてアカウントができた時に叩く）。作り済みなら何もしない
+fastify.post('/cm-name', async (request, reply) => {
+    if (!verifyProvisionSecret(request)) {
+        return reply.code(401).send({ error: 'unauthorized' });
+    }
+    const userId = String(request.body?.user_id || '').trim();
+    if (!userId) return reply.code(400).send({ error: 'user_id is required' });
+    const r = await ensureCmNameAudio(userId);
+    return reply.send({ ok: r.ok, ...(r.ok ? {} : { reason: r.reason }) });
+});
 
 fastify.post('/dial-tick', async (request, reply) => {
     if (!verifyProvisionSecret(request)) {
@@ -2228,7 +2317,7 @@ fastify.post('/dial-tick', async (request, reply) => {
         .maybeSingle();
     // 声セットは CM の性別でも選ぶ（Tom 2026-10-05）＝この CM の通話が鳴らすセットで判定する
     const gender = await operatorGender(userId);
-    const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null, gender);
+    const gate = await voiceSetGate(u.tenant_id, cur?.project_id || null, gender, userId);
     if (gate) {
         console.log(`[dial-tick] blocked operator=${userId} reason=${gate.reason}`);
         return reply.send({ ok: true, dialed: 0, reason: gate.reason, ...(gate.code ? { code: gate.code } : {}) });
@@ -2880,6 +2969,13 @@ fastify.register(async (fastify) => {
                 holdQuietUntil = Date.now() + POST_PLAYBACK_DELAY_MS;
             }
         };
+        // 台本の1本を流す＝社名の答え（company）は、名前で名乗る声セットなら後ろに CM の名前をつなぐ
+        const playClip = async (key) => {
+            await playAudio(key);
+            if (key === 'company' && cfg?.clips?.has('name_lead') && cfg.clips.has('cm_name') && state === 'PLAYING') {
+                await playAudio('cm_name');
+            }
+        };
         const playAudioInner = async (key) => {
             const token = ++markCounter;
             currentPlaybackToken = token;
@@ -3033,6 +3129,18 @@ fastify.register(async (fastify) => {
             clearAnswerTimers();
             state = 'PLAYING';
             disableVad('playing greeting');
+            // 名前で名乗る声セット＝「お世話になっております。◯◯の」→ CM の名前（後ろに間つき）→ 用件〜取次の頼み
+            if (cfg?.clips?.has('name_lead') && cfg.clips.has('cm_name')) {
+                await playAudio('name_lead');
+                if (state !== 'PLAYING') return;
+                await playAudio('cm_name');
+                if (state !== 'PLAYING') return;
+            } else if (cfg?.clips?.has('name_lead')) {
+                // 関門で止まるはずの形（受電・手動・名前の音の読み損ね）＝名前を抜いて「◯◯の」から用件へつなぐ
+                console.error('[greeting] name_lead set without the operator name audio; skipping the name');
+                await playAudio('name_lead');
+                if (state !== 'PLAYING') return;
+            }
             if (cfg?.greetingKey) await playAudio(cfg.greetingKey);
             if (state !== 'PLAYING') return;
 
@@ -3626,7 +3734,7 @@ fastify.register(async (fastify) => {
             consecutiveEmpty = 0;
             state = 'PLAYING';
             disableVad('playing response');
-            await playAudio(intentDef.audio_key);
+            await playClip(intentDef.audio_key);
 
             if (intentDef.wants_callback_info && decision?.callback_info && callSid) {
                 try {
@@ -3641,6 +3749,8 @@ fastify.register(async (fastify) => {
             }
             if (looped) { await endCallWithFarewell('loop_detected'); return; }
             if (intentDef.end_call) { await endCallWithFarewell(intentDef.end_reason || 'rejected'); return; }
+            // 流した後に CM へ（資料送付＝送付先は CM が伺う・2026-10-07）
+            if (intentDef.then_agent && state === 'PLAYING') { await fallbackToAgent(`then_agent (${intentDef.name})`); return; }
             if (state === 'PLAYING') resumeListening(true);
         };
 
@@ -3904,7 +4014,7 @@ fastify.register(async (fastify) => {
             consecutiveEmpty = 0;
             state = 'PLAYING';
             disableVad('playing response');
-            await playAudio(intent.audio_key);
+            await playClip(intent.audio_key);
 
             if (intent.is_transfer) {
                 // 「おつなぎします」の最中に切れた・こちらが切った＝取次へ進まない（段0）
@@ -3941,6 +4051,11 @@ fastify.register(async (fastify) => {
 
             if (intent.end_call) {
                 await endCallWithFarewell(intent.end_reason || 'rejected');
+                return;
+            }
+            // 流した後に CM へ（資料送付＝送付先は CM が伺う・2026-10-07）
+            if (intent.then_agent && state === 'PLAYING') {
+                await fallbackToAgent(`then_agent (${intent.name})`);
                 return;
             }
 
@@ -4335,7 +4450,11 @@ fastify.register(async (fastify) => {
                             (callParams.operator_gender
                                 ? Promise.resolve(parseVoiceGender(callParams.operator_gender))
                                 : operatorGender(callParams.operator_id || null))
-                                .then((gender) => loadPlaybook(callParams.tenant_id, callParams.project_id || null, gender)),
+                                .then((gender) => loadPlaybook(callParams.tenant_id, callParams.project_id || null, gender))
+                                // 名前で名乗る声セットだけ CM の名前の音をのせる（作り済みを引くだけ＝関門で作ってある）
+                                .then(async (pb) => (pb?.clips?.has('name_lead') && callParams.operator_id
+                                    ? withCmName(pb, await ensureCmNameAudio(callParams.operator_id))
+                                    : pb)),
                             // あいさつを待たせない＝1.5秒で読めなければ今の挙動
                             Promise.race([
                                 loadTransferSettings(callParams.tenant_id, callParams.project_id || null),

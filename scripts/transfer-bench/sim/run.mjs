@@ -102,16 +102,25 @@ const CLIPS = [
     ['transfer_success', 'response'], ['reason', 'response'], ['company', 'response'],
     ['appointment', 'response'], ['callback_request', 'response'], ['sorry_disturb', 'response'],
 ].map(([key, clip_type], i) => ({ id: `clip-${i}`, key, clip_type, filename: `${key}.mp3`, text: key, active: true, audio_ready: true, sort_order: i }));
+// 名前で名乗る声セット（2026-10-07）＝name_lead と受付の答え2本・資料送付は流した後に CM へ
+const NAME_CLIPS = ['name_lead', 'addressee', 'send_material']
+    .map((key, i) => ({ id: `clip-n${i}`, key, clip_type: 'response', filename: `${key}.mp3`, text: key, active: true, audio_ready: true, sort_order: 20 + i }));
+const NAME_INTENTS = [
+    { name: 'addressee', action: 'play_audio', audio_key: 'addressee', is_transfer: false, end_call: false },
+    { name: 'material_request', action: 'play_audio', audio_key: 'send_material', is_transfer: false, end_call: false, then_agent: true },
+];
 
 const readBody = (req) => new Promise((r) => { const c = []; req.on('data', (d) => c.push(d)); req.on('end', () => r(Buffer.concat(c))); });
 const json = (res, code, obj, headers = {}) => { res.writeHead(code, { 'Content-Type': 'application/json', ...headers }); res.end(JSON.stringify(obj)); };
 
 function restRows(table) {
     if (table === 'call_playbooks') return [{ id: 'pb-1', tenant_id: TENANT, project_id: PROJECT, is_active: true, company_name: 'テスト株式会社', voice: 'shimmer', audio_base_path: 'sim', voice_gender: 'male' }];
-    if (table === 'audio_clips') return CLIPS;
-    if (table === 'call_intents') return INTENTS.map((i, n) => ({ ...i, triggers: [i.name], sort_order: n + 1, active: true }));
+    if (table === 'audio_clips') return sc.nameSet ? [...CLIPS, ...NAME_CLIPS] : CLIPS;
+    if (table === 'call_intents') return [...INTENTS, ...(sc.nameSet ? NAME_INTENTS : [])].map((i, n) => ({ ...i, triggers: [i.name], sort_order: n + 1, active: true }));
     if (table === 'transfer_settings') return sc.settings ? [{ ...sc.settings, tenant_id: TENANT, project_id: null }] : [];
-    if (table === 'user_profiles') return [{ gender: 'male' }];
+    if (table === 'user_profiles') {
+        return [{ id: OPERATOR, tenant_id: TENANT, gender: 'male', spoken_name: 'じんぼ', spoken_name_audio_path: 'sim/_names/op.mp3', spoken_name_audio_key: 'NO5A3b3sSzDyJQF7MiNS|じんぼ' }];
+    }
     if (table === 'call_sessions') return [{ id: '55555555-5555-5555-5555-555555555555' }];
     return [];
 }
@@ -724,6 +733,56 @@ const SCENARIOS = {
         },
     },
     // 台本で答えられない返事＝自由会話（GPT）へ行かず CM へ（Tom「困ったらcmに接続」）
+    // ===== 2026-10-07 名前で名乗る（Tom「これでgo」）=====
+    // あいさつ＝「◯◯の」→ CM の名前 → 用件〜取次の頼み
+    name_greeting: {
+        settings: V2(),
+        nameSet: true,
+        timeline: [{ kind: 'silence', ms: 6000 }],
+        haiku: () => 'reprompt',
+        maxMs: 10000,
+        doneWhen: (log) => log.some((l) => /✓ Finished greeting/.test(l.line)),
+        check(r) {
+            const errs = [];
+            const at = (re) => r.log.findIndex((l) => re.test(l.line));
+            const a = at(/Playing name_lead/), b = at(/Playing cm_name/), c = at(/Playing greeting/);
+            if (!(a >= 0 && b > a && c > b)) errs.push(`あいさつの順が違う: name_lead=${a} cm_name=${b} greeting=${c}`);
+            return errs;
+        },
+    },
+    // 「どちらの会社ですか」＝社名（〜の）の後に CM の名前
+    name_company: {
+        settings: V2(),
+        nameSet: true,
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: 'どちらの会社ですか？' }, { kind: 'silence', ms: 6000 }],
+        haiku: haikuFor([['会社', 'company']]),
+        maxMs: 20000,
+        doneWhen: (log) => log.filter((l) => /✓ Finished cm_name/.test(l.line)).length >= 2,
+        check(r) {
+            const errs = [];
+            const i = r.log.findIndex((l) => /Playing company/.test(l.line));
+            const j = r.log.findIndex((l, n) => n > i && /Playing cm_name/.test(l.line));
+            if (!(i >= 0 && j > i)) errs.push('社名の答えの後に名前をつないでいない');
+            return errs;
+        },
+    },
+    // 「資料を送ってください」＝返事を流してから CM へ（送付先は CM が伺う）
+    material_then_agent: {
+        settings: V2(),
+        nameSet: true,
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '資料を送ってください。' }, { kind: 'silence', ms: 8000 }],
+        haiku: haikuFor([['資料', 'material_request']]),
+        maxMs: 20000,
+        doneWhen: (log, ev) => ev.some((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')),
+        check(r) {
+            const errs = [];
+            if (!has(r, /Playing send_material/)) errs.push('資料送付の返事を流していない');
+            if (!has(r, /\[fallback\] then_agent \(material_request\) → CM/)) errs.push('返事の後に CM へつないでいない');
+            const rings = r.events.filter((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')).length;
+            if (rings !== 1) errs.push(`CM を ${rings} 回呼んだ（1回のはず）`);
+            return errs;
+        },
+    },
     fallback_to_agent: {
         settings: V2(),
         timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: 'えっと、それってどういう仕組みなんですか？' }, { kind: 'silence', ms: 8000 }],
