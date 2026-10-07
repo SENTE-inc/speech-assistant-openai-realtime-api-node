@@ -225,7 +225,7 @@ export async function elevenTts(text, voiceId) {
 export function registerVoiceAi(fastify, deps) {
     const {
         supabase, anthropic, verifyProvisionSecret, AUDIO_BUCKET,
-        CLIP_TEMPLATE, bustTenantAudio, detectAudioFormat,
+        CLIP_TEMPLATE, INTENT_TEMPLATE, bustTenantAudio, detectAudioFormat,
         parseVoiceGender, scopePlaybookQuery, voiceSetBase,
     } = deps;
     const CLIP_KEYS = new Set(CLIP_TEMPLATE.map((c) => c.key));
@@ -583,6 +583,46 @@ export function registerVoiceAi(fastify, deps) {
             .from('audio_clips').select('key, filename').eq('playbook_id', pb.id);
         if (clipErr) return reply.code(500).send({ error: '音声を保存できませんでした' });
         const fileByKey = Object.fromEntries((clips || []).map((c) => [c.key, c.filename]));
+
+        // 13本より前の声セット（10本）に、型にあって台本に無いセリフを保存した＝その行と意図を足す（2026-10-07 codex レビュー）
+        //   足した行は音が無い間 audio_ready=false＝関門（D1）で架電しない。name_lead を足した時は、名乗りまで言う旧い
+        //   greeting・company の音も作り直すまで止める（名前と二重に名乗らない・社名の答えが「〜の」で切れない）
+        const savedKeys = [...picks.map((p) => p.key), ...textOnly.map((t) => t.key)];
+        const addKeys = savedKeys.filter((k) => !fileByKey[k]);
+        if (addKeys.length) {
+            const textOf = Object.fromEntries([...picks, ...textOnly].map((x) => [x.key, x.text]));
+            const clipRows = CLIP_TEMPLATE.filter((c) => addKeys.includes(c.key)).map((c) => ({
+                playbook_id: pb.id, tenant_id: scope.tenant_id, key: c.key, clip_type: c.clip_type, filename: c.filename,
+                text: textOf[c.key], source: 'tts', audio_ready: false, suppress_farewell: !!c.suppress_farewell,
+                sort_order: c.sort_order, active: true,
+            }));
+            const { error: addErr } = await supabase.from('audio_clips').insert(clipRows);
+            if (addErr) {
+                console.error('[voice-ai] save add clips failed:', addErr.message);
+                return reply.code(500).send({ error: '音声を保存できませんでした' });
+            }
+            for (const c of clipRows) fileByKey[c.key] = c.filename;
+            const { data: haveIntents } = await supabase.from('call_intents').select('name').eq('playbook_id', pb.id);
+            const haveNames = new Set((haveIntents || []).map((i) => i.name));
+            const intentRows = INTENT_TEMPLATE.filter((i) => addKeys.includes(i.audio_key) && !haveNames.has(i.name)).map((i) => ({
+                playbook_id: pb.id, tenant_id: scope.tenant_id, name: i.name, action: i.action || 'play_audio',
+                audio_key: i.audio_key, triggers: i.triggers, is_transfer: !!i.is_transfer, end_call: !!i.end_call,
+                end_reason: i.end_reason ?? null, wants_callback_info: !!i.wants_callback_info, then_agent: !!i.then_agent,
+                sort_order: i.sort_order, active: true,
+            }));
+            if (intentRows.length) {
+                const { error: intErr } = await supabase.from('call_intents').insert(intentRows);
+                if (intErr) console.error('[voice-ai] save add intents failed:', intErr.message);
+            }
+            if (addKeys.includes('name_lead')) {
+                const redo = ['greeting', 'company'].filter((k) => !picks.some((p) => p.key === k));
+                if (redo.length) {
+                    await supabase.from('audio_clips').update({ audio_ready: false, updated_at: new Date().toISOString() })
+                        .eq('playbook_id', pb.id).in('key', redo);
+                }
+            }
+            console.log(`[voice-ai] save added clips ${addKeys.join(',')} to playbook=${pb.id}`);
+        }
 
         const pbPatch = { updated_at: new Date().toISOString() };
         if (realtime) pbPatch.realtime_system_message = realtime;

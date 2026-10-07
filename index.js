@@ -380,6 +380,18 @@ async function operatorGender(userId) {
 //   名前（user_profiles.spoken_name）と性別の声で「◯◯と申します。」を1本作って持たせる＝名前か声が変わった時だけ作り直す
 //   呼び手＝/cm-name（画面が名前を保存した時・招待を受けた時）と /dial-tick の関門（作り損ねの拾い）
 const cmNameInflight = new Map(); // userId -> Promise（同じ CM を同時に2回作らない）
+const cmNameVerified = new Set(); // Storage に実体が在ると確かめた path（このプロセスで1回だけ確かめる）
+async function nameAudioExists(path) {
+    if (cmNameVerified.has(path)) return true;
+    try {
+        await fetchClip(path);
+        cmNameVerified.add(path);
+        return true;
+    } catch (err) {
+        console.error(`[cm-name] audio missing at ${path}: ${err.message}`);
+        return false;
+    }
+}
 async function ensureCmNameAudio(userId) {
     if (!userId) return { ok: false, reason: 'no_user' };
     if (cmNameInflight.has(userId)) return cmNameInflight.get(userId);
@@ -393,7 +405,8 @@ async function ensureCmNameAudio(userId) {
         const gender = parseVoiceGender(u.gender);
         if (!u.spoken_name || !gender) return { ok: false, reason: 'no_name' };
         const audioKey = `${DECIDED_VOICE_BY_GENDER[gender]}|${u.spoken_name}`;
-        if (u.spoken_name_audio_path && u.spoken_name_audio_key === audioKey) {
+        // DB の path を鵜呑みにしない＝実体が消えていたら作り直す（2026-10-07 codex レビュー）
+        if (u.spoken_name_audio_path && u.spoken_name_audio_key === audioKey && await nameAudioExists(u.spoken_name_audio_path)) {
             return { ok: true, path: u.spoken_name_audio_path, text: `${u.spoken_name}と申します。` };
         }
         const { data: t } = await supabase.from('tenants').select('slug').eq('id', u.tenant_id).maybeSingle();
@@ -413,9 +426,8 @@ async function ensureCmNameAudio(userId) {
             await supabase.storage.from(AUDIO_BUCKET).remove([path]).catch(() => {});
             return { ok: false, reason: updErr ? 'update_failed' : 'changed_meanwhile' };
         }
-        if (u.spoken_name_audio_path && u.spoken_name_audio_path !== path) {
-            await supabase.storage.from(AUDIO_BUCKET).remove([u.spoken_name_audio_path]).catch(() => {});
-        }
+        // 前の名前の音は消さない＝通話中の電話がまだその path を流すことがある（数十 KB・2026-10-07 codex レビュー）
+        cmNameVerified.add(path);
         console.log(`[cm-name] made ${path}`);
         return { ok: true, path, text: `${u.spoken_name}と申します。` };
     })().catch((err) => {
@@ -2222,7 +2234,7 @@ fastify.post('/clip-audio', { bodyLimit: 6 * 1024 * 1024 }, async (request, repl
 
 // 音声タブ（案件 → 台本の提案 → ElevenLabs のテイク → 選んで保存・上限）＝voice-ai.js
 registerVoiceAi(fastify, {
-    supabase, anthropic, verifyProvisionSecret, AUDIO_BUCKET, CLIP_TEMPLATE, bustTenantAudio, detectAudioFormat,
+    supabase, anthropic, verifyProvisionSecret, AUDIO_BUCKET, CLIP_TEMPLATE, INTENT_TEMPLATE, bustTenantAudio, detectAudioFormat,
     parseVoiceGender, scopePlaybookQuery, voiceSetBase,
 });
 
