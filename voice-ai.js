@@ -602,26 +602,39 @@ export function registerVoiceAi(fastify, deps) {
                 return reply.code(500).send({ error: '音声を保存できませんでした' });
             }
             for (const c of clipRows) fileByKey[c.key] = c.filename;
-            const { data: haveIntents } = await supabase.from('call_intents').select('name').eq('playbook_id', pb.id);
-            const haveNames = new Set((haveIntents || []).map((i) => i.name));
-            const intentRows = INTENT_TEMPLATE.filter((i) => addKeys.includes(i.audio_key) && !haveNames.has(i.name)).map((i) => ({
-                playbook_id: pb.id, tenant_id: scope.tenant_id, name: i.name, action: i.action || 'play_audio',
-                audio_key: i.audio_key, triggers: i.triggers, is_transfer: !!i.is_transfer, end_call: !!i.end_call,
-                end_reason: i.end_reason ?? null, wants_callback_info: !!i.wants_callback_info, then_agent: !!i.then_agent,
-                sort_order: i.sort_order, active: true,
-            }));
-            if (intentRows.length) {
-                const { error: intErr } = await supabase.from('call_intents').insert(intentRows);
-                if (intErr) console.error('[voice-ai] save add intents failed:', intErr.message);
-            }
             if (addKeys.includes('name_lead')) {
-                const redo = ['greeting', 'company'].filter((k) => !picks.some((p) => p.key === k));
-                if (redo.length) {
-                    await supabase.from('audio_clips').update({ audio_ready: false, updated_at: new Date().toISOString() })
-                        .eq('playbook_id', pb.id).in('key', redo);
+                // 保存の成否に依らず先に止める＝この保存で音を作り直せた行だけ、下のテイクの保存が ready に戻す
+                const { error: redoErr } = await supabase.from('audio_clips')
+                    .update({ audio_ready: false, updated_at: new Date().toISOString() })
+                    .eq('playbook_id', pb.id).in('key', ['greeting', 'company']);
+                if (redoErr) {
+                    console.error('[voice-ai] save hold greeting/company failed:', redoErr.message);
+                    return reply.code(500).send({ error: '音声を保存できませんでした' });
                 }
             }
             console.log(`[voice-ai] save added clips ${addKeys.join(',')} to playbook=${pb.id}`);
+        }
+        // 足したセリフの意図（宛先・資料送付）が台本に無ければ足す＝行を足した回に失敗しても、次の保存で埋まる
+        const NEW_INTENT_KEYS = ['addressee', 'send_material'];
+        if (NEW_INTENT_KEYS.some((k) => fileByKey[k])) {
+            const { data: haveIntents, error: hiErr } = await supabase.from('call_intents').select('name').eq('playbook_id', pb.id);
+            if (hiErr) return reply.code(500).send({ error: '台本を保存できませんでした' });
+            const haveNames = new Set((haveIntents || []).map((i) => i.name));
+            const intentRows = INTENT_TEMPLATE
+                .filter((i) => NEW_INTENT_KEYS.includes(i.audio_key) && fileByKey[i.audio_key] && !haveNames.has(i.name))
+                .map((i) => ({
+                    playbook_id: pb.id, tenant_id: scope.tenant_id, name: i.name, action: i.action || 'play_audio',
+                    audio_key: i.audio_key, triggers: i.triggers, is_transfer: !!i.is_transfer, end_call: !!i.end_call,
+                    end_reason: i.end_reason ?? null, wants_callback_info: !!i.wants_callback_info, then_agent: !!i.then_agent,
+                    sort_order: i.sort_order, active: true,
+                }));
+            if (intentRows.length) {
+                const { error: intErr } = await supabase.from('call_intents').insert(intentRows);
+                if (intErr) {
+                    console.error('[voice-ai] save add intents failed:', intErr.message);
+                    return reply.code(500).send({ error: '台本を保存できませんでした' });
+                }
+            }
         }
 
         const pbPatch = { updated_at: new Date().toISOString() };

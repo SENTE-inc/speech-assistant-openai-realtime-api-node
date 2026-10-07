@@ -380,12 +380,14 @@ async function operatorGender(userId) {
 //   名前（user_profiles.spoken_name）と性別の声で「◯◯と申します。」を1本作って持たせる＝名前か声が変わった時だけ作り直す
 //   呼び手＝/cm-name（画面が名前を保存した時・招待を受けた時）と /dial-tick の関門（作り損ねの拾い）
 const cmNameInflight = new Map(); // userId -> Promise（同じ CM を同時に2回作らない）
-const cmNameVerified = new Set(); // Storage に実体が在ると確かめた path（このプロセスで1回だけ確かめる）
+const cmNameVerified = new Map(); // Storage に実体が在ると確かめた path -> 時刻（10分は確かめ直さない）
+const CM_NAME_VERIFY_TTL_MS = 10 * 60 * 1000;
 async function nameAudioExists(path) {
-    if (cmNameVerified.has(path)) return true;
+    const at = cmNameVerified.get(path);
+    if (at && Date.now() - at < CM_NAME_VERIFY_TTL_MS) return true;
     try {
         await fetchClip(path);
-        cmNameVerified.add(path);
+        cmNameVerified.set(path, Date.now());
         return true;
     } catch (err) {
         console.error(`[cm-name] audio missing at ${path}: ${err.message}`);
@@ -427,7 +429,7 @@ async function ensureCmNameAudio(userId) {
             return { ok: false, reason: updErr ? 'update_failed' : 'changed_meanwhile' };
         }
         // 前の名前の音は消さない＝通話中の電話がまだその path を流すことがある（数十 KB・2026-10-07 codex レビュー）
-        cmNameVerified.add(path);
+        cmNameVerified.set(path, Date.now());
         console.log(`[cm-name] made ${path}`);
         return { ok: true, path, text: `${u.spoken_name}と申します。` };
     })().catch((err) => {
