@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Blob } from 'node:buffer';
 import crypto from 'node:crypto';
-import { registerVoiceAi, makeNameAudio, DECIDED_VOICE_BY_GENDER, ABSENT_CLIPS } from './voice-ai.js';
+import { registerVoiceAi, makeNameAudio, DECIDED_VOICE_BY_GENDER, ABSENT_CLIPS, elevenTts } from './voice-ai.js';
 
 dotenv.config();
 
@@ -551,6 +551,8 @@ async function loadPlaybook(tenantId, projectId = null, gender = null) {
     cfg.transcriptionPrompt = buildTranscriptionPrompt(pb.company_name, intents);
 
     playbookCache.set(cacheKey, { cfg, loadedAt: Date.now() });
+    // 不在の流れの4本が欠けていれば、その声セットの声で作って足す（裏で・人の手を通さない＝2026-10-08 Tom「勝手に作成できるようにしたい」）
+    ensureAbsentClips(pb, cfg).catch((err) => console.error(`[absent-clips] ${pb.id} failed: ${err.message}`));
 
     // Warm the clip cache in the background so the first call isn't slow.
     for (const key of cfg.clips.keys()) {
@@ -1165,6 +1167,37 @@ const CLIP_TEMPLATE = [
 
 // 不在の流れの4本＝voice-ai.js の ABSENT_CLIPS（4本とも在る声セットだけ「戻りの時間を聞く」流れ）
 const ABSENT_KEYS = ABSENT_CLIPS.map((c) => c.key);
+
+// 声セットを読んだ時に、不在の4本が欠けていれば ElevenLabs でその声セットの声（voice_ai_voice_id）で作り、置き場へ上げ、
+// audio_clips に audio_ready=true で足す（音を上げた後に行を足す＝欠けた行で架電の関門を止めない）。台本の作り直しで消えても次の読み込みで戻る。
+// ElevenLabs の声が無い声セット（肉声だけ等）は作らない＝今の流れ（辞去で終話）のまま。失敗したらその声セットは1時間おく。
+// 4本で約150字・声セットごとに1回（ElevenLabs の月の上限の数には入れない）。家＝~/sente/sente_aivoice_canonical.md §3「📐 実装の計画 v3」
+const absentClipsTried = new Map(); // playbookId -> 次に試してよい時刻
+async function ensureAbsentClips(pb, cfg) {
+    if (!process.env.ELEVENLABS_API_KEY || !pb?.voice_ai_voice_id) return;
+    const base = (pb.audio_base_path || '').trim();
+    if (!base) return;
+    const missing = ABSENT_CLIPS.map((c, i) => ({ ...c, sort_order: 30 + i })).filter((c) => !cfg.clips.has(c.key));
+    if (!missing.length) return;
+    const next = absentClipsTried.get(pb.id);
+    if (next && Date.now() < next) return;
+    absentClipsTried.set(pb.id, Date.now() + 60 * 60 * 1000);
+    let made = 0;
+    for (const c of missing) {
+        const mp3 = await elevenTts(c.text, pb.voice_ai_voice_id);
+        const { error: upErr } = await supabase.storage.from(AUDIO_BUCKET)
+            .upload(`${base}/${c.filename}`, mp3, { contentType: 'audio/mpeg', upsert: true });
+        if (upErr) throw new Error(`upload ${c.key}: ${upErr.message}`);
+        const { error: insErr } = await supabase.from('audio_clips').insert({
+            playbook_id: pb.id, tenant_id: pb.tenant_id, key: c.key, clip_type: 'response', filename: c.filename, text: c.text,
+            source: 'elevenlabs', audio_ready: true, suppress_farewell: false, sort_order: c.sort_order, active: true,
+        });
+        if (insErr) throw new Error(`insert ${c.key}: ${insErr.message}`);
+        made++;
+    }
+    console.log(`[absent-clips] added ${made} clips to playbook ${pb.id}`);
+    bustPlaybookCache(pb.tenant_id); // 次の電話から4本を読む（通話中の電話は読み込んだ声セットのまま）
+}
 
 // Intent set + trigger phrases. Company-independent, so it's fixed here and
 // not exposed in the dashboard form. audio_key references CLIP_TEMPLATE keys.
