@@ -48,6 +48,7 @@ async function haiku(text, afterHold, model = 'claude-haiku-4-5-20251001', schem
             system: [{ type: 'text', text: PROMPT, cache_control: { type: 'ephemeral' } }],
             // Haiku 5.5 は先頭埋め（prefill）を 400 で弾く＝JSON の形を指定して返させる・思考は切る
             ...(model.includes('haiku-4-5') ? { messages: [{ role: 'user', content: userMessage(text, afterHold) }, { role: 'assistant', content: '{' }] }
+                : schema === 'low' ? { messages: [{ role: 'user', content: userMessage(text, afterHold) }], output_config: { effort: 'low' } }
                 : !schema ? { messages: [{ role: 'user', content: userMessage(text, afterHold) }], thinking: { type: 'disabled' } }
                 : model.includes('haiku-4-5')
                 ? { messages: [{ role: 'user', content: userMessage(text, afterHold) }, { role: 'assistant', content: '{' }] }
@@ -59,6 +60,7 @@ async function haiku(text, afterHold, model = 'claude-haiku-4-5-20251001', schem
     });
     const j = await r.json();
     if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
+    if (process.env.USAGE) console.error('USAGE', model, schema, JSON.stringify({ i: j.usage?.input_tokens, cr: j.usage?.cache_read_input_tokens, cw: j.usage?.cache_creation_input_tokens, o: j.usage?.output_tokens, types: j.content?.map((c) => c.type) }));
     const t0 = j.content?.find((c) => c.type === 'text')?.text || '';
     const raw = t0.trimStart().startsWith('{') ? t0 : '{' + t0;
     return JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)).intent;
@@ -112,6 +114,7 @@ const ENGINES = {
     haiku: (t, w) => haiku(t, w),
     haiku55: (t, w) => haiku(t, w, 'claude-haiku-5-5'),
     haiku55_plain: (t, w) => haiku(t, w, 'claude-haiku-5-5', false),
+    haiku55_low: (t, w) => haiku(t, w, 'claude-haiku-5-5', 'low'),
     luna_none: (t, w) => luna(t, w, 'none'),
     luna_low: (t, w) => luna(t, w, 'low'),
 };
