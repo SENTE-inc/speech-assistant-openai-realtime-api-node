@@ -39,19 +39,28 @@ const userMessage = (text, afterHold) =>
 // ---------------------------------------------------------------------
 // モデル（どれも intent の名前を1つ返す）
 // ---------------------------------------------------------------------
-async function haiku(text, afterHold) {
+async function haiku(text, afterHold, model = 'claude-haiku-4-5-20251001', schema = true) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'x-api-key': AK, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
         body: JSON.stringify({
-            model: 'claude-haiku-4-5-20251001', max_tokens: 200,
+            model, max_tokens: 200,
             system: [{ type: 'text', text: PROMPT, cache_control: { type: 'ephemeral' } }],
-            messages: [{ role: 'user', content: userMessage(text, afterHold) }, { role: 'assistant', content: '{' }],
+            // Haiku 5.5 は先頭埋め（prefill）を 400 で弾く＝JSON の形を指定して返させる・思考は切る
+            ...(model.includes('haiku-4-5') ? { messages: [{ role: 'user', content: userMessage(text, afterHold) }, { role: 'assistant', content: '{' }] }
+                : !schema ? { messages: [{ role: 'user', content: userMessage(text, afterHold) }], thinking: { type: 'disabled' } }
+                : model.includes('haiku-4-5')
+                ? { messages: [{ role: 'user', content: userMessage(text, afterHold) }, { role: 'assistant', content: '{' }] }
+                : { messages: [{ role: 'user', content: userMessage(text, afterHold) }], thinking: { type: 'disabled' },
+                    output_config: { format: { type: 'json_schema', schema: {
+                        type: 'object', additionalProperties: false, required: ['intent', 'callback_info'],
+                        properties: { intent: { type: 'string', enum: NAMES }, callback_info: { type: 'string' } } } } } }),
         }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
-    const raw = '{' + (j.content?.[0]?.text || '');
+    const t0 = j.content?.find((c) => c.type === 'text')?.text || '';
+    const raw = t0.trimStart().startsWith('{') ? t0 : '{' + t0;
     return JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)).intent;
 }
 
@@ -101,6 +110,8 @@ async function systemOne(model, text, afterHold, via = 'cloudflare') {
 
 const ENGINES = {
     haiku: (t, w) => haiku(t, w),
+    haiku55: (t, w) => haiku(t, w, 'claude-haiku-5-5'),
+    haiku55_plain: (t, w) => haiku(t, w, 'claude-haiku-5-5', false),
     luna_none: (t, w) => luna(t, w, 'none'),
     luna_low: (t, w) => luna(t, w, 'low'),
 };
@@ -117,6 +128,8 @@ if (CF_ACCOUNT && CF_TOKEN) {
     ENGINES.clef = (t, w) => systemOne('@cf/cloudflare/clef', t, w);
     ENGINES.clef_flash = (t, w) => systemOne('@cf/cloudflare/clef-flash', t, w);
 }
+
+if (process.env.ENGINES) for (const k of Object.keys(ENGINES)) if (!process.env.ENGINES.split(',').includes(k)) delete ENGINES[k];
 
 // ---------------------------------------------------------------------
 const CASES = [
