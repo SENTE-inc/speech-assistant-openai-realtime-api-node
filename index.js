@@ -727,9 +727,12 @@ async function classifyWithClaude(transcript, ctx = {}, prompt) {
     const MAX_ATTEMPTS = 3;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
+            // Haiku 5.5（2026-10-08〜）＝prefill を 400 で弾く・思考は既定で入る＝思考を切り、JSON はプロンプトの指示で返させる
+            // （json_schema で縛ると 0.6秒遅い＝試験 scripts/transfer-bench/model-bench.mjs の haiku55_plain が本番の形）
             const message = await anthropic.messages.create({
-                model: 'claude-haiku-4-5-20251001',
+                model: 'claude-haiku-5-5',
                 max_tokens: 200,
+                thinking: { type: 'disabled' },
                 system: [
                     {
                         type: 'text',
@@ -737,13 +740,10 @@ async function classifyWithClaude(transcript, ctx = {}, prompt) {
                         cache_control: { type: 'ephemeral' },
                     },
                 ],
-                messages: [
-                    { role: 'user', content: userMessage },
-                    { role: 'assistant', content: '{' },
-                ],
+                messages: [{ role: 'user', content: userMessage }],
             });
 
-            const raw = '{' + (message.content[0]?.text || '');
+            const raw = (message.content || []).filter((c) => c.type === 'text').map((c) => c.text || '').join('');
             const start = raw.indexOf('{');
             const end = raw.lastIndexOf('}');
             if (start < 0 || end < 0) throw new Error('No JSON found');

@@ -164,9 +164,15 @@ const fake = http.createServer(async (req, res) => {
             const intent = sc.haiku(transcript, afterHold);
             events.push({ t: 'haiku', transcript, afterHold, intent });
             if (sc.haikuDelayMs) await new Promise((r) => setTimeout(r, sc.haikuDelayMs));
+            // 本番の送り方（Haiku 5.5＝prefill なし・思考切り）でない要求は 400 にする＝送り方の後戻りを試験で捕まえる
+            const last = msg.messages[msg.messages.length - 1];
+            if (msg.model !== 'claude-haiku-5-5' || last.role !== 'user' || msg.thinking?.type !== 'disabled') {
+                events.push({ t: 'haiku_bad_request', model: msg.model, lastRole: last.role, thinking: msg.thinking });
+                return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'sim: not the Haiku 5.5 request shape' } });
+            }
             return json(res, 200, {
-                id: 'msg_sim', type: 'message', role: 'assistant', model: 'claude-haiku-4-5-20251001',
-                content: [{ type: 'text', text: `"intent": "${intent}"}` }], stop_reason: 'end_turn',
+                id: 'msg_sim', type: 'message', role: 'assistant', model: 'claude-haiku-5-5',
+                content: [{ type: 'thinking', thinking: '' }, { type: 'text', text: `{"intent": "${intent}"}` }], stop_reason: 'end_turn',
                 usage: { input_tokens: 1, output_tokens: 1 },
             });
         }
