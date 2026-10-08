@@ -341,3 +341,180 @@ export function decideHold({ ts, announced }) {
         : { transfer: false, reason: 'hold_without_words_off' };
 }
 
+
+// =====================================================================
+// 2026-10-08 森さんの FB（家＝~/sente/sente_aivoice_canonical.md §3「📐 実装の計画 v3」）
+// =====================================================================
+
+// 句読点・空白・伸ばし棒を除いた形（判定用）
+const stripForJudge = (s) => String(s || '').replace(/[\s、。，．,.！!・…「」『』（）()〜~ー]/g, '');
+const hasQuestionMark = (s) => /[?？]/.test(String(s || ''));
+
+// つなぎ言葉だけ（「あのー」「えっと」）＝これには返さず続きを聞く。「ええ」は肯定なので外す
+const FILLER_WORDS_RE = /^(?:あのう?|ええ?っと|ええ?と|えっとですね|あのですね|え|あ|その|まあ|ん|んと|うんと)+$/;
+export function isFillerWordsOnly(transcript) {
+    const n = stripForJudge(transcript).replace(/[?？]/g, '');
+    if (!n || n === 'ええ' || hasQuestionMark(transcript)) return false;
+    return FILLER_WORDS_RE.test(n);
+}
+
+// 言いかけ（文が終わっていない）＝助詞・接続で終わる／「〜の者」「〜のもの」「〜の方」で終わり「です・ます」が無い。
+// 問いかけ（？付き）は言いかけにしない（「社長は？」に1.5秒待たない）
+const INCOMPLETE_TAIL_RE = /(?:の|が|は|を|に|て|で|と|けど|けれど|から|ので|って|の者|のもの|の方)$/;
+export function isIncompleteUtterance(transcript) {
+    if (hasQuestionMark(transcript)) return false;
+    if (isFillerWordsOnly(transcript)) return true;
+    const n = stripForJudge(transcript);
+    if (n.length < 2) return false;
+    return INCOMPLETE_TAIL_RE.test(n);
+}
+
+// 「もう一度」（何をかを言っていない物だけ）＝直前の返答を流し直す。「御社名をもう一度」は AI へ（社名の答えがある）
+const REPEAT_RE = /もう(?:一|いち)度|もう(?:一|いっ)回|もういっぺん|聞こえ(?:ませ|な|づら|にく)|聞き取れ|(?:なんて|何て)(?:おっしゃ|言)/;
+const REPEAT_TARGET_RE = /社名|会社|御社|名前|お名|用件|要件|ご用|番号|部署|どちら|どなた|何の/;
+export function isRepeatRequest(transcript) {
+    const t = String(transcript || '');
+    return REPEAT_RE.test(t) && !REPEAT_TARGET_RE.test(t);
+}
+
+// ---------------------------------------------------------------------
+// 戻り時間（JST）＝相手の言葉から再コールの日時を作る。読めなければ null
+// ---------------------------------------------------------------------
+const KANJI_NUM = { 〇: 0, 零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+function kanjiToNumber(s) {
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    if (!/^[〇零一二三四五六七八九十]+$/.test(s)) return NaN;
+    if (!s.includes('十')) return [...s].reduce((n, c) => n * 10 + KANJI_NUM[c], 0);
+    const [a, b] = s.split('十');
+    return (a ? KANJI_NUM[a] : 1) * 10 + (b ? KANJI_NUM[b] : 0);
+}
+const toHalfWidth = (s) => String(s || '').replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0));
+const NUM = '(\\d{1,2}|[〇零一二三四五六七八九十]{1,3})';
+// 否定・都合が悪い＝この区切りの時刻は採らない
+const RECALL_NEG_RE = /休み|不在|外出|戻ってきませ|戻ってこな|戻れな|いらっしゃらな|はちょっと|ちょっと(?:難|無理|厳|都合)|戻らな|戻りませ|戻ってこな|いな(?:い|く)|いませ|おりませ|おらず|困|難し|無理|だめ|ダメ|厳し|都合が悪|分から|わから|未定|不明/;
+const WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
+
+// JST の暦（年・月・日・曜日・時・分）を now から作る
+function jstParts(now) {
+    const d = new Date(now.getTime() + 9 * 3600 * 1000);
+    return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate(), wd: d.getUTCDay(), h: d.getUTCHours(), mi: d.getUTCMinutes() };
+}
+// JST の (年, 月, 日+dayOffset, 時, 分) → UTC の Date
+function jstDate(p, dayOffset, h, mi) {
+    return new Date(Date.UTC(p.y, p.m, p.d + dayOffset, h - 9, mi));
+}
+
+function parseSegment(seg, now, ctx = {}) {
+    const p = jstParts(now);
+    // 相対（◯分後・◯時間後・◯分ほどで）
+    let m = seg.match(new RegExp(`${NUM}分(?:後|ほど|くらい|ぐらい|程|ちょっと|で)`));
+    if (m && !new RegExp(`${NUM}時${NUM}分`).test(seg)) {
+        const n = kanjiToNumber(m[1]);
+        if (n > 0 && n <= 180) return new Date(now.getTime() + n * 60000);
+    }
+    m = seg.match(new RegExp(`${NUM}時間(?:後|ほど|くらい|ぐらい|程)`));
+    if (m) {
+        const n = kanjiToNumber(m[1]);
+        if (n > 0 && n <= 12) return new Date(now.getTime() + n * 3600000);
+    }
+    // 日
+    let day = null;
+    if (/明後日|あさって/.test(seg)) day = 2;
+    else if (/明日|あした|あす/.test(seg)) day = 1;
+    else if (/今日|本日|きょう/.test(seg)) day = 0;
+    else {
+        const w = seg.match(/([日月火水木金土])曜/);
+        if (w) {
+            const target = WEEKDAYS.indexOf(w[1]);
+            if (/来週/.test(seg)) {
+                const toNextMon = ((8 - p.wd) % 7) || 7; // 来週の月曜まで
+                day = toNextMon + ((target + 6) % 7);
+            } else {
+                day = ((target - p.wd + 7) % 7) || 7; // 今日と同じ曜日＝来週
+            }
+        }
+    }
+    // 時刻
+    let h = null, mi = 0;
+    m = seg.match(new RegExp(`${NUM}時(?:(半)|${NUM}分)?`));
+    if (m) {
+        h = kanjiToNumber(m[1]);
+        if (m[2]) mi = 30;
+        else if (m[3]) mi = kanjiToNumber(m[3]);
+        if (Number.isNaN(h) || h > 23 || Number.isNaN(mi) || mi > 59) return null;
+        if ((/午後|夕方|夜/.test(seg) || (ctx.pm && !/午前|朝/.test(seg))) && h < 12) h += 12;
+        else if (!/午前|朝/.test(seg) && h >= 1 && h <= 7) h += 12; // 「3時」＝営業の時間なら15時
+    } else if (/夕方/.test(seg)) h = 17;
+    else if (/お昼|昼(?:頃|ごろ|過ぎ|すぎ|には|に)/.test(seg)) h = 13;
+    else if (/午後/.test(seg)) h = 13;
+    else if (/午前中|朝/.test(seg)) h = 10;
+    if (day == null && ctx.day != null && h != null) day = ctx.day; // 「明日、16時に」＝前の区切りの日を引き継ぐ
+    if (h == null && day == null) return null;
+    if (h == null) h = 10;
+    if (day != null) return jstDate(p, day, h, mi);
+    // 日を言っていない＝今日のその時刻（過ぎていれば明日）
+    const today = jstDate(p, 0, h, mi);
+    return today.getTime() > now.getTime() ? today : jstDate(p, 1, h, mi);
+}
+
+// 区切り（句読点・逆接・「ではなく」）ごとに読み、否定の付かない区切りのうち最後に読めた日時を採る。
+//   前の区切りで言った日（明日・明後日・曜日）と午後は、後ろの時刻へ引き継ぐ（「明日、16時に戻ります」＝明日16時）
+const RECALL_SPLIT_RE = /[、。，．,.！!？?]|けど|けれど|ではなく|じゃなくて|じゃなく|ですが|ますが/;
+function dayOf(seg, now) {
+    const d = parseSegment(seg.replace(/\d|[〇零一二三四五六七八九十]+時|時/g, ''), now);
+    return d ? Math.round((Date.UTC(...jstYmd(d)) - Date.UTC(...jstYmd(now))) / 86400000) : null;
+}
+function jstYmd(d) { const p = jstParts(d); return [p.y, p.m, p.d]; }
+export function recallCandidates(text, now = new Date()) {
+    const segs = toHalfWidth(text).split(RECALL_SPLIT_RE).map((x) => x.trim()).filter(Boolean);
+    const out = [];
+    const ctx = {};
+    for (const seg of segs) {
+        if (RECALL_NEG_RE.test(seg)) continue;
+        const at = parseSegment(seg, now, ctx);
+        if (/明後日|あさって|明日|あした|あす|今日|本日|きょう|曜/.test(seg)) ctx.day = dayOf(seg, now);
+        if (/午後|夕方/.test(seg)) ctx.pm = true;
+        if (at) out.push({ at, seg });
+    }
+    return out;
+}
+export function parseRecallAt(text, now = new Date()) {
+    const c = recallCandidates(text, now);
+    return c.length ? c[c.length - 1].at : null;
+}
+
+// 不在の段の答え（AI を待たない）
+//   asked（戻りの時間を聞いた）→ reject／time（recallAt）／unknown
+//   proposed（「明日の午後は」と出した）→ yes（recallAt＝言われた別の日時か明日13:00）／no
+const ABSENT_REJECT_RE = /結構|必要(?:が)?(?:ありません|ない)|いりません|要りません|お断り|断って|興味(?:が|は)?(?:ない|ありません)|間に合って|かけてこない|電話しないで/;
+const ABSENT_UNKNOWN_RE = /分から|わから|わかんな|未定|不明|決まって(?:い)?な|何とも|なんとも|聞いてな|把握/;
+const ABSENT_NO_RE = /ちょっと|いや|不在|外出|戻ってきませ|戻ってこな|いえ|難し|厳し|無理|だめ|ダメ|困|都合が悪|いな(?:い|く)|いませ|おりませ|休み|戻らな|分から|わから/;
+const ABSENT_AFFIRM_SEG_RE = /なら|大丈夫|いい|構いません|かまいません|お願い|空いて/;
+const ABSENT_YES_RE = /はい|ええ|大丈夫|いいですよ|構いません|かまいません|お願いします|どうぞ|了解|承知|わかりました|分かりました|オッケー|OK|ok/;
+export function classifyAbsentReply(transcript, stage, now = new Date()) {
+    const t = String(transcript || '');
+    if (ABSENT_REJECT_RE.test(t)) return { kind: 'reject' };
+    if (stage === 'asked') {
+        if (ABSENT_UNKNOWN_RE.test(t)) return { kind: 'unknown' };
+        const at = parseRecallAt(t, now);
+        return at ? { kind: 'time', recallAt: at } : { kind: 'unknown' };
+    }
+    // proposed＝読めた日時の区切りごとに、その日時への肯定かを見る（「はい、明後日なら大丈夫です」＝明後日・
+    //   「明日の午後ですか、分かりません」「明日は休みです」＝了承ではない）
+    const neg = ABSENT_NO_RE.test(t);
+    const cands = recallCandidates(t, now).filter((c) => !/ですか|ますか|でしょうか/.test(c.seg));
+    const affirmed = cands.filter((c) => !neg || ABSENT_AFFIRM_SEG_RE.test(c.seg));
+    if (affirmed.length) return { kind: 'yes', recallAt: affirmed[affirmed.length - 1].at };
+    if (neg || /ですか|ますか|でしょうか|[?？]/.test(t)) return { kind: 'no' };
+    if (ABSENT_YES_RE.test(t)) return { kind: 'yes', recallAt: parseRecallAt('明日の午後', now) };
+    return { kind: 'no' };
+}
+
+// apply_call_outcome に渡す再コールの間隔（DB の now()＋この間隔）。決めた日時が無い・過ぎた時は既定
+export function retryIntervalFor(recallAtIso, now = new Date(), defaultHours = 24) {
+    const at = recallAtIso ? Date.parse(recallAtIso) : NaN;
+    if (!Number.isFinite(at)) return `${defaultHours} hours`;
+    const sec = Math.round((at - now.getTime()) / 1000);
+    if (sec <= 0) return `${defaultHours} hours`;
+    return `${sec} seconds`;
+}

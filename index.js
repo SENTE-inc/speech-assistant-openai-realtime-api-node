@@ -12,6 +12,8 @@ import {
     hasSufficientTransferEvidence, buildClassifierPrompt, buildTranscriptionPrompt,
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
     decideFastHandover, decideAfterClassifierV2, decideHold, isWordless,
+    isIncompleteUtterance, isFillerWordsOnly, isRepeatRequest, classifyAbsentReply, parseRecallAt, retryIntervalFor,
+    matchHandover, firstMatch, NEGATIVE_RE,
 } from './transfer-logic.js';
 import {
     existsSync,
@@ -26,7 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Blob } from 'node:buffer';
 import crypto from 'node:crypto';
-import { registerVoiceAi, makeNameAudio, DECIDED_VOICE_BY_GENDER } from './voice-ai.js';
+import { registerVoiceAi, makeNameAudio, DECIDED_VOICE_BY_GENDER, ABSENT_CLIPS } from './voice-ai.js';
 
 dotenv.config();
 
@@ -838,6 +840,18 @@ const HOLD_MAX_SECONDS = parseInt(process.env.HOLD_MAX_SECONDS || '120', 10);
 const PER_OPERATOR_CONCURRENCY = parseInt(process.env.PER_OPERATOR_CONCURRENCY || '3', 10);
 // まだかける会社（未通電・担当者不在）を次にかけるまでの間（作る順番の3番目）。
 const RETRY_AFTER_HOURS = parseInt(process.env.RETRY_AFTER_HOURS || '24', 10);
+
+// call_sessions.metadata に足して書く（丸ごと置き換えない）＝callback_info と recall_at（再コールの日時）。result も一緒に書ける
+async function mergeSessionMetadata(callSid, patch, result = null) {
+    if (!callSid) return;
+    const { data, error } = await supabase.from('call_sessions').select('metadata').eq('call_sid', callSid).maybeSingle();
+    if (error) { console.error('[metadata] read failed:', error.message); return; }
+    const update = { metadata: { ...(data?.metadata || {}), ...patch } };
+    if (result) update.result = result;
+    const { error: upErr } = await supabase.from('call_sessions').update(update).eq('call_sid', callSid);
+    if (upErr) console.error('[metadata] update failed:', upErr.message);
+    else console.log(`[metadata] saved ${Object.keys(patch).join(',')}${result ? ` result=${result}` : ''}`);
+}
 const HANDOFF_TTL_MS = 15 * 60 * 1000;
 const handoffs = new Map(); // prospect callSid -> { tenantId, projectId, agentId, agentCallSid, excluded, baseUrl, clipPath, createdAt }
 
@@ -1148,6 +1162,9 @@ const CLIP_TEMPLATE = [
     { key: '22a_pardon',       clip_type: 'pardon',   filename: '22a_pardon.mp3',          sort_order: 11 },
     { key: 'farewell',         clip_type: 'farewell', filename: '21_farewell.mp3',         sort_order: 13 },
 ];
+
+// 不在の流れの4本＝voice-ai.js の ABSENT_CLIPS（4本とも在る声セットだけ「戻りの時間を聞く」流れ）
+const ABSENT_KEYS = ABSENT_CLIPS.map((c) => c.key);
 
 // Intent set + trigger phrases. Company-independent, so it's fixed here and
 // not exposed in the dashboard form. audio_key references CLIP_TEMPLATE keys.
@@ -1932,7 +1949,8 @@ fastify.post('/call-status', async (request, reply) => {
         if (session.contact_id && session.project_id) {
             const { data: applied, error } = await supabase.rpc('apply_call_outcome', {
                 p_session: session.id,
-                p_retry: `${RETRY_AFTER_HOURS} hours`,
+                // 通話で決まった再コールの日時（不在の流れ・戻り時間）があれば、そこまでの間隔＝結果と同じ1回の更新で入る
+                p_retry: retryIntervalFor(session.metadata?.recall_at, new Date(), RETRY_AFTER_HOURS),
             });
             cErr = error;
             if (!error) {
@@ -2761,8 +2779,19 @@ fastify.register(async (fastify) => {
         let turnSeq = 0;        // 発話ごとの番号
         let liveTurn = 0;       // いま生きている判定の番号（つなぎ直した判定は 0 で止まる）
         let mergeTurn = null;   // { turn, audio }＝つなぎ直してよい判定（待機中・6秒で区切った発話は今の持ち越しの形のまま）
-        // 切れ端の上限＝先読み0.3秒＋閉じる0.5秒＋話した0.5秒（8kHz μ-law＝1秒8,000バイト）。KWK の「あ」は 5,120 バイト
-        const MERGE_MAX_FRAGMENT_BYTES = 10400;
+        // 切れ端の上限＝先読み0.3秒＋閉じる0.8秒＋話した0.5秒（8kHz μ-law＝1秒8,000バイト）。KWK の「あ」は 5,120 バイト
+        const MERGE_MAX_FRAGMENT_BYTES = 12800;
+        // 言いかけ（「責任者のもの」「あのー」）には返さず、文字起こしの後この時間だけ続きを待つ（2026-10-08 森さん FB）
+        const INCOMPLETE_WAIT_MS = 1500;
+        let held = null;        // { audio, transcript }＝返さずに持っている言いかけ
+        let heldTimer = null;
+        // 不在の流れの段（null／asked＝戻りの時間を聞いた／proposed＝明日の午後を出した）
+        let absentStage = null;
+        let absentAsked = false; // 1通話に1回だけ聞く（段を抜けた後にもう一度「不在」と言われても聞き直さない）
+        // 「もう一度」で流し直す、最後に流し終えた返答の列（つなぎの「はい」と聞き返しは入れない）
+        let lastResponseSeq = null;
+        let repeatCount = 0;
+        const REPEAT_MAX = 2;
         let lastRecorded = null; // { turn, text }＝同じ発話の繰り返しの数に最後に入れた発話（捨てた切れ端を外すため）
         // あいさつは相手の第一声が終わってから流す（2026-10-06 Tom「最初は向こうが名乗るだろうから、それを待ってから自己紹介」＝声セットの家 D7 を覆した）
         // 💥 森さんの試しの電話＝電話の録音の案内とあいさつが重なり、想定外の返事から自由会話へ落ちた
@@ -2794,7 +2823,7 @@ fastify.register(async (fastify) => {
         // VAD
         const VAD_RMS_THRESHOLD = 2000;
         const SPEECH_START_FRAMES = 3;   // 3 consecutive frames (~60ms) required
-        const SILENCE_END_FRAMES = 25;   // 25 frames * 20ms = 500ms of silence ends utterance
+        const SILENCE_END_FRAMES = 40;   // 40 frames * 20ms = 800ms of silence ends utterance（2026-10-08 森さん「返しが早い」＝0.5秒→0.8秒）
         const MIN_UTTERANCE_BYTES = 4000; // ~500ms of audio (8kHz mulaw)
         const CALL_START_GRACE_MS = 5000;  // ignore inbound audio for the first 5s (Twilio trial preamble)
         const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
@@ -2844,6 +2873,13 @@ fastify.register(async (fastify) => {
             silenceFrames = 0;
             speechChunks = [];
             preRoll = [];
+        };
+
+        // 言いかけの持ち（held）を捨てる＝待機・取次・終話・切断で
+        const dropHeld = (why) => {
+            if (heldTimer) { clearTimeout(heldTimer); heldTimer = null; }
+            if (held) console.log(`[held] dropped (${why})`);
+            held = null;
         };
 
         const disableVad = (reason) => {
@@ -2985,11 +3021,25 @@ fastify.register(async (fastify) => {
             }
         };
         // 台本の1本を流す＝社名の答え（company）は、名前で名乗る声セットなら後ろに CM の名前をつなぐ
-        const playClip = async (key) => {
-            await playAudio(key);
-            if (key === 'company' && cfg?.clips?.has('name_lead') && cfg.clips.has('cm_name') && state === 'PLAYING') {
-                await playAudio('cm_name');
+        //   返す値＝'done'（全部流し終えた）／'missing'（音が無い・読めない）／'cancelled'（止められた・切れた）。
+        //   流し終えた返答は「もう一度」で流し直す列として持つ（record=false＝流し直しそのもの）
+        const playClip = async (key, { record = true } = {}) => {
+            const seq = [key];
+            let r = await playAudio(key);
+            if (r === 'done' && key === 'company' && cfg?.clips?.has('name_lead') && cfg.clips.has('cm_name') && state === 'PLAYING') {
+                seq.push('cm_name');
+                r = await playAudio('cm_name');
             }
+            if (r === 'done' && record) { lastResponseSeq = seq; repeatCount = 0; }
+            return r;
+        };
+        const playSeq = async (keys) => {
+            for (const k of keys) {
+                const r = await playAudio(k);
+                if (r !== 'done') return r;
+                if (state !== 'PLAYING') return 'cancelled';
+            }
+            return 'done';
         };
         const playAudioInner = async (key) => {
             const token = ++markCounter;
@@ -2998,7 +3048,7 @@ fastify.register(async (fastify) => {
             const clip = cfg?.clips.get(key);
             if (!clip) {
                 console.error(`[playAudio] unknown clip "${key}" for tenant ${cfg?.tenantId}`);
-                return;
+                return 'missing';
             }
             const loadT0 = Date.now();
             let mulaw;
@@ -3006,10 +3056,10 @@ fastify.register(async (fastify) => {
                 mulaw = await getAudioBuffer(cfg, key);
             } catch (err) {
                 console.error(`Failed to load ${key}:`, err.message);
-                return;
+                return 'missing';
             }
             const loadMs = Date.now() - loadT0;
-            if (currentPlaybackToken !== token) return; // Interrupted while loading
+            if (currentPlaybackToken !== token) return 'cancelled'; // Interrupted while loading
 
             console.log(`▶ Playing ${key} (${clip.filename}) load=${loadMs}ms size=${mulaw.length}B`);
             // Record what we just played so endCallWithFarewell can decide
@@ -3017,7 +3067,7 @@ fastify.register(async (fastify) => {
             lastPlayedAudioKey = key;
             const chunkSize = 160; // 20ms at 8kHz mulaw
             for (let i = 0; i < mulaw.length; i += chunkSize) {
-                if (currentPlaybackToken !== token) return;
+                if (currentPlaybackToken !== token) return 'cancelled';
                 sendMedia(mulaw.subarray(i, i + chunkSize).toString('base64'));
             }
 
@@ -3052,6 +3102,9 @@ fastify.register(async (fastify) => {
 
             console.log(`✓ Finished ${key}`);
             saveTranscript('assistant', clip.text || '');
+            // 流し終えた後に通話が切れていた・止められた＝届いたとは限らない
+            if (state === 'ENDED' || currentPlaybackToken !== token) return 'cancelled';
+            return 'done';
         };
 
         // -----------------------------------------------------------------
@@ -3158,6 +3211,8 @@ fastify.register(async (fastify) => {
             }
             if (cfg?.greetingKey) await playAudio(cfg.greetingKey);
             if (state !== 'PLAYING') return;
+            // 「もう一度」で流し直す列＝あいさつは名乗りから（名前の音が無い声セットは在る物だけ）
+            lastResponseSeq = ['name_lead', 'cm_name', cfg?.greetingKey].filter((k) => k && cfg?.clips?.has(k));
 
             state = 'LISTENING';
             // Reset the silence clock now that we're actually listening —
@@ -3342,6 +3397,7 @@ fastify.register(async (fastify) => {
             }
             aborted = true;
             clearAnswerTimers();
+            dropHeld('end');
             if (state === 'ENDED') {
                 console.log(`[end] endCallWithFarewell(${reason}) called but state=ENDED already; ignoring`);
                 return;
@@ -3541,6 +3597,8 @@ fastify.register(async (fastify) => {
             transferCommitted = true;
             holdRun = null;
             holdCandidate = null;
+            dropHeld('transfer');
+            absentStage = null;
             leaveWait(why);
             consecutiveEmpty = 0;
             currentPlaybackToken = ++markCounter; // 流れかけのつなぎの「はい」を止める
@@ -3567,7 +3625,7 @@ fastify.register(async (fastify) => {
             if (transferCommitted || aborted || state === 'ENDED' || state === 'REALTIME') { holdCandidate = null; return; }
             if (Date.now() - c.at > 15000) { holdCandidate = null; return; } // 古い候補は捨てる
             // carryAudio＝切れ端の続きを聞いている途中（つないだ発話を判定してから決める＝2026-10-06 codex レビュー）
-            if (state !== 'LISTENING' || pendingUtterance || carryAudio) return; // 処理が終わって聞き取りに戻った時に、もう一度ここへ来る
+            if (state !== 'LISTENING' || pendingUtterance || carryAudio || held) return; // 処理が終わって聞き取りに戻った時に、もう一度ここへ来る（held＝言いかけの続きを待っている）
             // 候補の区間の後に話し始めた発話がある＝その中身（「担当者はいません」等）を聞いてから決める（codex レビュー 版7 の1）
             //   保留音そのものも VAD では「話している」になるので、区間より前から続く発話は待たない
             if (speechActive && speechStartedAt > c.regionEndAt) return;
@@ -3687,6 +3745,8 @@ fastify.register(async (fastify) => {
             }
         };
         const enterWait = () => {
+            dropHeld('wait');
+            absentStage = null;
             const now = Date.now();
             waitCtx = { startedAt: now, deadline: now + ts.wait_max_seconds * 1000 };
             recentUserUtterances = [];
@@ -3708,6 +3768,132 @@ fastify.register(async (fastify) => {
         };
 
         // 判定（transfer-logic.js の decideBeforeClassifier／decideAfterClassifier）を実行する
+        // -----------------------------------------------------------------
+        // 2026-10-08 森さんの FB（家＝~/sente/sente_aivoice_canonical.md §3「📐 実装の計画 v3」）
+        // -----------------------------------------------------------------
+        // 聞き取りに戻る（設定がある通話は resumeListening・無い通話は今までの戻り方）
+        const backToListening = (why) => {
+            if (state === 'ENDED') return;
+            if (ts) { resumeListening(true); return; }
+            state = 'LISTENING';
+            lastSpeechAt = Date.now();
+            enableVadDelayed(POST_PLAYBACK_DELAY_MS, why);
+        };
+
+        // 言いかけ（「責任者のもの」「あのー」）＝返さずに持ち、続きが来たらつないで文字起こしからやり直す。
+        // 来なければ期限で、その文のまま判定へ（同じ発話の番号の取り合いは handleUserUtterance の入口と同じ管理を通す）
+        const holdIncomplete = (turn, audio, transcript) => {
+            dropHeld('replaced');
+            held = { turn, audio, transcript };
+            mergeTurn = null;
+            liveTurn = 0;
+            captureWhileProcessing = false;
+            state = 'LISTENING';
+            lastSpeechAt = Date.now();
+            // 長い発話は文字起こしの間 VAD を止めている＝すぐ開け直す（動いていれば捕まえかけの音を捨てない）
+            if (!vadEnabled) enableVadDelayed(0, 'held (incomplete)');
+            console.log(`[held] incomplete utterance (${transcript.length} chars); waiting ${INCOMPLETE_WAIT_MS}ms for the rest`);
+            logDecision({ event: 'turn', step: 'held', transcript, action: 'wait_rest' });
+            heldTimer = setTimeout(() => {
+                heldTimer = null;
+                if (!held || held.turn !== turn) return;
+                // 話し始めていれば、話し始めの所で carryAudio へ移している（ここへは来ない）
+                if (state !== 'LISTENING' || speechActive) return;
+                const h = held;
+                held = null;
+                console.log('[held] no continuation; judging the held utterance as-is');
+                handleUserUtterance(h.audio, { heldTranscript: h.transcript })
+                    .catch((err) => console.error('handleUserUtterance (held) error:', err));
+            }, INCOMPLETE_WAIT_MS);
+        };
+
+        // 「もう一度」＝最後に流し終えた返答の列を流し直す（2回まで・3回目は聞き返し＝回数は聞き返しの上限で数える）
+        const replayLastResponse = async () => {
+            if (!lastResponseSeq?.length || repeatCount >= REPEAT_MAX) {
+                console.log(`[repeat] ${lastResponseSeq?.length ? 'limit reached' : 'nothing to replay'}; reprompting`);
+                await repromptOrEnd();
+                return;
+            }
+            repeatCount++;
+            console.log(`[repeat] replaying ${lastResponseSeq.join('+')} (${repeatCount}/${REPEAT_MAX})`);
+            logDecision({ event: 'turn', step: 'repeat', action: 'replay', matched_phrase: lastResponseSeq.join('+') });
+            state = 'PLAYING';
+            disableVad('replaying last response');
+            const r = await playSeq(lastResponseSeq);
+            if (r === 'cancelled' || state === 'ENDED') return;
+            backToListening('after replay');
+        };
+
+        // 戻り時間を書く（callback_info と recall_at＝再コールの日時）。読めなければ callback_info だけ
+        const saveCallback = async (callbackInfo, transcript, result = null, recallAt = undefined) => {
+            const at = recallAt !== undefined ? recallAt : parseRecallAt([callbackInfo, transcript].filter(Boolean).join('。'), new Date());
+            const patch = {};
+            if (callbackInfo || transcript) patch.callback_info = callbackInfo || transcript;
+            if (at) patch.recall_at = at.toISOString();
+            if (!Object.keys(patch).length && !result) return;
+            await mergeSessionMetadata(callSid, patch, result);
+        };
+
+        // 不在の流れの入口＝4本そろった声セットで、待機中でない時だけ。流せたら true（呼び手は今の流れへ進まない）
+        //   待機中（「少々お待ちください」→ 戻ってきて「不在でした」）も入る＝待機を出てから聞く。1通話に1回だけ
+        const startAbsentFlow = async () => {
+            if (absentStage || absentAsked || !ABSENT_KEYS.every((k) => cfg?.clips?.has(k))) return false;
+            absentAsked = true;
+            if (waitCtx) leaveWait('absent');
+            consecutiveEmpty = 0;
+            state = 'PLAYING';
+            disableVad('absent: ask return time');
+            const r = await playClip('absent_ask');
+            if (r === 'missing') { console.error('[absent] ask clip unavailable; falling back'); return false; }
+            if (r !== 'done' || state === 'ENDED') return true;
+            absentStage = 'asked';
+            logDecision({ event: 'turn', step: 'absent', action: 'ask_return_time' });
+            backToListening('absent: asked');
+            return true;
+        };
+        // 不在の段を抜ける言葉＝取次・待たせる・本人の名乗り（抜けた後は今の判定へ）。
+        //   否定（いません・不在）や日時が一緒にある答え（「担当の者は16時に戻ります」）は段の答えとして扱う
+        //   区切り（句読点・逆接）ごとに見る＝「担当は不在ですが、別の担当に代わりますので少々お待ちください」は抜ける
+        const absentEscape = (transcript) => (transcript || '').split(/[、。，．,.！!？?]|けど|けれど|ですが|ますが/).some((seg) => {
+            if (!seg.trim() || NEGATIVE_RE.test(seg) || parseRecallAt(seg, new Date())) return false;
+            return hasSufficientTransferEvidence(seg)
+                || !!(ts && (firstMatch(seg, ts.wait_phrases) || firstMatch(seg, ts.transfer_phrases) || (ts.v2 && matchHandover(seg, ts))))
+                || /少々お待ち|お待ちください|代わります|替わります|変わります/.test(seg);
+        });
+        // 不在の段の答え（AI を待たない）。結果と再コールの日時は声を流す前に書く
+        const handleAbsentReply = async (transcript, stale = () => false) => {
+            const stage = absentStage;
+            const r = classifyAbsentReply(transcript, stage, new Date());
+            console.log(`[absent] stage=${stage} reply=${r.kind}${r.recallAt ? ` at=${r.recallAt.toISOString()}` : ''}`);
+            logDecision({ event: 'turn', step: 'absent', transcript, action: `${stage}:${r.kind}` });
+            consecutiveEmpty = 0;
+            const finish = async (clipKey, result, recallAt) => {
+                absentStage = null;
+                await saveCallback(null, transcript, result, recallAt || null);
+                // 書いている間に切れた・時間切れ・取次・続きの言葉で追い越された＝声も終話も古い判定からはしない
+                if (aborted || state === 'ENDED' || transferCommitted || stale()) return;
+                state = 'PLAYING';
+                disableVad(`absent: ${result}`);
+                const pr = await playClip(clipKey);
+                if (pr === 'cancelled' && state === 'ENDED') return;
+                await endCallWithFarewell(result);
+            };
+            if (r.kind === 'reject') return finish('sorry_disturb', 'rejected', null);
+            if (stage === 'asked' && r.kind === 'time') return finish('absent_time_ack', 'callback_scheduled', r.recallAt);
+            if (stage === 'asked') {
+                state = 'PLAYING';
+                disableVad('absent: propose');
+                const pr = await playClip('absent_propose');
+                if (pr === 'missing') return finish('sorry_disturb', 'not_available', null);
+                if (pr !== 'done' || state === 'ENDED') return;
+                absentStage = 'proposed';
+                backToListening('absent: proposed');
+                return;
+            }
+            if (r.kind === 'yes') return finish('absent_close', 'callback_scheduled', r.recallAt);
+            return finish('absent_close', 'not_available', null);
+        };
+
         const actOnDecision = async (d, intentDef, decision, meta) => {
             console.log(`[decide] step=${d.step} action=${d.action}${d.gate ? ` gate=${d.gate}` : ''}${meta.inWait ? ' (waiting)' : ''}`);
             logDecision({
@@ -3736,6 +3922,8 @@ fastify.register(async (fastify) => {
                 return;
             }
 
+            // 不在＝戻りの時間を聞く流れ（4本がそろった声セットだけ・辞去や終話より前）
+            if (intentDef?.name === 'not_available' && await startAbsentFlow()) return;
             // intent（否定＝切る）／answer（答えて聞く・待機中は待機を続ける）
             if (!intentDef?.audio_key || !cfg.clips.has(intentDef.audio_key)) {
                 console.error(`[intent] "${intentDef?.name}" has no playable clip`);
@@ -3747,21 +3935,14 @@ fastify.register(async (fastify) => {
             }
             const looped = waitCtx ? false : recordClaudeDecision(intentDef.audio_key);
             consecutiveEmpty = 0;
+            // 戻り時間（「16時頃戻ります」）は声を流す前に書く（相手が声の途中で切っても残る）
+            if (intentDef.wants_callback_info) {
+                await saveCallback(decision?.callback_info, meta.transcript);
+                if (aborted || state === 'ENDED' || transferCommitted || (meta.stale && meta.stale())) return; // 書いている間に終わった・追い越された
+            }
             state = 'PLAYING';
             disableVad('playing response');
             await playClip(intentDef.audio_key);
-
-            if (intentDef.wants_callback_info && decision?.callback_info && callSid) {
-                try {
-                    const { error: cbErr } = await supabase
-                        .from('call_sessions')
-                        .update({ metadata: { callback_info: decision.callback_info } })
-                        .eq('call_sid', callSid);
-                    if (cbErr) console.error('[callback_info] save failed:', cbErr);
-                } catch (err) {
-                    console.error('[callback_info] threw:', err);
-                }
-            }
             if (looped) { await endCallWithFarewell('loop_detected'); return; }
             if (intentDef.end_call) { await endCallWithFarewell(intentDef.end_reason || 'rejected'); return; }
             // 流した後に CM へ（資料送付＝送付先は CM が伺う・2026-10-07）
@@ -3772,7 +3953,8 @@ fastify.register(async (fastify) => {
         // -----------------------------------------------------------------
         // After a user utterance: filler + Whisper + Claude + action
         // -----------------------------------------------------------------
-        const handleUserUtterance = async (mulawAudio, { forced = false } = {}) => {
+        //   heldTranscript＝言いかけの待ちが期限切れ＝文字起こしをやり直さず、その文で判定だけ続ける（もう言いかけ判定はしない）
+        const handleUserUtterance = async (mulawAudio, { forced = false, heldTranscript = null } = {}) => {
             // 処理の間に閉じた発話＝最新の1つだけ持ち越す（待機を続ける・待機に入る時に回す＝§1-d）
             if (state === 'PROCESSING' && (waitCtx || captureWhileProcessing)) {
                 pendingUtterance = { audio: mulawAudio, forced };
@@ -3810,7 +3992,7 @@ fastify.register(async (fastify) => {
             // Start Whisper immediately so STT runs during the human-pause
             // window — the overall response latency stays roughly the same
             // even though the filler is delayed.
-            const whisperPromise = transcribeWhisper(mulawAudio, cfg.transcriptionPrompt).catch((err) => {
+            const whisperPromise = heldTranscript != null ? Promise.resolve(heldTranscript) : transcribeWhisper(mulawAudio, cfg.transcriptionPrompt).catch((err) => {
                 console.error('Whisper error:', err);
                 return null;
             });
@@ -3830,21 +4012,34 @@ fastify.register(async (fastify) => {
                 if (state === 'ENDED' || !fillerKey || transferCommitted || stale()) return;
                 return playAudio(fillerKey);
             }).catch((err) => console.error('Filler playback error:', err));
-            // 版6（v2）＝「はい」は中身を聞いてから決める＝担当者本人の名乗りなら流さない（Tom「『はい』なしで取次」）
-            const v2 = !!ts?.v2;
-            let fillerPromise = v2 ? null : startFiller(HUMAN_PAUSE_MS);
-            console.log(
-                `[parallel] Whisper started; filler ${fillerKey || '(none)'} ${v2 ? 'decided after STT' : `scheduled in ${HUMAN_PAUSE_MS}ms`}`
-            );
+            // 「はい」は全部の通話で中身を聞いてから決める（版6 は v2 だけだった）＝担当者本人の名乗り・言いかけ・「もう一度」には流さない
+            //   （一度送った音は止められない＝言いかけで黙るには先に流さないしかない・2026-10-08 森さん FB／codex 監査）
+            let fillerPromise = null;
+            console.log(`[parallel] Whisper started; filler ${fillerKey || '(none)'} decided after STT`);
 
             const transcript = await whisperPromise;
             console.log(`[timing] Whisper done in ${Date.now() - t0}ms`);
             if (stale()) return;
-            let fast = null;
-            if (v2) {
-                fast = transcript ? decideFastHandover({ transcript, ts }) : null;
-                fillerPromise = fast ? Promise.resolve() : startFiller(Math.max(0, HUMAN_PAUSE_MS - (Date.now() - t0)));
+            if (state === 'ENDED' || transferCommitted) return;
+
+            // 言いかけ・つなぎ言葉だけ＝返さずに持って続きを聞く（期限＝文字起こしの後 INCOMPLETE_WAIT_MS）。
+            //   待機中・6秒で区切った発話・期限切れで戻った文（heldTranscript）は対象外
+            if (transcript && !inWait && !forced && heldTranscript == null && isIncompleteUtterance(transcript)) {
+                holdIncomplete(turn, mulawAudio, transcript);
+                return;
             }
+
+            // 期限まで続きの来なかったつなぎ言葉だけ（「あのー」）＝「はい」も AI も通さずに聞き返す
+            if (heldTranscript != null && isFillerWordsOnly(transcript)) {
+                saveTranscript('user', transcript);
+                console.log('[held] filler only; reprompting');
+                await repromptOrEnd();
+                return;
+            }
+
+            const fast = transcript && ts?.v2 ? decideFastHandover({ transcript, ts }) : null;
+            const repeatAsk = !!transcript && !inWait && !fast && isRepeatRequest(transcript);
+            fillerPromise = (fast || repeatAsk) ? Promise.resolve() : startFiller(Math.max(0, HUMAN_PAUSE_MS - (Date.now() - t0)));
 
             if (!transcript) {
                 if (inWait) {
@@ -3892,6 +4087,14 @@ fastify.register(async (fastify) => {
                 return;
             }
 
+            // 「もう一度」＝直前の返答を流し直す（同じ発話の繰り返しの数には入れない・2回まで・3回目は聞き返し）
+            if (repeatAsk) {
+                await fillerPromise;
+                if (state === 'ENDED' || stale()) return;
+                await replayLastResponse();
+                return;
+            }
+
             // -----------------------------------------------------------------
             // B-2 — Loop detection on the caller's side (same utterance over
             // and over). Triggers before we even call Claude, since asking
@@ -3908,11 +4111,22 @@ fastify.register(async (fastify) => {
                 return;
             }
 
-            const turnMeta = { transcript, inWait, forced, stateBefore };
+            const turnMeta = { transcript, inWait, forced, stateBefore, stale: staleTurn };
             // 版6＝担当者本人の名乗りは Haiku を待たずに取次（「はい」も取次の声も流さない）
             if (fast) {
                 await actOnDecision(fast, null, null, turnMeta);
                 return;
+            }
+            // 不在の流れの途中＝取次・待たせる言葉が無ければ、段の答えとして AI を待たずに決める
+            if (absentStage && !inWait) {
+                if (!absentEscape(transcript)) {
+                    await fillerPromise;
+                    if (state === 'ENDED' || staleTurn()) return;
+                    await handleAbsentReply(transcript, staleTurn);
+                    return;
+                }
+                console.log(`[absent] left stage ${absentStage}: transfer/wait words`);
+                absentStage = null;
             }
             // 手順3＝待機中の相づちだけは Haiku の前に決める（設定が在る通話だけ＝§1-f）
             if (ts) {
@@ -3971,6 +4185,8 @@ fastify.register(async (fastify) => {
                 await fallbackToAgent('unknown intent');
                 return;
             }
+            // 不在＝戻りの時間を聞く流れ（4本がそろった声セットだけ）
+            if (intent.name === 'not_available' && await startAbsentFlow()) return;
 
             // 聞き返しの回数を0に戻すのは、実際に応答の声を流す・自由会話へ渡す時だけ（段0）。
             // 以前は関門の前で戻していた＝関門で何度拒否しても毎回「1回目」で、聞き返しが終わらなかった。
@@ -4027,6 +4243,10 @@ fastify.register(async (fastify) => {
             const looped = recordClaudeDecision(intent.audio_key);
 
             consecutiveEmpty = 0;
+            if (intent.wants_callback_info) {
+                await saveCallback(decision.callback_info, transcript);
+                if (aborted || state === 'ENDED' || transferCommitted || staleTurn()) return; // 書いている間に終わった・追い越された
+            }
             state = 'PLAYING';
             disableVad('playing response');
             await playClip(intent.audio_key);
@@ -4044,20 +4264,7 @@ fastify.register(async (fastify) => {
                 return;
             }
 
-            // Persist callback_info when the intent expects scheduling context
-            // (e.g. "16時頃戻ります"). n8n's post-call analysis uses it.
-            if (intent.wants_callback_info && decision.callback_info && callSid) {
-                try {
-                    const { error: cbErr } = await supabase
-                        .from('call_sessions')
-                        .update({ metadata: { callback_info: decision.callback_info } })
-                        .eq('call_sid', callSid);
-                    if (cbErr) console.error('[callback_info] save failed:', cbErr);
-                    else console.log(`[callback_info] saved (${String(decision.callback_info).length} chars)`);
-                } catch (err) {
-                    console.error('[callback_info] threw:', err);
-                }
-            }
+            // callback_info（「16時頃戻ります」）は声を流す前に saveCallback で書いた
 
             if (looped) {
                 await endCallWithFarewell('loop_detected');
@@ -4317,6 +4524,13 @@ fastify.register(async (fastify) => {
                     // the caller is engaged.
                     lastSpeechAt = Date.now();
                     console.log(`[vad] speech start (rms=${rms.toFixed(0)}, preroll=${speechChunks.length}f)`);
+                    // 言いかけの続きが始まった＝持っていた音を頭につないで、閉じた後に文字起こしからやり直す
+                    if (held && state === 'LISTENING' && !waitCtx) {
+                        if (heldTimer) { clearTimeout(heldTimer); heldTimer = null; }
+                        carryAudio = held.audio; // 持っていた音は前の切れ端も含む（handleUserUtterance でつないだ後の音）
+                        held = null;
+                        console.log(`[held] caller continued; will re-judge with the previous ${carryAudio.length} bytes`);
+                    }
                     // 処理中に相手の続きが始まった＝その判定は捨てて、閉じた後に前の切れ端とつないで判定し直す
                     if (state === 'PROCESSING' && !waitCtx && mergeTurn && mergeTurn.turn === liveTurn) {
                         carryAudio = mergeTurn.audio;
@@ -4537,6 +4751,7 @@ fastify.register(async (fastify) => {
             // 取次が Twilio を <Enqueue> へ切り替えた時の切断は正常（段0）＝それ以外は通話が終わった
             if (transferPhase !== 'committing' && transferPhase !== 'committed') aborted = true;
             clearAnswerTimers();
+            dropHeld('closed');
             state = 'ENDED';
             currentPlaybackToken = null;
             // If the socket closed before authenticating, free its unauth slot

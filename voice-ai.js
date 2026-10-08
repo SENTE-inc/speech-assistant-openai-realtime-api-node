@@ -175,6 +175,16 @@ function speedUp(mp3) {
     });
 }
 
+// 不在の流れの4本（2026-10-08 森さん FB・Tom「明日の午後でいいよ」）＝どの会社でも同じ文。台本の13本・画面の行の外。
+// 4本とも在る声セットだけ「戻りの時間を聞く」流れになる（無ければ今どおり辞去で終話）。音は scripts/add-absent-clips.mjs で足す
+// 家＝~/sente/sente_aivoice_canonical.md §3「📐 実装の計画 v3」
+export const ABSENT_CLIPS = [
+    { key: 'absent_ask',      filename: 'a1_absent_ask.mp3',      text: 'ありがとうございます。ちなみに、ご担当の方のお戻りのお時間ってお分かりになりますか？' },
+    { key: 'absent_time_ack', filename: 'a2_absent_time_ack.mp3', text: '左様でございますか。それでは、そのお時間に改めてお電話させていただきます。' },
+    { key: 'absent_propose',  filename: 'a3_absent_propose.mp3',  text: 'それは失礼いたしました。例えば、明日の午後であればご迷惑ではないでしょうか？' },
+    { key: 'absent_close',    filename: 'a4_absent_close.mp3',    text: '承知いたしました。ありがとうございます。また改めてお電話いたします。' },
+];
+
 // 名乗りの声＝性別ごとに1つに固定（画面 lib/gender.ts の DECIDED_VOICES と揃える）＝男性 Shohei／女性 Sakura
 export const DECIDED_VOICE_BY_GENDER = { male: 'NO5A3b3sSzDyJQF7MiNS', female: 'RBnMinrYKeccY3vaUxlZ' };
 // 名前の後の間＝一続きで作った時の「〜と申します。」の後の間（0.62 秒）に揃える（2026-10-07 試し・Tom「ますぅと営業代行の間に違和感」→ 0.42 秒足して「違和感なし」）

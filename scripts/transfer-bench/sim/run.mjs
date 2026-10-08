@@ -105,6 +105,9 @@ const CLIPS = [
 // 名前で名乗る声セット（2026-10-07）＝name_lead と受付の答え2本・資料送付は流した後に CM へ
 const NAME_CLIPS = ['name_lead', 'addressee', 'send_material']
     .map((key, i) => ({ id: `clip-n${i}`, key, clip_type: 'response', filename: `${key}.mp3`, text: key, active: true, audio_ready: true, sort_order: 20 + i }));
+// 不在の流れの4本（2026-10-08）＝absentSet の場面だけ
+const ABSENT_SET = ['absent_ask', 'absent_time_ack', 'absent_propose', 'absent_close']
+    .map((key, i) => ({ id: `clip-a${i}`, key, clip_type: 'response', filename: `${key}.mp3`, text: key, active: true, audio_ready: true, sort_order: 30 + i }));
 const NAME_INTENTS = [
     { name: 'addressee', action: 'play_audio', audio_key: 'addressee', is_transfer: false, end_call: false },
     { name: 'material_request', action: 'play_audio', audio_key: 'send_material', is_transfer: false, end_call: false, then_agent: true },
@@ -115,7 +118,7 @@ const json = (res, code, obj, headers = {}) => { res.writeHead(code, { 'Content-
 
 function restRows(table) {
     if (table === 'call_playbooks') return [{ id: 'pb-1', tenant_id: TENANT, project_id: PROJECT, is_active: true, company_name: 'テスト株式会社', voice: 'shimmer', audio_base_path: 'sim', voice_gender: 'male' }];
-    if (table === 'audio_clips') return sc.nameSet ? [...CLIPS, ...NAME_CLIPS] : CLIPS;
+    if (table === 'audio_clips') return [...CLIPS, ...(sc.nameSet ? NAME_CLIPS : []), ...(sc.absentSet ? ABSENT_SET : [])];
     if (table === 'call_intents') return [...INTENTS, ...(sc.nameSet ? NAME_INTENTS : [])].map((i, n) => ({ ...i, triggers: [i.name], sort_order: n + 1, active: true }));
     if (table === 'transfer_settings') return sc.settings ? [{ ...sc.settings, tenant_id: TENANT, project_id: null }] : [];
     if (table === 'user_profiles') {
@@ -374,7 +377,8 @@ const SCENARIOS = {
         settings: V2('strict'),
         timeline: [
             { kind: 'silence', ms: 6000 }, { kind: 'music', ms: 11000 },
-            { kind: 'silence', ms: 1200 }, { kind: 'speech', ms: 1800, text: 'お電話代わりました、山田です。' },
+            // 名乗りは聞き返しの後に置く（保留音の後の「はい」＋聞き返しの間に話した声はもともと捨てる＝話し終わりの間を 0.8秒にした 2026-10-08 に 1.2秒→3秒）
+            { kind: 'silence', ms: 3000 }, { kind: 'speech', ms: 1800, text: 'お電話代わりました、山田です。' },
         ],
         haiku: haikuFor([['代わりました', 'transfer']]),
         maxMs: 35000,
@@ -416,7 +420,8 @@ const SCENARIOS = {
             if (!resultsSaved(r).includes('transferred')) errs.push(`結果が transferred でない: ${resultsSaved(r)}`);
             const end = r.log.find((l) => /\[vad\] speech end/.test(l.line));
             const enq = r.log.find((l) => /committed \(handover/.test(l.line));
-            if (end && enq && enq.at - end.at > 1500) errs.push(`話し終わりから取次まで ${enq.at - end.at}ms（1.5秒を超えた）`);
+            // 話し終わりの間（0.8秒・2026-10-08 森さん「返しが早い」）＋文字起こし＝1.8秒まで
+            if (end && enq && enq.at - end.at > 1800) errs.push(`話し終わりから取次まで ${enq.at - end.at}ms（1.8秒を超えた）`);
             return errs;
         },
     },
@@ -484,7 +489,8 @@ const SCENARIOS = {
             { kind: 'silence', ms: 6000 },
             { kind: 'speech', ms: 1500, text: '少々お待ちください。' },
             { kind: 'music', ms: 14000 },
-            { kind: 'silence', ms: 800 },
+            // 保留音と名乗りの間＝話し終わりの間（0.8秒・2026-10-08）より長く置く（同じ長さだと保留音とつながって1発話になる＝取次はするが名乗りの後半を文字起こしに回さない）
+            { kind: 'silence', ms: 1200 },
             { kind: 'speech', ms: 2000, text: 'お電話代わりました、山田です。' },
         ],
         haiku: haikuFor([['少々お待ち', 'transfer'], ['代わりました', 'transfer']]),
@@ -730,11 +736,205 @@ const SCENARIOS = {
         doneWhen: (log) => log.some((l) => /✓ Finished reason/.test(l.line)),
         check(r) {
             const errs = [];
-            if (!has(r, /\[merge\] caller continued/)) errs.push('処理中の続きの言葉で判定を捨てていない');
+            // 「あ、」はつなぎ言葉＝文字起こしの前に続きが来ればつなぎ直し（merge）、後なら言いかけの待ち（held）からつなぐ
+            if (!has(r, /\[merge\] caller continued|\[held\] caller continued/)) errs.push('処理中の続きの言葉で判定を捨てていない');
             if (!r.sttTexts.includes('あ、用件はなんですか？')) errs.push(`つないだ発話を文字起こししていない: ${JSON.stringify(r.sttTexts)}`);
             if (!has(r, /Playing reason/)) errs.push('用件の答えを流していない');
             if (has(r, /Playing pardon/)) errs.push('聞き返しを流した');
             const e = covered(r, '用件はなんですか？'); if (e) errs.push(e);
+            return errs;
+        },
+    },
+    // ===== 2026-10-08 森さんの FB（家＝~/sente/sente_aivoice_canonical.md §3「📐 実装の計画 v3」）=====
+    // 言いかけ（「〜の者が」）＝返さずに待ち、続きとつないで判定（実物＝「今、営業の責任者のもの。」で聞き返した）
+    incomplete_then_rest: {
+        settings: V2(),
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1400, text: '今、営業の責任者の者が' }, { kind: 'silence', ms: 1300 },
+            { kind: 'speech', ms: 1500, text: '席を外しております。' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: haikuFor([['席を外し', 'not_available']]),
+        maxMs: 22000,
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[held\] incomplete utterance/)) errs.push('言いかけで待っていない');
+            if (has(r, /Playing pardon/)) errs.push('聞き返しを流した');
+            if (has(r, /Playing hai /) && lines(r, /Playing hai /).length > 1) errs.push('「はい」を2回流した');
+            if (!r.sttTexts.includes('今、営業の責任者の者が席を外しております。')) errs.push(`つないだ発話を文字起こししていない: ${JSON.stringify(r.sttTexts)}`);
+            if (!resultsSaved(r).includes('not_available')) errs.push(`結果が not_available でない: ${resultsSaved(r)}`);
+            return errs;
+        },
+    },
+    // つなぎ言葉だけで黙った＝1.5秒待ってから、文字起こしをやり直さずに判定（聞き返し）
+    incomplete_timeout: {
+        settings: V2(),
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 700, text: 'えっと、' }, { kind: 'silence', ms: 8000 }],
+        haiku: () => 'reason', // AI に回したら用件の答えになる＝回していないことを見る
+        maxMs: 14000,
+        doneWhen: (log) => log.some((l) => /✓ Finished pardon/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[held\] no continuation/)) errs.push('期限で判定に戻っていない');
+            if (r.events.filter((e) => e.t === 'stt' && e.text === 'えっと、').length !== 1) errs.push('同じ発話を2回文字起こしした');
+            if (!has(r, /Playing pardon/)) errs.push('聞き返しを流していない');
+            if (r.events.some((e) => e.t === 'haiku')) errs.push('つなぎ言葉だけを AI に回した');
+            if (has(r, /Playing hai /)) errs.push('「はい」を流した');
+            const end = r.log.find((l) => /\[vad\] speech end/.test(l.line));
+            const pardon = r.log.find((l) => /Playing pardon/.test(l.line));
+            if (end && pardon && pardon.at - end.at < 1500) errs.push(`待たずに返した（${pardon.at - end.at}ms）`);
+            return errs;
+        },
+    },
+    // 「もう一度」＝あいさつを名乗りから流し直す（聞き返しにしない・AI を待たない）
+    repeat_greeting: {
+        settings: V2(),
+        nameSet: true,
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1200, text: 'すいません、もう一度。' }, { kind: 'silence', ms: 6000 }],
+        haiku: () => 'reprompt',
+        maxMs: 16000,
+        doneWhen: (log) => log.filter((l) => /✓ Finished greeting/.test(l.line)).length >= 2,
+        check(r) {
+            const errs = [];
+            if (has(r, /Playing pardon/)) errs.push('聞き返しを流した');
+            if (r.events.some((e) => e.t === 'haiku')) errs.push('AI を待った');
+            if (lines(r, /Playing name_lead/).length < 2) errs.push('名乗りから流し直していない');
+            if (lines(r, /Playing greeting/).length < 2) errs.push('あいさつを流し直していない');
+            if (has(r, /Playing hai /)) errs.push('「はい」を流した');
+            return errs;
+        },
+    },
+    // 不在 → 戻りの時間を聞く → 時刻を言われた＝そのお時間に → 折り返し予定・再コールの日時を記録
+    absent_time: {
+        settings: V2(),
+        absentSet: true,
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '担当者は本日外出しております。' }, { kind: 'silence', ms: 5000 },
+            { kind: 'speech', ms: 1300, text: '16時には戻ります。' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: haikuFor([['外出', 'not_available']]),
+        maxMs: 24000,
+        check(r) {
+            const errs = [];
+            if (!has(r, /Playing absent_ask/)) errs.push('戻りの時間を聞いていない');
+            if (!has(r, /Playing absent_time_ack/)) errs.push('「そのお時間に」を流していない');
+            if (has(r, /Playing sorry_disturb/)) errs.push('辞去で切った');
+            if (r.events.filter((e) => e.t === 'haiku').length !== 1) errs.push('段の答えで AI を待った');
+            if (!resultsSaved(r).includes('callback_scheduled')) errs.push(`結果が callback_scheduled でない: ${resultsSaved(r)}`);
+            const md = r.events.find((e) => e.t === 'PATCH' && e.table === 'call_sessions' && e.payload?.metadata?.recall_at);
+            if (!md) errs.push('再コールの日時を書いていない');
+            else if (!/T07:00:00/.test(md.payload.metadata.recall_at)) errs.push(`再コールの日時が16時（JST）でない: ${md.payload.metadata.recall_at}`);
+            return errs;
+        },
+    },
+    // 不在 → 分からない → 「明日の午後は」→ はい＝明日13時
+    absent_unknown_yes: {
+        settings: V2(),
+        absentSet: true,
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '担当者は本日外出しております。' }, { kind: 'silence', ms: 5000 },
+            { kind: 'speech', ms: 1300, text: 'ちょっと分からないです。' }, { kind: 'silence', ms: 4500 },
+            { kind: 'speech', ms: 1000, text: 'はい、大丈夫です。' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: haikuFor([['外出', 'not_available']]),
+        maxMs: 30000,
+        check(r) {
+            const errs = [];
+            for (const k of ['absent_ask', 'absent_propose', 'absent_close']) if (!has(r, new RegExp(`Playing ${k}`))) errs.push(`${k} を流していない`);
+            if (!resultsSaved(r).includes('callback_scheduled')) errs.push(`結果が callback_scheduled でない: ${resultsSaved(r)}`);
+            const md = r.events.find((e) => e.t === 'PATCH' && e.table === 'call_sessions' && e.payload?.metadata?.recall_at);
+            if (!md || !/T04:00:00/.test(md.payload.metadata.recall_at)) errs.push(`再コールの日時が13時（JST）でない: ${md?.payload?.metadata?.recall_at}`);
+            return errs;
+        },
+    },
+    // 設定の無い通話でも同じ流れ＝分からない → 明日は無理＝不在で終話（再コールの日時は書かない）
+    absent_unknown_no_legacy: {
+        settings: null,
+        absentSet: true,
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '担当者は本日外出しております。' }, { kind: 'silence', ms: 5000 },
+            { kind: 'speech', ms: 1300, text: '分からないです。' }, { kind: 'silence', ms: 4500 },
+            { kind: 'speech', ms: 1000, text: '明日はちょっと無理です。' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: haikuFor([['外出', 'not_available']]),
+        maxMs: 30000,
+        check(r) {
+            const errs = [];
+            for (const k of ['absent_ask', 'absent_propose', 'absent_close']) if (!has(r, new RegExp(`Playing ${k}`))) errs.push(`${k} を流していない`);
+            if (!resultsSaved(r).includes('not_available')) errs.push(`結果が not_available でない: ${resultsSaved(r)}`);
+            if (r.events.some((e) => e.t === 'PATCH' && e.table === 'call_sessions' && e.payload?.metadata?.recall_at)) errs.push('NO なのに再コールの日時を書いた');
+            return errs;
+        },
+    },
+    // 戻りの時間を聞いている最中に「別の者に代わりますので少々お待ちください」＝段を抜けて待機へ
+    absent_escape_to_wait: {
+        settings: V2(),
+        absentSet: true,
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '担当者は本日外出しております。' }, { kind: 'silence', ms: 5000 },
+            { kind: 'speech', ms: 2200, text: '担当は不在ですが、別の者に代わりますので少々お待ちください。' }, { kind: 'silence', ms: 4000 },
+        ],
+        haiku: haikuFor([['少々お待ち', 'wait'], ['外出', 'not_available']]),
+        maxMs: 26000,
+        doneWhen: (log) => log.some((l) => /\[wait\] entered/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /Playing absent_ask/)) errs.push('戻りの時間を聞いていない');
+            if (!has(r, /\[absent\] left stage asked/)) errs.push('取次の言葉で段を抜けていない');
+            if (!has(r, /\[wait\] entered/)) errs.push('待機に入っていない');
+            if (has(r, /Playing absent_propose/)) errs.push('取次の言葉なのに明日の午後を出した');
+            return errs;
+        },
+    },
+    // 4本の無い声セット＝今までどおり辞去で終話
+    absent_without_clips: {
+        settings: V2(),
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '担当者は本日外出しております。' }, { kind: 'silence', ms: 6000 }],
+        haiku: haikuFor([['外出', 'not_available']]),
+        maxMs: 16000,
+        check(r) {
+            const errs = [];
+            if (has(r, /Playing absent_/)) errs.push('4本が無いのに不在の流れへ入った');
+            if (!has(r, /Playing sorry_disturb/)) errs.push('辞去を流していない');
+            if (!resultsSaved(r).includes('not_available')) errs.push(`結果が not_available でない: ${resultsSaved(r)}`);
+            return errs;
+        },
+    },
+    // 待機中に「不在でした」＝待機を出て戻りの時間を聞く
+    absent_in_wait: {
+        settings: V2(),
+        absentSet: true,
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'silence', ms: 4000 },
+            { kind: 'speech', ms: 1800, text: '申し訳ございません、担当は外出しておりまして。' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: haikuFor([['少々お待ち', 'wait'], ['外出', 'not_available']]),
+        maxMs: 22000,
+        doneWhen: (log) => log.some((l) => /✓ Finished absent_ask/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[wait\] entered/)) errs.push('待機に入っていない');
+            if (!has(r, /Playing absent_ask/)) errs.push('待機の後の不在で戻りの時間を聞いていない');
+            if (has(r, /Playing sorry_disturb/)) errs.push('辞去で切った');
+            return errs;
+        },
+    },
+    // 保留音の無い待機（森さんの携帯）＝黙って待ち、本人の名乗りで取次1回
+    silent_wait_handover: {
+        settings: V2(),
+        timeline: [
+            { kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: '少々お待ちください。' }, { kind: 'silence', ms: 12000 },
+            { kind: 'speech', ms: 1800, text: 'お電話代わりました、森です。' },
+        ],
+        haiku: haikuFor([['少々お待ち', 'wait'], ['代わりました', 'transfer']]),
+        maxMs: 30000,
+        doneWhen: (log, ev) => ev.some((e) => e.t === 'twilio' && e.path.endsWith('/Calls.json')),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[wait\] entered/)) errs.push('待機に入っていない');
+            if (!has(r, /\[decide\] step=2h action=transfer_fast/)) errs.push('名乗りで最速の取次になっていない');
+            if (lines(r, /\[transfer\] committed/).length !== 1) errs.push('取次が1回でない');
+            if (has(r, /Playing pardon/)) errs.push('黙っている間に聞き返した');
+            if (!resultsSaved(r).includes('transferred')) errs.push(`結果が transferred でない: ${resultsSaved(r)}`);
             return errs;
         },
     },
@@ -830,7 +1030,8 @@ const SCENARIOS = {
         doneWhen: (log) => log.some((l) => /✓ Finished reason/.test(l.line)),
         check(r) {
             const errs = [];
-            if (!has(r, /\[merge\] caller continued/)) errs.push('処理中の続きの言葉で判定を捨てていない');
+            // 「あ、」はつなぎ言葉＝文字起こしの前に続きが来ればつなぎ直し（merge）、後なら言いかけの待ち（held）からつなぐ
+            if (!has(r, /\[merge\] caller continued|\[held\] caller continued/)) errs.push('処理中の続きの言葉で判定を捨てていない');
             if (!has(r, /Playing reason/)) errs.push('用件の答えを流していない');
             if (has(r, /Playing pardon/)) errs.push('聞き返しを流した');
             return errs;
