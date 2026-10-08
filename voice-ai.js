@@ -15,7 +15,7 @@ import ffmpegStatic from 'ffmpeg-static';
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_v3';
-const SCRIPT_MODEL = process.env.SCRIPT_MODEL || 'claude-opus-5';
+const SCRIPT_MODEL = process.env.SCRIPT_MODEL || 'claude-opus-5-5';   // 2026-10-08 Opus 5→5.5
 
 const MAX_TAKES_PER_CLIP = 4;
 const MAX_CLIP_CHARS = 200;

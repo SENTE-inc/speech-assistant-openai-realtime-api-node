@@ -1996,8 +1996,9 @@ ${log}
   "next_call_date": "次回架電日（YYYY-MM-DD形式）。callback_scheduledの場合はコールバック情報から推測。rejectedは空文字。それ以外は3営業日後"
 }`;
             const resp = await anthropic.messages.create({
-                model: 'claude-sonnet-4-6',
-                max_tokens: 1024,
+                // 2026-10-08 Sonnet 4.6→5.5＝思考が既定で入る（effort high）＝枠を思考と本文の合算で 4000 に
+                model: 'claude-sonnet-5-5',
+                max_tokens: 4000,
                 messages: [{ role: 'user', content: prompt }],
             });
             const text = resp.content.find((b) => b.type === 'text')?.text || '';
