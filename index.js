@@ -844,8 +844,10 @@ async function transferCall(callSid, agentPhone) {
 // 相手の通話は <Enqueue>（保留音）に移し、CM のブラウザ（Twilio Voice SDK）へ
 // 別の1本を鳴らして <Dial><Queue> でつなぐ。10秒出なければその CM を離席にして次の人へ。
 // 誰もいなければ「改めてご連絡いたします」の録音を流して切り、要再架電を付ける。
+// 既定は Twilio の保留音を https で（監査）＝バケット名に「.」が入るので仮想ホスト形式の https は証明書が合わない。
+// パス形式（s3.amazonaws.com/<bucket>/…）なら https で同じ物（ETag 一致・2026-10-09 確認）が返る。
 const HOLD_MUSIC_URL = process.env.HOLD_MUSIC_URL
-    || 'http://com.twilio.sounds.music.s3.amazonaws.com/MARKOVICHAMP-Borghestral.mp3';
+    || 'https://s3.amazonaws.com/com.twilio.sounds.music/MARKOVICHAMP-Borghestral.mp3';
 const AGENT_RING_TIMEOUT_S = parseInt(process.env.AGENT_RING_TIMEOUT_S || '10', 10);
 // 保留の上限（秒・レビュー C4）＝超えたら保留から出して「改めてご連絡いたします」で切る。
 // 保留音を1曲ごとに取りに来させてここで見る＝エンジンが再起動して handoffs が消えても止まる。
