@@ -786,7 +786,12 @@ async function classifyWithClaude(transcript, ctx = {}, prompt) {
 // transfer-logic.js へ移した＝試験 scripts/transfer-bench/ が同じ物を import する（2026-10-05）。
 
 // 日本の番号だけにかける（レビュー C2）＝国外・高額番号へ SENTE の Twilio で発信しない。
-const isJapaneseE164 = (p) => /^\+81\d{9,10}$/.test(String(p || ''));
+// 0990（ダイヤルQ2）・0570（ナビダイヤル）・0180（テレドーム）は掛けた側に課金される番号＝かけない（監査 2026-10-09）。
+const PREMIUM_JP_PREFIX = /^\+81(990|570|180)/;
+const isJapaneseE164 = (p) => {
+    const s = String(p || '');
+    return /^\+81\d{9,10}$/.test(s) && !PREMIUM_JP_PREFIX.test(s);
+};
 // ログに電話番号を出さない（レビュー D1）＝末尾4桁だけ。
 const maskPhone = (p) => {
     const s = String(p || '');
