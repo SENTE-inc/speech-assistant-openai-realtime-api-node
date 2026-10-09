@@ -10,6 +10,7 @@ import ffmpegStatic from 'ffmpeg-static';
 import { spawn } from 'node:child_process';
 import {
     hasSufficientTransferEvidence, buildClassifierPrompt, buildTranscriptionPrompt,
+    classifierIntentNames, sanitizeClassifierResult,
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
     decideFastHandover, decideAfterClassifierV2, decideHold, isWordless,
     isIncompleteUtterance, isFillerWordsOnly, isRepeatRequest, classifyAbsentReply, parseRecallAt, retryIntervalFor,
@@ -753,7 +754,12 @@ async function classifyWithClaude(transcript, ctx = {}, prompt) {
             if (start < 0 || end < 0) throw new Error('No JSON found');
             const parsed = JSON.parse(raw.slice(start, end + 1));
             if (!parsed.intent) throw new Error('Missing intent');
-            return parsed;
+            // 一覧に無い intent は信じない（監査 Low 6）＝null にして呼び手の「知らない intent」の道へ
+            const clean = sanitizeClassifierResult(parsed, ctx.validIntents);
+            if (clean.reason === 'invalid_intent') {
+                console.log(`[claude] intent not in playbook ("${clean.raw_intent}"); treating as unknown`);
+            }
+            return clean;
         } catch (err) {
             const isOverloaded = err?.status === 529;
             if (isOverloaded && attempt < MAX_ATTEMPTS) {
@@ -4198,6 +4204,7 @@ fastify.register(async (fastify) => {
                 company: callParams?.company,
                 contact: callParams?.contact,
                 afterHold: inWait,
+                validIntents: classifierIntentNames(cfg.intents, ts),
             }, cfg.classifierPrompt);
             console.log(
                 `[timing] Claude done in ${Date.now() - claudeT0}ms (total ${Date.now() - t0}ms): ` +

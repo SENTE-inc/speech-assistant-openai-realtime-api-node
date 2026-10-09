@@ -81,6 +81,36 @@ export function buildClassifierPrompt(cfg, ts = null) {
         `{ "intent": "<上記nameのいずれか>", "callback_info": "<日時情報があれば。無ければ省略>" }`;
 }
 
+// Haiku が返してよい intent の名前＝プロンプトに載せた物だけ（監査 Low 6）。
+// 台本の call_intents の name ＋ 設定が在る時の wait ＋ プロンプトの判断文が名指しする reprompt／openai_realtime。
+export const PROMPT_FALLBACK_INTENTS = ['reprompt', 'openai_realtime'];
+export function classifierIntentNames(intents, ts = null) {
+    const names = new Set(PROMPT_FALLBACK_INTENTS);
+    for (const i of intents || []) if (i?.name) names.add(i.name);
+    if (ts) names.add('wait');
+    return names;
+}
+
+// Haiku の答え（JSON を読んだ物）を、エンジンが使ってよい形に絞る。
+// 一覧に無い intent・文字列でない intent は null にする＝呼び手の「知らない intent」の道
+// （設定なし＝fallbackToAgent・設定あり＝decideAfterClassifier の intentDef=null）へ行く。
+// callback_info は文字列だけ残す（DB にテキストとして書くだけ）。
+export function sanitizeClassifierResult(parsed, validNames) {
+    const intent = typeof parsed?.intent === 'string' ? parsed.intent.trim() : '';
+    const out = {};
+    if (typeof parsed?.callback_info === 'string' && parsed.callback_info.trim()) {
+        out.callback_info = parsed.callback_info.slice(0, 500);
+    }
+    if (intent && (!validNames || validNames.has(intent))) {
+        out.intent = intent;
+    } else {
+        out.intent = null;
+        out.reason = 'invalid_intent';
+        out.raw_intent = String(parsed?.intent ?? '').slice(0, 64);
+    }
+    return out;
+}
+
 // Vocabulary hint for STT — biases gpt-transcribe toward this tenant's
 // expected phrases so homophones (e.g. 代表/対象) resolve correctly.
 // Sample a couple of triggers per intent so the hint stays balanced across
