@@ -1477,6 +1477,17 @@ async function purgeExpiredDecisions() {
     return data || 0;
 }
 
+// 文字起こしも録音と同じ保持日数で消す（監査 2026-10-09・Tom「30日でgo」＝DB の purge_call_transcripts）
+async function purgeExpiredTranscripts() {
+    const { data, error } = await supabase.rpc('purge_call_transcripts');
+    if (error) {
+        console.error('[transcripts] purge failed:', error.message);
+        return 0;
+    }
+    if (data) console.log(`[transcripts] purged ${data} expired row(s)`);
+    return data || 0;
+}
+
 async function purgeExpiredRecordings() {
     const { data: expired, error } = await supabase
         .from('call_recordings')
@@ -1587,6 +1598,7 @@ fastify.post('/recording-status', async (request, reply) => {
         console.log(`✓ [recording] saved ${storagePath} (${mp3.length} bytes, expires=${expiresAt || 'never'})`);
         purgeExpiredRecordings().catch((e) => console.error('[recording] purge error:', e));
         purgeExpiredDecisions().catch((e) => console.error('[decision-log] purge error:', e));
+        purgeExpiredTranscripts().catch((e) => console.error('[transcripts] purge error:', e));
         return reply.send({ ok: true });
     } catch (err) {
         // The recording stays on Twilio (we delete only after success), so a
@@ -1603,7 +1615,8 @@ fastify.post('/purge-recordings', async (request, reply) => {
     }
     const recordings = await purgeExpiredRecordings();
     const decisions = await purgeExpiredDecisions().catch(() => 0);
-    return reply.send({ ...recordings, decisions });
+    const transcripts = await purgeExpiredTranscripts().catch(() => 0);
+    return reply.send({ ...recordings, decisions, transcripts });
 });
 
 // =====================================================================
