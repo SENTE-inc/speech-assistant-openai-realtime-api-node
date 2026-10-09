@@ -1648,33 +1648,6 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         err.code = 'NON_JP_NUMBER';
         throw err;
     }
-    const qs = new URLSearchParams({
-        company: contact.company_name || '',
-        contact: contact.contact_name || '',
-        phone: contact.phone_number,
-        agent_phone: ctx.agent_phone || '',
-        agent_name: ctx.agent_name || '',
-        tenant_id: ctx.tenant_id || '',
-        operator_id: ctx.operator_id || '',
-        operator_gender: parseVoiceGender(ctx.operator_gender) || '',
-        project_id: ctx.project_id || '',
-        contact_id: ctx.contact_id || '',
-    });
-    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
-    const form = new URLSearchParams({
-        To: contact.phone_number,
-        // プロジェクトの番号（作る順番の6番目）があればそれ、無ければ共通の番号
-        From: ctx.from_number || TWILIO_FROM_NUMBER,
-        Url: `${baseUrl}/incoming-call?${qs.toString()}`,
-        StatusCallback: TWILIO_STATUS_CALLBACK_URL || `${baseUrl}/call-status`,
-        StatusCallbackMethod: 'POST',
-        TimeLimit: String(CALL_TIME_LIMIT_S),
-        Record: 'true',
-        RecordingChannels: 'dual',
-        RecordingStatusCallback: `${baseUrl}/recording-status`,
-        RecordingStatusCallbackMethod: 'POST',
-    });
-
     // Make the local session durable BEFORE dialing so a fast status/recording
     // callback can never hit "session not found". We create the row with a
     // synthetic provisional call_sid (no Twilio sid yet), then patch in the
@@ -1698,6 +1671,34 @@ async function placeOutboundCall(baseUrl, contact, ctx) {
         // a durable session would strand the recording/status callbacks.
         throw new Error(`session pre-insert failed: ${sInsErr.message}`);
     }
+
+    // 客の社名・担当者名・電話番号は Url に載せない（監査 Low 5）＝Twilio は Url を自分のログに残す。
+    // 代わりに上で作った call_sessions の行の id（session_id）を渡し、/incoming-call がその行から引く。
+    // agent_phone／agent_name は自社の CM＝そのまま。
+    const qs = new URLSearchParams({
+        session_id: String(sessionRow.id),
+        agent_phone: ctx.agent_phone || '',
+        agent_name: ctx.agent_name || '',
+        tenant_id: ctx.tenant_id || '',
+        operator_id: ctx.operator_id || '',
+        operator_gender: parseVoiceGender(ctx.operator_gender) || '',
+        project_id: ctx.project_id || '',
+        contact_id: ctx.contact_id || '',
+    });
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    const form = new URLSearchParams({
+        To: contact.phone_number,
+        // プロジェクトの番号（作る順番の6番目）があればそれ、無ければ共通の番号
+        From: ctx.from_number || TWILIO_FROM_NUMBER,
+        Url: `${baseUrl}/incoming-call?${qs.toString()}`,
+        StatusCallback: TWILIO_STATUS_CALLBACK_URL || `${baseUrl}/call-status`,
+        StatusCallbackMethod: 'POST',
+        TimeLimit: String(CALL_TIME_LIMIT_S),
+        Record: 'true',
+        RecordingChannels: 'dual',
+        RecordingStatusCallback: `${baseUrl}/recording-status`,
+        RecordingStatusCallbackMethod: 'POST',
+    });
 
     let callSid;
     try {
@@ -2691,9 +2692,24 @@ fastify.all('/incoming-call', async (request, reply) => {
     // query は Fastify がもうデコード済み＝もう一度 decodeURIComponent すると、社名の「%」
     // （例「100%ジュース」）で URIError → 500 になり、相手に「application error」が流れて切れる（レビュー E1）。
     const q = (key, fallback = '') => xmlEsc(String(request.query[key] || fallback));
-    const company = q('company', 'unknown');
-    const contact = q('contact', 'unknown');
-    const phone = q('phone', 'unknown');
+    // 客の社名・担当者名・番号は session_id から call_sessions を引く（監査 Low 5＝Url に客の情報を載せない）。
+    // session_id の無い Url（デプロイ前に発信した通話・sim）は今までどおり query の値を使う。
+    let company = q('company', 'unknown');
+    let contact = q('contact', 'unknown');
+    let phone = q('phone', 'unknown');
+    const sessionId = String(request.query.session_id || '');
+    if (sessionId) {
+        const { data: sess, error: sessErr } = await supabase.from('call_sessions')
+            .select('company_name, contact_name, phone_number')
+            .eq('id', sessionId).maybeSingle();
+        if (sessErr || !sess) {
+            console.error(`[incoming-call] session ${sessionId} lookup failed:`, sessErr?.message || 'not found');
+        } else {
+            company = xmlEsc(String(sess.company_name || 'unknown'));
+            contact = xmlEsc(String(sess.contact_name || 'unknown'));
+            phone = xmlEsc(String(sess.phone_number || 'unknown'));
+        }
+    }
     const agent_phone = q('agent_phone');
     const agent_name = q('agent_name');
     const tenant_id = q('tenant_id');
