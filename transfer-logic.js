@@ -376,7 +376,13 @@ export function decideAfterClassifierV2({ transcript, intentName, intentDef, ts,
         if (g.pass) return { step: '8', action: 'transfer', gate: g.gate, matched: g.matched };
         return { step: '8', action: inWait ? 'continue_wait' : 'reprompt', gate: g.gate, matched: g.matched };
     }
-    if (inWait) return { step: '9', action: 'continue_wait' };
+    if (inWait) {
+        // ⑥ 版7.2＝待機中の答えの無い質問は CM へ（Haiku が否定・質問の答え・待たせるを返した物は上で決まっている）
+        if (isUnansweredQuestionInWait(transcript)) return { step: '9q', action: 'realtime', gate: 'question_in_wait' };
+        return { step: '9', action: 'continue_wait' };
+    }
+    // ⑦ 版7.2＝あいさつ・お礼・相づちだけ＝CM へつながず、つなぎの「はい」を返して続きを聞く
+    if (isCourtesyOnly(transcript)) return { step: '9c', action: 'listen', gate: 'courtesy' };
     if (intentDef?.action === 'reprompt') return { step: '9', action: 'reprompt' };
     return { step: '9', action: 'realtime' };
 }
@@ -580,4 +586,69 @@ export function retryIntervalFor(recallAtIso, now = new Date(), defaultHours = 2
     const sec = Math.round((at - now.getTime()) / 1000);
     if (sec <= 0) return `${defaultHours} hours`;
     return `${sec} seconds`;
+}
+
+// =====================================================================
+// 版7.2（2026-10-10）＝受付からの質問の取りこぼし（家＝~/sente/sfav_transfer_tuning_plan.md「版7.2」）
+// =====================================================================
+
+// step 3q＝社名・名前・宛先・用件を「頼む語」つきで明示に聞かれたら、Haiku を待たずにその答えを流す。
+//   断り・不在・名乗り・確かめ句・つながない句・番号や部署の質問・複数の対象が混ざる発言は決めない（Haiku へ）。
+//   同じ発言に待たせる言い回しが在れば、段ごとに答えの後を決める＝緩い（on_words=transfer）は取次／ふつう・締めるは待機。
+//   呼び手は、返した intent の声が再生できる時だけ使う（声の無い声セットは Haiku の道へ）。
+const ASK_RE = /よろし|お聞き|お聞かせ|お伺い|伺|教え|ですか|でしょうか|ますか|お願い|いただ|頂|ちょうだい|頂戴|もう(?:一|いち)度|もう(?:一|いっ)回|もういっぺん/;
+const ASK_ADDRESSEE_RE = /担当(?:者)?(?:の方)?の(?:お)?名前|どなた(?:様)?(?:宛|あて|に|を)|誰(?:宛|あて)|宛(?:先|名)|どちら様(?:宛|あて)|どの者|どなたをお呼び/;
+const ASK_COMPANY_RE = /社名|会社名|御社名|会社(?:の)?(?:お)?名前|お名前|名前|どちら様|どなた|どちらの会社|どこの会社|お名乗り/;
+const ASK_REASON_RE = /ご?用件|要件|ご用|どういった(?:お|ご)?(?:話|内容|件)|どのような(?:お|ご)?(?:話|内容|件)/;
+const ASK_HAIKU_RE = /番号|部署|メール|住所|ファックス|FAX|何時|いつ/;
+// 自動音声の案内（録音のお知らせ・番号の案内）＝人の質問ではない
+const IVR_RE = /録音(?:させて|して|され|いた|を)|番を押|プッシュ|ガイダンス|ただいま電話に出ること/;
+// 3q で答えない＝既に聞いた・承った（「ご用件は伺っております」）／漢字・読み方・綴り（名乗りの声では答えられない）
+const ASK_NOT_QUESTION_RE = /(?:伺|聞い|お聞きし|承)って(?:おり|い|ます)|漢字|読み|字は|綴り|スペル/;
+// 3q の「待たせる言葉」＝段の wait_phrases に加えて丁寧形（「確認いたします」「確認してまいります」）も拾う（段の言い回しとプロンプトは変えない）
+const ASK_WAIT_EXTRA_RE = /確認(?:いた|致)します|確認してまいります|確認して参ります|お調べします|お調べいたします/;
+// お詫び（「すいません」の中の「いません」）を否定に数えない＝新しい規則だけ（既存の NEGATIVE_RE の使い手は変えない）
+const APOLOGY_RE = /す[いみ]ません|申し訳(?:ござい|あり)ません|恐れ入ります/g;
+const negativeIgnoringApology = (t) => NEGATIVE_RE.test(String(t || '').replace(APOLOGY_RE, ''));
+export function decideAskedQuestion({ transcript, ts }) {
+    if (!ts?.v2) return null;
+    const t = String(transcript || '');
+    if (!ASK_RE.test(t)) return null;
+    if (negativeIgnoringApology(t) || ASK_HAIKU_RE.test(t) || IVR_RE.test(t) || ASK_NOT_QUESTION_RE.test(t)) return null;
+    if (firstMatch(t, ts.block_phrases) || matchHandover(t, ts) || matchPhrases(t, ts.self_confirm_phrases)) return null;
+    // 聞かれた物＝頼む語と同じ文（。！？で区切った1文）の中に在る対象だけ数える。宛先の語を抜いた残りでこちらの社名・名前を見る（「お名前と担当者のお名前」＝2つ＝Haiku へ）
+    const hits = new Set();
+    for (const sent of t.split(/[。！!？?]/)) {
+        if (!sent || !ASK_RE.test(sent)) continue;
+        if (ASK_ADDRESSEE_RE.test(sent)) hits.add('addressee');
+        if (ASK_COMPANY_RE.test(sent.replace(new RegExp(ASK_ADDRESSEE_RE.source, 'g'), ''))) hits.add('company');
+        if (ASK_REASON_RE.test(sent)) hits.add('reason');
+    }
+    if (hits.size !== 1) return null;
+    const [intent] = hits;
+    const waitHit = firstMatch(t, ts.wait_phrases) || (t.match(ASK_WAIT_EXTRA_RE) || [])[0] || null;
+    if (!waitHit) return { step: '3q', action: 'answer', intent, gate: 'asked', matched: null };
+    return ts.on_words === 'transfer'
+        ? { step: '3q', action: 'answer_then_transfer', intent, gate: 'words_asked', matched: waitHit }
+        : { step: '3q', action: 'answer_then_wait', intent, gate: 'words_asked', matched: waitHit };
+}
+
+// ⑥ 待機中に答えの無い質問をされた（Haiku が聞き返し・自由会話・未知）＝黙らず CM へ（待機の外の「答えられない→CM」と揃える）。
+//   質問の形・4字以上・否定の語なし・保留音の空耳でない時だけ（2026-10-10 Tom「繋いじゃおう」）
+const QUESTION_FORM_RE = /[？?]|か[。\s]*$|でしょうか|ですか|ますか/;
+export function isUnansweredQuestionInWait(transcript) {
+    const t = String(transcript || '');
+    // 否定の語が在っても CM へ＝Haiku が不在・断りと取れなかった問いかけ（「担当は席を外していますが、いかがいたしましょうか」）は CM が受ける（Tom「繋いじゃおう」・監査 2026-10-10）
+    return QUESTION_FORM_RE.test(t) && normalizeForTransferGuard(t).length >= 4 && !isWordless(t);
+}
+
+// ⑦ 版7.2＝あいさつ・お礼・相づちだけの発言（「お世話になっております」「ありがとうございます」「かしこまりました」）で CM へつながない。
+//   Haiku が自由会話・聞き返し・未知を返した時だけ使う（待機の外）＝つなぎの「はい」を返して続きを聞く（action='listen'）。
+//   2026-10-06 の試しの架電で「ありがとうございます。」が2回とも CM へ（call_turn_decisions）・録音の流し直しで「答えが無い→CM」157件のうち72件
+const COURTESY_RE = /(?:いつも)?(?:大変)?お世話に(?:なって)?(?:おります|なっております|なります|なりました)|お世話様です|(?:お電話)?(?:誠に|どうも)?ありがとうございます|ありがとうございました|お疲れ様です|お疲れさまです|おつかれさまです|おはようございます|こんにちは|こんばんは|よろしくお願い(?:いた|致)?します|よろしくお願いします|失礼(?:いた|致)?します|かしこまりました|承知(?:いた|致)?しました|承知しました|わかりました|分かりました|恐れ入ります|どうも|はいはい|はい|ええ|ああ|あ|えっと|あの|うん/g;
+export function isCourtesyOnly(transcript) {
+    if (/[？?]/.test(String(transcript || ''))) return false; // 「はい？」「あ？」＝聞き返し＝相づちでない
+    const t = normalizeForTransferGuard(transcript);
+    if (!t) return false;
+    return t.replace(COURTESY_RE, '').length === 0;
 }

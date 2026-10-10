@@ -12,7 +12,7 @@ import {
     hasSufficientTransferEvidence, buildClassifierPrompt, buildTranscriptionPrompt,
     classifierIntentNames, sanitizeClassifierResult,
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
-    decideFastHandover, decideAfterClassifierV2, decideHold, isWordless,
+    decideFastHandover, decideAfterClassifierV2, decideHold, isWordless, decideAskedQuestion, isCourtesyOnly,
     isIncompleteUtterance, isFillerWordsOnly, isRepeatRequest, classifyAbsentReply, parseRecallAt, retryIntervalFor,
     matchHandover, firstMatch, NEGATIVE_RE,
 } from './transfer-logic.js';
@@ -3984,6 +3984,8 @@ fastify.register(async (fastify) => {
             if (d.action === 'wait_enter') { enterWait(); return; } // つなぎの「はい」はこの発話の処理で流れた＝足さない
             if (d.action === 'reprompt') { await repromptOrEnd(); return; }
             if (d.action === 'realtime') { await fallbackToAgent('no scripted answer'); return; }
+            // 版7.2 ⑦＝あいさつ・お礼だけ＝何も流さず続きを聞く（つなぎの「はい」はこの発話の処理で流れた）
+            if (d.action === 'listen') { resumeListening(true); return; }
 
             if (d.action === 'transfer') {
                 leaveWait('transfer'); // 「おつなぎします」の最中に待機の期限で切らない
@@ -4017,11 +4019,31 @@ fastify.register(async (fastify) => {
             }
             state = 'PLAYING';
             disableVad('playing response');
-            await playClip(intentDef.audio_key);
+            const played = await playClip(intentDef.audio_key);
             if (looped) { await endCallWithFarewell('loop_detected'); return; }
             if (intentDef.end_call) { await endCallWithFarewell(intentDef.end_reason || 'rejected'); return; }
             // 流した後に CM へ（資料送付＝送付先は CM が伺う・2026-10-07）
             if (intentDef.then_agent && state === 'PLAYING') { await fallbackToAgent(`then_agent (${intentDef.name})`); return; }
+            // 版7.2＝待たせる言い回しつきの質問に答えた後（段ごと）＝緩いは取次／ふつう・締めるは待機（既に待機中なら期限はそのまま）
+            // 答えの声が流れ切らなかった（取得の失敗・割り込み）・その間に終わった／取次済み／新しい発話に追い越された＝後続へ進まない
+            if ((d.action === 'answer_then_transfer' || d.action === 'answer_then_wait')
+                && (played !== 'done' || aborted || transferCommitted || (meta.stale && meta.stale()))) {
+                if (played === 'missing' && state === 'PLAYING' && !aborted && !transferCommitted) {
+                    // 声が無かった＝答えられない＝待機の外は CM へ（待機中は待ち続ける）＝通常の「声が無い」と同じ扱い
+                    if (meta.inWait) { continueWait(); return; }
+                    await fallbackToAgent('no playable clip');
+                }
+                return;
+            }
+            if (d.action === 'answer_then_transfer' && state === 'PLAYING') {
+                const tIntent = cfg.intents.find((i) => i.is_transfer);
+                await commitTransfer('words', { clipKey: tIntent?.audio_key && cfg.clips.has(tIntent.audio_key) ? tIntent.audio_key : null });
+                return;
+            }
+            if (d.action === 'answer_then_wait' && state === 'PLAYING') {
+                if (waitCtx) resumeListening(true); else enterWait(); // 待機中＝期限を作り直さない（enterWait は deadline を新しくする）
+                return;
+            }
             if (state === 'PLAYING') resumeListening(true);
         };
 
@@ -4179,7 +4201,8 @@ fastify.register(async (fastify) => {
             // 捨てた切れ端は同じ発話の繰り返しの数から外す＝続きが始まった瞬間に外す（つないだ発話の判定より先＝codex レビュー）
             const staleTurn = stale;
             if (!inWait) lastRecorded = { turn, text: transcript };
-            if (!inWait && recordUserUtterance(transcript)) {
+            // 版7.2 ⑦＝あいさつ・お礼・相づちだけ（「はい」の応酬）は同じ発話の繰り返しに数えない＝listen で聞き続ける間に切らない
+            if (!inWait && !isCourtesyOnly(transcript) && recordUserUtterance(transcript)) {
                 await fillerPromise;
                 if (staleTurn()) return;
                 await endCallWithFarewell('loop_detected');
@@ -4190,6 +4213,15 @@ fastify.register(async (fastify) => {
             // 版6＝担当者本人の名乗りは Haiku を待たずに取次（「はい」も取次の声も流さない）
             if (fast) {
                 await actOnDecision(fast, null, null, turnMeta);
+                return;
+            }
+            // 版7.2 step 3q＝社名・名前・宛先・用件を明示に聞かれた＝Haiku を待たずに答える（答える声が在る時だけ・不在の段の途中でも答えて段を保つ）
+            const asked = ts ? decideAskedQuestion({ transcript, ts }) : null;
+            const askedDef = asked ? cfg.intentByName.get(asked.intent) : null;
+            if (asked && askedDef?.audio_key && cfg.clips.has(askedDef.audio_key)) {
+                await fillerPromise;
+                if (state === 'ENDED' || staleTurn()) return;
+                await actOnDecision(asked, askedDef, null, turnMeta);
                 return;
             }
             // 不在の流れの途中＝取次・待たせる言葉が無ければ、段の答えとして AI を待たずに決める
