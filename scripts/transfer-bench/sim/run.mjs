@@ -710,6 +710,26 @@ const SCENARIOS = {
             return errs;
         },
     },
+    // 電話を取った瞬間の「ププッ」（試しの架電の録音10本すべてに在る 0.05秒×2）＝第一声にしない＝受付の名乗りの後にあいさつ
+    answer_pickup_beep: {
+        settings: V2(),
+        timeline: [
+            { kind: 'speech', ms: 60, text: '' }, { kind: 'silence', ms: 40 }, { kind: 'speech', ms: 60, text: '' },
+            { kind: 'silence', ms: 1300 }, { kind: 'speech', ms: 1500, text: 'はい、テスト株式会社です。' }, { kind: 'silence', ms: 6000 },
+        ],
+        haiku: () => 'reprompt',
+        maxMs: 12000,
+        doneWhen: (log) => log.some((l) => /✓ Finished greeting/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!has(r, /\[answer\] ignored a short sound/)) errs.push('ププッを聞き流していない');
+            if (!has(r, /\[answer\] greeting after answered/)) errs.push('名乗りの終わりであいさつしていない');
+            const ends = r.log.map((l, i) => (/\[vad\] speech end/.test(l.line) ? i : -1)).filter((i) => i >= 0);
+            const greet = r.log.findIndex((l) => /Playing (greeting|name_lead)/.test(l.line));
+            if (!(ends.length >= 2 && greet > ends[1])) errs.push('受付の名乗りより前にあいさつを流した');
+            return errs;
+        },
+    },
     // だれも話さない＝2.5秒であいさつ
     answer_quiet: {
         settings: V2(),
