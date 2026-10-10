@@ -40,7 +40,7 @@ test('台本の文が変わった・声が変わった・肉声が混じる → 
     assert.equal(thanksConfig(notReady, V).thanksKey, null);
 });
 
-// 電話を取った瞬間の「ププッ」（約440Hz の澄んだ音）と声を見分ける（録音の実測＝ププッ 0.54〜0.55・声 0.00〜0.01）
+// 電話を取った瞬間の「ププッ」（約440Hz の澄んだ音）と声を見分ける（録音の実測＝ププッ 0.88・短い「はい」0.11・声 0.01）
 test('pickupBeepToneRatio: 440Hz の澄んだ音は高い・倍音の多い声らしい音と雑音は低い', () => {
     const n = 960; // 0.12秒
     const tone = Array.from({ length: n }, (_, i) => Math.round(9000 * Math.sin(2 * Math.PI * 440 * i / 8000)));

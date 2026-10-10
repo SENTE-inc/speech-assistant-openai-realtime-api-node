@@ -719,23 +719,27 @@ export function thanksConfig(clips, voiceId) {
 }
 
 // 電話を取った瞬間の「ププッ」（試しの架電の録音10本すべての相手側の頭に在る 約440Hz・0.05秒×2）を見分ける。
-//   samples＝8kHz の PCM（声の線を越えた枠だけ）。400〜500Hz の1本の音にエネルギーが集まっている割合（0〜1）を返す。
+//   samples＝8kHz の PCM（声の線を越えた枠だけ）。400〜500Hz の1本の音にエネルギーが集まっている割合（0〜1）を返す（録音のププッ 0.88・「はい」0.11）。
 //   声（「はい」）は倍音と子音で広がる＝低い／ププッは澄んだ音＝1 に近い
 export function pickupBeepToneRatio(samples, sampleRate = 8000) {
-    const n = samples.length;
-    if (n < 160) return 0;
-    let total = 0;
-    for (let i = 0; i < n; i++) total += samples[i] * samples[i];
-    if (total === 0) return 0;
-    let best = 0;
-    for (let hz = 400; hz <= 500; hz += 10) {
-        const w = (2 * Math.PI * hz) / sampleRate;
-        const c = 2 * Math.cos(w);
-        let s1 = 0, s2 = 0;
-        for (let i = 0; i < n; i++) { const s0 = samples[i] + c * s1 - s2; s2 = s1; s1 = s0; }
-        const power = s1 * s1 + s2 * s2 - c * s1 * s2; // |X(hz)|^2
-        best = Math.max(best, power);
+    // 20ms ごとに測って音の大きさで重みをつけて平均する（2回の「プッ」の間で波がずれても下がらない）
+    const F = 160;
+    let num = 0, den = 0;
+    for (let off = 0; off + F <= samples.length; off += F) {
+        let total = 0;
+        for (let i = off; i < off + F; i++) total += samples[i] * samples[i];
+        if (total === 0) continue;
+        let best = 0;
+        for (let hz = 400; hz <= 500; hz += 10) {
+            const w = (2 * Math.PI * hz) / sampleRate;
+            const c = 2 * Math.cos(w);
+            let s1 = 0, s2 = 0;
+            for (let i = off; i < off + F; i++) { const s0 = samples[i] + c * s1 - s2; s2 = s1; s1 = s0; }
+            best = Math.max(best, s1 * s1 + s2 * s2 - c * s1 * s2); // |X(hz)|^2
+        }
+        // 純音なら 2·|X|^2/(F·total) ≈ 1
+        num += Math.min(1, (2 * best) / (F * total)) * total;
+        den += total;
     }
-    // 純音なら |X|^2 ≈ (A·n/2)^2・total ≈ A^2·n/2 ⇒ 2·|X|^2/(n·total) ≈ 1
-    return Math.min(1, (2 * best) / (n * total));
+    return den ? num / den : 0;
 }

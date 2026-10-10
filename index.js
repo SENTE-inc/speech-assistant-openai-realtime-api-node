@@ -682,6 +682,98 @@ async function transcribeDetailed(mulawBuffer, prompt) {
     }
 }
 
+// 話している最中から文字起こしを流す口（通話ごとに1本・2026-10-10 Tom「じゃあ0.8秒で」）。
+//   ファイルの文字起こしは言い終わってから音を送るので約1秒かかる（試しの架電で閉じてから 1.03秒）。
+//   こちらは発話の音を 20ms ずつ流しておき、無音 0.3秒で区切る（commit）＝区切ってから 0.5〜0.6秒で文字がそろう（日本からの実測）。
+//   使えない時（つながっていない・設定が通る前・音が欠けた・時間切れ・失敗）は { ok:false } を返す＝呼び手がファイルの文字起こしに戻す。
+//   おかしな事（error・時間切れ）が1回でもあれば、その通話では閉じて以後はファイルだけ（commit と結果の対応がずれると別の発話の文字を返すため＝codex 監査）
+const LIVE_STT_MODEL = 'gpt-live-transcribe';
+const LIVE_STT_TIMEOUT_MS = 2500;
+function createLiveStt(prompt) {
+    let ws = null;
+    let open = false;   // session.updated まで来た（設定が通った）
+    let intact = true;  // 区切りの間の音を全部送れたか（つながる前・切れた後に落とした音があれば false）
+    let bytes = 0;
+    const queue = [];   // commit した順の resolve（committed の item_id と結ぶ）
+    const byItem = new Map();
+    const settle = (resolve, r) => { try { resolve(r); } catch (_) {} };
+    const failAll = (why) => {
+        if (queue.length || byItem.size) console.log(`[live-stt] dropping ${queue.length + byItem.size} pending (${why})`);
+        for (const r of queue.splice(0)) settle(r, { ok: false });
+        for (const r of byItem.values()) settle(r, { ok: false });
+        byItem.clear();
+    };
+    const send = (obj) => { if (open && ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(obj)); return true; } return false; };
+    const kill = (why) => {
+        if (open) console.log(`[live-stt] closed for this call (${why}); file transcription from now on`);
+        open = false;
+        failAll(why);
+        try { ws.removeAllListeners(); ws.on('error', () => {}); ws.terminate(); } catch (_) {}
+    };
+    try {
+        ws = new WebSocket(`${process.env.OPENAI_WSS_BASE || 'wss://api.openai.com'}/v1/realtime?intent=transcription`, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
+    } catch (err) {
+        console.error('[live-stt] connect failed:', err?.message || err);
+        return null;
+    }
+    ws.on('open', () => {
+        intact = false; // 設定が通る前の音は送れていない＝次の発話の始めから使う
+        const transcription = { model: LIVE_STT_MODEL, languages: ['ja'] };
+        if (prompt) transcription.prompt = prompt;
+        ws.send(JSON.stringify({ type: 'session.update', session: { type: 'transcription', audio: { input: { format: { type: 'audio/pcmu' }, transcription, turn_detection: null } } } }));
+    });
+    ws.on('message', (raw) => {
+        let m;
+        try { m = JSON.parse(raw.toString()); } catch (_) { return; }
+        if (m.type === 'session.updated') {
+            if (!open) console.log('[live-stt] ready');
+            open = true;
+        } else if (m.type === 'input_audio_buffer.committed') {
+            const r = queue.shift();
+            if (r) byItem.set(m.item_id, r);
+        } else if (m.type === 'conversation.item.input_audio_transcription.completed') {
+            const r = byItem.get(m.item_id);
+            if (r) { byItem.delete(m.item_id); settle(r, { ok: true, text: String(m.transcript || '').trim() }); }
+        } else if (m.type === 'conversation.item.input_audio_transcription.failed') {
+            const r = byItem.get(m.item_id);
+            if (r) { byItem.delete(m.item_id); settle(r, { ok: false }); }
+            console.error('[live-stt] transcription failed:', m.error?.message || '');
+        } else if (m.type === 'error') {
+            console.error('[live-stt] error:', m.error?.code || '', m.error?.message || '');
+            kill('error');
+        }
+    });
+    ws.on('close', () => kill('closed'));
+    ws.on('error', (err) => { console.error('[live-stt] ws error:', err?.message || err); kill('ws error'); });
+    return {
+        // 発話の始め＝前の区切りの残りを捨てて、この発話の音（先読み込み）から送り直す
+        start(audio) {
+            if (!send({ type: 'input_audio_buffer.clear' })) { intact = false; return; }
+            intact = true;
+            bytes = 0;
+            this.append(audio);
+        },
+        append(audio) {
+            if (!audio?.length) return;
+            if (!send({ type: 'input_audio_buffer.append', audio: audio.toString('base64') })) { intact = false; return; }
+            bytes += audio.length;
+        },
+        // 区切る＝ここまでの音の文字起こしを待つ。使えない時は即 { ok:false }
+        commit() {
+            if (!intact || bytes < 800 || !send({ type: 'input_audio_buffer.commit' })) return Promise.resolve({ ok: false });
+            bytes = 0;
+            intact = false; // 次の start まで追記しない
+            return new Promise((resolve) => {
+                let done = false;
+                const once = (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } };
+                const timer = setTimeout(() => { once({ ok: false }); kill('timed out'); }, LIVE_STT_TIMEOUT_MS);
+                queue.push(once);
+            });
+        },
+        close() { kill('call ended'); },
+    };
+}
+
 async function transcribeWhisper(mulawBuffer, prompt) {
     const text = await transcribeWhisperRaw(mulawBuffer, prompt);
     return text === undefined ? null : text;
@@ -2935,10 +3027,10 @@ fastify.register(async (fastify) => {
         // 💥 森さんの試しの電話＝電話の録音の案内とあいさつが重なり、想定外の返事から自由会話へ落ちた
         const ANSWER_QUIET_MS = 2500; // だれも話さなければこの時間であいさつ
         const ANSWER_MAX_MS = 8000;   // 相手が話し続けても（録音の案内など）この時間であいさつ
-        // ププッの見分け＝声の線を越えた枠が 0.3秒未満・400〜500Hz の1本の音に 30% 以上が集まる
-        //   （録音10本のププッは 0.12秒・0.54〜0.55／短い「はい」・人の声は 0.00〜0.01＝2026-10-10 実測）
+        // ププッの見分け＝声の線を越えた枠が 0.3秒未満・400〜500Hz の1本の音に 50% 以上が集まる（20ms ごとに測った平均）
+        //   （録音10本のププッは 0.12秒・0.88／短い「はい」0.11・人の声 0.01＝2026-10-10 実測）
         const ANSWER_BEEP_MAX_S = 0.3;
-        const ANSWER_BEEP_MIN_RATIO = 0.3;
+        const ANSWER_BEEP_MIN_RATIO = 0.5;
         const pickupBeepOf = (mulaw) => {
             const voiced = [];
             for (let i = 0; i + 160 <= mulaw.length; i += 160) {
@@ -2987,6 +3079,12 @@ fastify.register(async (fastify) => {
         //   線は保留音の「音あり」と同じ 350＝小声も拾う側に倒す（回線の雑音で超えても、いつもの文字起こしに戻るだけ）
         const EARLY_STT_QUIET_RMS = 350; // ＝HOLD_RMS_THRESHOLD（下で宣言）
         let earlyStt = null; // { chunks, promise, maxRms }＝speechChunks の同じ配列・その後ずっと静かだった時だけ使う
+        // 話している最中から流す文字起こし（createLiveStt）。liveFor＝いま流している発話の speechChunks（区切った・崩れたら null）
+        let liveStt = null;
+        let liveFor = null;
+        // 先に始めた文字起こしを捨てる（失敗しても、捨てた音でファイルの文字起こしを走らせない）
+        const dropEarly = () => { if (earlyStt) earlyStt.cancelled = true; earlyStt = null; };
+        let adoptedEarly = null; // 閉じた発話に使った先の文字起こし（つなぎ直しで判定を捨てた時に止める）
         const PREROLL_FRAMES = 15;       // ~300ms kept before VAD confirms speech, so soft onsets aren't clipped
         const MAX_UTTERANCE_FRAMES = 300; // 6s＝設定が在る通話の1発話の上限（§1-d）
         const HOLD_RMS_THRESHOLD = 350;   // 保留音の「音あり」の線＝発話の線（2000）より低い＝小さな保留音も拾う（試しの電話で決め直す）
@@ -3027,6 +3125,8 @@ fastify.register(async (fastify) => {
         let realtimeOpened = false;
 
         const resetVadCapture = () => {
+            liveFor = null;
+            dropEarly();
             speechActive = false;
             speechFrames = 0;
             silenceFrames = 0;
@@ -4719,7 +4819,7 @@ fastify.register(async (fastify) => {
             if (isLoud) {
                 speechFrames++;
                 silenceFrames = 0;
-                earlyStt = null; // 黙りの途中で声が戻った＝先に始めた文字起こしは使わない
+                dropEarly(); // 黙りの途中で声が戻った＝先に始めた文字起こしは使わない
                 if (!speechActive && speechFrames >= SPEECH_START_FRAMES) {
                     speechActive = true;
                     speechStartedAt = Date.now();
@@ -4727,6 +4827,7 @@ fastify.register(async (fastify) => {
                     // so a soft onset like "どう…" isn't clipped. The current
                     // frame is appended below.
                     speechChunks = preRoll.slice();
+                    if (liveStt) { liveStt.start(Buffer.concat(speechChunks)); liveFor = speechChunks; }
                     // Refresh silence clock as soon as we detect speech —
                     // we don't need to wait for the transcript to confirm
                     // the caller is engaged.
@@ -4742,6 +4843,7 @@ fastify.register(async (fastify) => {
                     // 処理中に相手の続きが始まった＝その判定は捨てて、閉じた後に前の切れ端とつないで判定し直す
                     if (state === 'PROCESSING' && !waitCtx && mergeTurn && mergeTurn.turn === liveTurn) {
                         carryAudio = mergeTurn.audio;
+                        if (adoptedEarly) { adoptedEarly.cancelled = true; adoptedEarly = null; } // 捨てた判定の文字起こしは要らない
                         if (lastRecorded?.turn === mergeTurn.turn) {
                             const i = recentUserUtterances.lastIndexOf(lastRecorded.text);
                             if (i >= 0) recentUserUtterances.splice(i, 1);
@@ -4759,17 +4861,29 @@ fastify.register(async (fastify) => {
                 speechFrames = 0;
                 silenceFrames++;
                 if (earlyStt && rms > earlyStt.maxRms) earlyStt.maxRms = rms;
-                if (speechActive && silenceFrames === EARLY_STT_FRAMES && state === 'LISTENING' && !carryAudio && !held) {
+                if (earlyStt && earlyStt.maxRms >= EARLY_STT_QUIET_RMS) dropEarly(); // 小声が来た＝使わないと決まった（codex 監査）
+                if (speechActive && silenceFrames === EARLY_STT_FRAMES && rms < EARLY_STT_QUIET_RMS && state === 'LISTENING' && !carryAudio && !held) {
                     const audio = Buffer.concat(speechChunks);
                     if (audio.length >= MIN_UTTERANCE_BYTES) {
-                        earlyStt = {
+                        // 流している文字起こしを区切る（使えなければファイルの文字起こしに戻す）
+                        const live = liveStt && liveFor === speechChunks ? liveStt.commit() : Promise.resolve({ ok: false });
+                        liveFor = null;
+                        const t = Date.now();
+                        const mine = {
                             chunks: speechChunks,
                             maxRms: rms, // この枠は音に入っていない＝判定にだけ入れる
-                            promise: transcribeWhisper(audio, cfg.transcriptionPrompt).catch((err) => {
+                            cancelled: false,
+                            promise: live.then((r) => {
+                                if (r.ok && r.text) { console.log(`[live-stt] done in ${Date.now() - t}ms after commit`); return r.text; }
+                                // 捨てた先の結果・終わった通話のためにファイルの文字起こしを走らせない（codex 監査）
+                                if (mine.cancelled || aborted || state === 'ENDED') return null;
+                                return transcribeWhisper(audio, cfg.transcriptionPrompt);
+                            }).catch((err) => {
                                 console.error('Whisper error (early):', err);
                                 return null;
                             }),
                         };
+                        earlyStt = mine;
                     }
                 }
                 if (speechActive && silenceFrames >= SILENCE_END_FRAMES) {
@@ -4777,7 +4891,7 @@ fastify.register(async (fastify) => {
                     const utterance = Buffer.concat(speechChunks);
                     const early = earlyStt && earlyStt.chunks === speechChunks && earlyStt.maxRms < EARLY_STT_QUIET_RMS && state === 'LISTENING' && !carryAudio ? earlyStt : null;
                     if (earlyStt && !early) console.log(`[stt] early transcription dropped (maxRms=${earlyStt.maxRms.toFixed(0)})`);
-                    earlyStt = null;
+                    if (early) { earlyStt = null; adoptedEarly = early; } else dropEarly();
                     speechChunks = [];
                     console.log(`[vad] speech end (${utterance.length} bytes)`);
                     if (state === 'AWAIT_ANSWER') {
@@ -4806,13 +4920,15 @@ fastify.register(async (fastify) => {
             preRoll.push(mulaw);
             if (preRoll.length > PREROLL_FRAMES) preRoll.shift();
 
-            if (speechActive) speechChunks.push(mulaw);
+            if (speechActive) { speechChunks.push(mulaw); if (liveFor === speechChunks) liveStt?.append(mulaw); }
 
             // 設定が在る通話だけ＝1発話の上限 6秒。超えたら区切って文字起こしへ回し、末尾1秒を次の頭に重ねる
             // （「少々お待ちください」の直後に保留音が切れ目なく続くと発話が閉じない＝§1-d）
             if (ts && speechActive && speechChunks.length >= MAX_UTTERANCE_FRAMES) {
                 const utterance = Buffer.concat(speechChunks);
+                dropEarly(); // 区切った発話はファイルの文字起こしで読む＝先に始めた分は捨てる
                 speechChunks = speechChunks.slice(-SPLIT_OVERLAP_FRAMES);
+                if (liveStt) { liveStt.start(Buffer.concat(speechChunks)); liveFor = speechChunks; }
                 console.log(`[vad] forced split (${utterance.length} bytes; carrying ${speechChunks.length}f)`);
                 handleUserUtterance(utterance, { forced: true }).catch((err) =>
                     console.error('handleUserUtterance error:', err)
@@ -4947,6 +5063,8 @@ fastify.register(async (fastify) => {
                                 } else {
                                     cfg = loaded;
                                 }
+                                // 切り札＝環境変数 LIVE_STT=0 で今までのファイルの文字起こしだけに戻す
+                                if (process.env.LIVE_STT !== '0' && !liveStt) liveStt = createLiveStt(cfg.transcriptionPrompt);
                                 return answerReady();
                             })
                             .catch((err) => {
@@ -4985,6 +5103,7 @@ fastify.register(async (fastify) => {
             if (transferPhase !== 'committing' && transferPhase !== 'committed') aborted = true;
             clearAnswerTimers();
             dropHeld('closed');
+            if (liveStt) { liveStt.close(); liveStt = null; liveFor = null; }
             state = 'ENDED';
             currentPlaybackToken = null;
             // If the socket closed before authenticating, free its unauth slot

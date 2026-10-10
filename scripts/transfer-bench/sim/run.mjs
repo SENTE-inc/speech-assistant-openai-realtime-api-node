@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { INTENTS, SF_DEFAULT, levelRow } from '../fixtures.mjs';
 import { TRANSFER_LEVELS } from '../../../transfer-logic.js';
 
@@ -26,6 +26,21 @@ const AGENT = '44444444-4444-4444-4444-444444444444';
 // ---------------------------------------------------------------------
 // 音（8kHz μ-law・20ms＝160バイト）
 // ---------------------------------------------------------------------
+function mulawToLinear(u) {
+    u = ~u & 0xff;
+    const t = (((u & 0x0f) << 3) + 0x84) << ((u & 0x70) >> 4);
+    return (u & 0x80) ? 0x84 - t : t - 0x84;
+}
+// μ-law の音を WAV（16bit・8kHz）にする＝偽物の文字起こし（sttFromAudio）にそのまま渡せる形
+function mulawToWav(mu) {
+    const pcm = Buffer.alloc(mu.length * 2);
+    for (let i = 0; i < mu.length; i++) pcm.writeInt16LE(mulawToLinear(mu[i]), i * 2);
+    const h = Buffer.alloc(44);
+    h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+    h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(8000, 24); h.writeUInt32LE(16000, 28);
+    h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+    return Buffer.concat([h, pcm]);
+}
 function linearToMulaw(sample) {
     const BIAS = 0x84, CLIP = 32635;
     let sign = (sample >> 8) & 0x80;
@@ -213,7 +228,7 @@ function startEngine() {
             env: {
                 ...process.env, PORT: String(ENGINE_PORT), SIM_FAKE_BASE: FAKE,
                 SUPABASE_URL: FAKE, SUPABASE_SERVICE_KEY: 'sim-service-key', ANTHROPIC_API_KEY: 'sim', ANTHROPIC_BASE_URL: `${FAKE}/anthropic`,
-                OPENAI_API_KEY: 'sim', TWILIO_ACCOUNT_SID: 'ACsim', TWILIO_AUTH_TOKEN: AUTH_TOKEN, PROVISION_SECRET: 'sim',
+                OPENAI_API_KEY: 'sim', OPENAI_WSS_BASE: `ws://127.0.0.1:${FAKE_PORT}/openai`, TWILIO_ACCOUNT_SID: 'ACsim', TWILIO_AUTH_TOKEN: AUTH_TOKEN, PROVISION_SECRET: 'sim',
                 TWILIO_FROM_NUMBER: '+815000000000', PUBLIC_BASE_URL: '',
             },
             stdio: ['ignore', 'pipe', 'pipe'],
@@ -715,7 +730,7 @@ const SCENARIOS = {
     answer_pickup_beep: {
         settings: V2(),
         timeline: [
-            { kind: 'beep', ms: 60 }, { kind: 'silence', ms: 40 }, { kind: 'beep', ms: 60 },
+            { kind: 'beep', ms: 80 }, { kind: 'silence', ms: 40 }, { kind: 'beep', ms: 80 }, // 本物は 0.05秒×2＝枠の区切りで拾われ方が揺れる＝必ず拾われる長さにする
             { kind: 'silence', ms: 1300 }, { kind: 'speech', ms: 1500, text: 'はい、テスト株式会社です。' }, { kind: 'silence', ms: 6000 },
         ],
         haiku: () => 'reprompt',
@@ -993,6 +1008,43 @@ const SCENARIOS = {
             return errs;
         },
     },
+    // 話している最中から流す文字起こし＝言い終わりの判定と同時に文字がそろう（相づちの間 0.8秒・2026-10-10）
+    live_stt_used: {
+        settings: V2(),
+        nameSet: true,
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: 'どちらの会社ですか？' }, { kind: 'silence', ms: 6000 }],
+        haiku: haikuFor([['会社', 'company']]),
+        liveDelayMs: 200,
+        maxMs: 20000,
+        doneWhen: (log) => log.some((l) => /✓ Finished company/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!r.events.some((e) => e.t === 'stt' && e.live && e.text === 'どちらの会社ですか？')) errs.push('流した文字起こしを使っていない');
+            if (r.events.some((e) => e.t === 'stt' && !e.live)) errs.push('ファイルの文字起こしも呼んだ');
+            const end = r.log.find((l) => /\[vad\] speech end/.test(l.line));
+            const hai = r.log.find((l) => /Playing hai /.test(l.line));
+            if (!end || !hai || hai.t - end.t > 0.15) errs.push(`言い終わりの判定から相づちまでが長い: ${end?.t}→${hai?.t}`);
+            if (!has(r, /Playing company/)) errs.push('社名を答えていない');
+            return errs;
+        },
+    },
+    // 流す文字起こしが失敗＝ファイルの文字起こしに戻して同じように答える
+    live_stt_fallback: {
+        settings: V2(),
+        nameSet: true,
+        timeline: [{ kind: 'silence', ms: 6000 }, { kind: 'speech', ms: 1500, text: 'どちらの会社ですか？' }, { kind: 'silence', ms: 6000 }],
+        haiku: haikuFor([['会社', 'company']]),
+        liveFail: true,
+        maxMs: 20000,
+        doneWhen: (log) => log.some((l) => /✓ Finished company/.test(l.line)),
+        check(r) {
+            const errs = [];
+            if (!r.events.some((e) => e.t === 'stt' && e.live && e.fail)) errs.push('流す文字起こしを試していない');
+            if (!r.events.some((e) => e.t === 'stt' && !e.live && e.text === 'どちらの会社ですか？')) errs.push('ファイルの文字起こしに戻していない');
+            if (!has(r, /Playing company/)) errs.push('社名を答えていない');
+            return errs;
+        },
+    },
     // 「資料を送ってください」＝返事を流してから CM へ（送付先は CM が伺う）
     material_then_agent: {
         settings: V2(),
@@ -1083,6 +1135,42 @@ const SCENARIOS = {
         },
     },
 };
+
+// 偽物の「話している最中から流す文字起こし」（OpenAI Realtime の transcription）＝append を溜め、commit で文字を返す
+const liveWss = new WebSocketServer({ server: fake, path: '/openai/v1/realtime' });
+let liveItem = 0;
+liveWss.on('connection', (sock) => {
+    let buf = [];
+    sock.on('message', async (raw) => {
+        const m = JSON.parse(raw.toString());
+        if (m.type === 'session.update') {
+            // 設定を本物と同じ形で確かめる（文字起こしだけ・μ-law・言語は languages）
+            const tr = m.session?.audio?.input?.transcription;
+            const okCfg = m.session?.type === 'transcription' && m.session?.audio?.input?.format?.type === 'audio/pcmu'
+                && tr?.model && Array.isArray(tr.languages) && m.session?.audio?.input?.turn_detection === null;
+            events.push({ t: 'live_session', ok: okCfg });
+            return sock.send(JSON.stringify(okCfg ? { type: 'session.updated', session: m.session } : { type: 'error', error: { code: 'invalid_value', message: 'sim: bad session.update' } }));
+        }
+        if (m.type === 'input_audio_buffer.append') buf.push(Buffer.from(m.audio, 'base64'));
+        else if (m.type === 'input_audio_buffer.clear') buf = [];
+        else if (m.type === 'input_audio_buffer.commit') {
+            const audio = Buffer.concat(buf);
+            buf = [];
+            const item_id = `item_sim_${++liveItem}`;
+            sock.send(JSON.stringify({ type: 'input_audio_buffer.committed', item_id }));
+            if (!sc) return;
+            const delay = sc.liveDelayMs ?? sc.sttDelayMs ?? 0;
+            if (delay) await new Promise((r) => setTimeout(r, delay));
+            if (sc.sttFail || sc.liveFail) {
+                events.push({ t: 'stt', live: true, fail: true });
+                return sock.send(JSON.stringify({ type: 'conversation.item.input_audio_transcription.failed', item_id, error: { message: 'sim live failure' } }));
+            }
+            const text = sc.sttFromAudio(mulawToWav(audio));
+            events.push({ t: 'stt', live: true, text, bytes: audio.length });
+            sock.send(JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', item_id, transcript: text }));
+        }
+    });
+});
 
 // ---------------------------------------------------------------------
 const want = process.argv.slice(2);
