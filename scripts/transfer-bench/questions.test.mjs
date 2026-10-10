@@ -146,3 +146,29 @@ test('⑦ 監査＝「はい？」「あ？」は聞き返し＝listen にしな
     assert.notEqual(outside('はい？', 'reprompt').action, 'listen');
     assert.notEqual(outside('あ？', 'reprompt').action, 'listen');
 });
+
+// ⑦ の足し（2026-10-10）＝あいさつの言い方の取りこぼしと、録音のお知らせだけ＝聞き続ける／番号を選ぶ案内は今どおり CM へ
+for (const text of ['お世話になっています', '世話になります', 'そうですね', 'はい、分かります', 'お久しぶりになります', 'この通話は品質向上のため録音させていただきます。']) {
+    test(`⑦ 足し「${text}」(Haiku=openai_realtime) → listen`, () => {
+        assert.equal(outside(text, 'openai_realtime').action, 'listen');
+    });
+}
+test('⑦ 足し＝番号を選ぶ案内は今どおり CM へ（人の CM が番号を押す）', () => {
+    assert.equal(outside('この通話は録音させていただきます。ご希望の番号を押してください', 'openai_realtime').action, 'realtime');
+    assert.equal(outside('ガイダンスに従ってご希望の番号を押してください', 'openai_realtime').action, 'realtime');
+});
+test('⑦ 足し＝「はい、そうです」は本人の返事でもあり得る＝あいさつにしない', () => {
+    assert.notEqual(outside('はい、そうです', 'openai_realtime').action, 'listen');
+});
+test('⑦ 足し 監査＝録音のお知らせの後の中身は聞き流さない・数字を押す案内は CM・問いかけは使わない', () => {
+    const N = 'この通話は録音させていただきます。';
+    for (const tail of ['私です', 'はい、そうです', '営業はお断りします', '担当は不在です', '確認してまいります']) {
+        assert.notEqual(outside(N + tail, 'openai_realtime').action, 'listen', tail);
+    }
+    assert.equal(outside(N + '営業は1を、採用は2を押してください', 'openai_realtime').action, 'realtime');
+    assert.equal(outside(N + '営業は一番を押してください', 'openai_realtime').action, 'realtime');
+    assert.notEqual(outside('この通話は録音させていただいてもよろしいでしょうか', 'openai_realtime').action, 'listen');
+    for (const t of ['この通話は品質向上のため録音します。', 'この通話はサービス向上のため録音しています。', '通話内容は録音されます。', N + 'お世話になっております。']) {
+        assert.equal(outside(t, 'openai_realtime').action, 'listen', t);
+    }
+});
