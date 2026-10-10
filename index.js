@@ -14,7 +14,7 @@ import {
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
     decideFastHandover, decideAfterClassifierV2, decideHold, isWordless, decideAskedQuestion, isCourtesyOnly,
     isIncompleteUtterance, isFillerWordsOnly, isRepeatRequest, classifyAbsentReply, parseRecallAt, retryIntervalFor,
-    matchHandover, firstMatch, NEGATIVE_RE, chooseAizuchi, thanksRestText, thanksConfig, thanksTargets, THANKS_KEY, THANKS_TEXT, restKeyOf, thanksClipFilename, pickupBeepToneRatio,
+    matchHandover, firstMatch, NEGATIVE_RE, chooseAizuchi, aizuchiPrefixOf, aizuchiConfig, aizuchiTargets, AIZUCHI_CLIPS, aizuchiFilename, isAizuchiKey, restKeyOf, thanksClipFilename, pickupBeepToneRatio,
 } from './transfer-logic.js';
 import {
     existsSync,
@@ -541,7 +541,7 @@ async function loadPlaybook(tenantId, projectId = null, gender = null) {
     };
     cfg.classifierPrompt = buildClassifierPrompt(cfg);
     // 相づちの「ありがとうございます」＝声セットに在り、「ありがとうございます」で始まる台本の全部に頭を落とした方が揃った時だけ使う（揃わなければ「はい」のまま）
-    Object.assign(cfg, thanksConfig(cfg.clips, pb.voice_ai_voice_id));
+    Object.assign(cfg, aizuchiConfig(cfg.clips, pb.voice_ai_voice_id));
 
     // Vocabulary hint for STT — biases gpt-transcribe toward this tenant's
     // expected phrases so homophones (e.g. 代表/対象) resolve correctly.
@@ -1304,24 +1304,24 @@ async function ensureThanksClips(pb) {
         const clips = new Map((data || []).map((c) => [c.key, c]));
         const voice = pb.voice_ai_voice_id;
         const fillers = [...clips.values()].filter((c) => c.clip_type === 'filler');
-        const targets = thanksTargets(clips);
+        const targets = aizuchiTargets(clips);
         if (!fillers.length || [...fillers, ...targets].some((c) => c.source !== 'elevenlabs')) return;
-        const want = [{ key: THANKS_KEY, text: THANKS_TEXT, sort_order: 40 }];
+        const want = AIZUCHI_CLIPS.map((a, i) => ({ key: a.key, text: a.text, tts: a.tts, filename: aizuchiFilename(a, voice), sort_order: 40 + i, trim: true, tempo: 1 }));
         for (const c of targets) {
-            const rest = thanksRestText(c.text);
-            if (rest.trim()) want.push({ key: restKeyOf(c.key), text: rest, sort_order: (c.sort_order ?? 0) + 100 });
+            const { rest } = aizuchiPrefixOf(c.text);
+            if (rest.trim()) want.push({ key: restKeyOf(c.key), text: rest, sort_order: (c.sort_order ?? 0) + 100, suppress_farewell: !!c.suppress_farewell });
         }
         for (const c of want) {
-            const filename = thanksClipFilename(c.key, c.text, voice);
+            const filename = c.filename || thanksClipFilename(c.key, c.text, voice);
             const have = clips.get(c.key);
             if (have && have.source === 'elevenlabs' && have.audio_ready === true && have.text === c.text && have.filename === filename) continue;
-            const mp3 = await elevenTts(c.text, voice);
+            const mp3 = await elevenTts(c.tts || c.text, voice, { trim: !!c.trim, ...(c.tempo ? { tempo: c.tempo } : {}) });
             const { error: upErr } = await supabase.storage.from(AUDIO_BUCKET)
                 .upload(`${base}/${filename}`, mp3, { contentType: 'audio/mpeg', upsert: true });
             if (upErr) throw new Error(`upload ${c.key}: ${upErr.message}`);
             const { error: wErr } = await supabase.from('audio_clips').upsert({
                 playbook_id: pb.id, tenant_id: pb.tenant_id, key: c.key, clip_type: 'response', filename, text: c.text,
-                source: 'elevenlabs', audio_ready: true, suppress_farewell: false, sort_order: c.sort_order, active: true,
+                source: 'elevenlabs', audio_ready: true, suppress_farewell: !!c.suppress_farewell, sort_order: c.sort_order, active: true,
                 updated_at: new Date().toISOString(),
             }, { onConflict: 'playbook_id,key' });
             if (wErr) throw new Error(`write ${c.key}: ${wErr.message}`);
@@ -3020,7 +3020,8 @@ fastify.register(async (fastify) => {
         // 「もう一度」で流し直す、最後に流し終えた返答の列（つなぎの「はい」と聞き返しは入れない）
         let lastResponseSeq = null;
         let repeatCount = 0;
-        let thanksSaidAt = 0; // 相づちの「ありがとうございます」を言い終えた時刻＝直後の「ありがとうございます…」の台本は頭を落として流す
+        let aizuchiSaid = null; // { kind, at }＝相づちを言い終えた時刻と種類＝直後の同じ言葉で始まる台本は頭を落として流す
+        let ackIndex = 0;       // 「承知しました！」「かしこまりました！」を交互に
         const REPEAT_MAX = 2;
         let lastRecorded = null; // { turn, text }＝同じ発話の繰り返しの数に最後に入れた発話（捨てた切れ端を外すため）
         // あいさつは相手の第一声が終わってから流す（2026-10-06 Tom「最初は向こうが名乗るだろうから、それを待ってから自己紹介」＝声セットの家 D7 を覆した）
@@ -3271,13 +3272,18 @@ fastify.register(async (fastify) => {
         // Playback (one key → cached mulaw → chunked → mark → await)
         // -----------------------------------------------------------------
         const playAudio = async (key) => {
-            // 相づちの「ありがとうございます」の直後（2秒以内）に「ありがとうございます」で始まる台本＝頭を落とした方（二重に言わない）
-            if (thanksSaidAt && key !== cfg?.thanksKey) {
-                const recent = Date.now() - thanksSaidAt < 2000;
-                thanksSaidAt = 0;
-                const sub = recent ? cfg?.thanksRestKey?.get(key) : undefined;
-                if (sub === '') return 'done';
-                if (sub) key = sub;
+            // 相づちの直後（2秒以内）に同じ言葉で始まる台本＝頭を落とした方（二重に言わない）
+            //   「ありがとうございます」の後の「ありがとうございます…」／「承知しました！」の後の「承知致しました。そうしましたら…」
+            if (aizuchiSaid && !isAizuchiKey(key)) {
+                const said = aizuchiSaid;
+                aizuchiSaid = null;
+                const r = Date.now() - said.at < 2000 ? cfg?.aizuchiRest?.get(key) : undefined;
+                if (r && r.kind === said.kind) {
+                    if (r.restKey === '') return 'done';
+                    const restResult = await playAudio(r.restKey);
+                    if (restResult !== 'missing') return restResult;
+                    // 頭を落とした方の音が取れない＝元の台本を流す（codex 監査）
+                }
             }
             playbackActive++;
             try {
@@ -4277,7 +4283,7 @@ fastify.register(async (fastify) => {
                 disableVad('processing utterance');
             }
             const t0 = Date.now();
-            thanksSaidAt = 0; // 前の発話の相づちを持ち越さない（「もう一度」の流し直しに効かせない＝監査 2026-10-10）
+            aizuchiSaid = null; // 前の発話の相づちを持ち越さない（「もう一度」の流し直しに効かせない＝監査 2026-10-10）
             console.log(`▶ State: PROCESSING (${mulawAudio.length} bytes captured)`);
 
             // Start Whisper immediately so STT runs during the human-pause
@@ -4302,10 +4308,16 @@ fastify.register(async (fastify) => {
                 setTimeout(resolve, delayMs)
             ).then(async () => {
                 if (state === 'ENDED' || !fillerKey || transferCommitted || stale()) return;
-                // 相づち＝基本は「ありがとうございます」・問いかけ／否定の語／相づちだけには「はい」（声セットに無ければ「はい」）
-                const key = cfg?.thanksKey && chooseAizuchi(text) === 'thanks' ? cfg.thanksKey : fillerKey;
+                // 相づち（2026-10-11 Tom）＝問いかけ・「はい」だけ→「ありがとうございます。」／それ以外→「承知しました！」「かしこまりました！」を交互／
+                //   つなぎ言葉・「もしもし」だけ→流さない。3本が揃わない声セット（肉声など）は今までどおり「はい」
+                if (!cfg?.aizuchi) return playAudio(fillerKey);
+                const kind = chooseAizuchi(text);
+                if (kind === 'none') return;
+                const key = kind === 'thanks' ? cfg.aizuchi.thanks : cfg.aizuchi.ack[ackIndex % cfg.aizuchi.ack.length];
                 const r = await playAudio(key);
-                if (key === cfg?.thanksKey && r === 'done' && !stale() && state !== 'ENDED') thanksSaidAt = Date.now(); // 次の発話が始まっていたら持ち越さない（監査 2026-10-10）
+                if (r === 'missing') return playAudio(fillerKey); // 相づちの音が取れない＝「はい」（codex 監査）
+                if (kind === 'ack') ackIndex++;
+                if (r === 'done' && !stale() && state !== 'ENDED') aizuchiSaid = { kind, at: Date.now() }; // 次の発話が始まっていたら持ち越さない（監査 2026-10-10）
                 return r;
             }).catch((err) => console.error('Filler playback error:', err));
             // 「はい」は全部の通話で中身を聞いてから決める（版6 は v2 だけだった）＝担当者本人の名乗り・言いかけ・「もう一度」には流さない

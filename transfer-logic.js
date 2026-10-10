@@ -666,57 +666,77 @@ export function isCourtesyOnly(transcript) {
 const RECORDING_NOTICE_RE = /録音させて(?:いただ|頂)|録音いたし|録音しており|録音しています|録音します|録音されます|通話内容を録音/;
 const IVR_MENU_RE = /番号|ボタン|プッシュ|ダイヤル|メニュー|お選びください|ガイダンスに従|音声案内|[0-9０-９一二三四五六七八九十]\s*(?:番)?\s*を\s*(?:押|選)|番を押/;
 
-// 相づちの言葉（2026-10-10 Tom「本番にgo」・森さん「会話の流れによるけど、ありがとうございます。でもいいかもね」＝SF Slack `1791554772.289199`）
-//   基本は「ありがとうございます」（受けの言葉で判定の間を埋める）。問いかけ・頼み（社名・名前・用件を聞く）・断りや不在・分からない（否定の語）・
-//   相づちだけの発言（「はい」「ええ」「どうも」）には「はい」。返す値＝'thanks'｜'hai'。声セットに「ありがとうございます」が揃わなければ呼び出し側で「はい」
+// 相づちの言葉（2026-10-11 Tom「〜ですか？→ありがとうございます／〜です→承知しました！かしこまりました！／はいは得意じゃなさそう／全部相槌ってよりかは返事って感じ」）
+//   返す値＝'thanks'（問いかけ・相づちだけの返事「はい」「そうです」）｜'ack'（それ以外＝〜です・お願いします・不在・断り）｜'none'（言葉が無い・つなぎ言葉・「もしもし」だけ）。
+//   声セットに3本が揃わなければ呼び出し側で今までどおり「はい」（肉声の声セット）
 const AIZUCHI_QUESTION_RE = /[?？]|か[。\s]*$|ですか|ますか|でしょうか|ましたか|(?:何|なん)でしょう|どちら様|どなた|どういった|どのような|いかが|何の|なんの|ません[かけ]/;
-const AIZUCHI_NEGATIVE_RE = /対応(?:できません|できない|いたしかねます|しかねます)|できません|できかねます|いたしかねます|存じ(?:上げ)?ません|わかりかねます|分かりかねます|わかりません|分かりません/;
-const AIZUCHI_ACK_ONLY_RE = /^(?:はい|ええ|うん|ああ|あ|はいはい|そうですね|そうです|なるほど|えっと|あの|もしもし|どうも|承知(?:いた|致)?しました|わかりました|分かりました|かしこまりました)+$/;
+const AIZUCHI_YES_ONLY_RE = /^(?:はい|ええ|うん|はいはい|そうですね|そうです|なるほど|どうも|承知(?:いた|致)?しました|わかりました|分かりました|かしこまりました)+$/;
+const AIZUCHI_FILLER_ONLY_RE = /^(?:あ|ああ|えっと|えー|あの|あのー|もしもし)+$/;
 export function chooseAizuchi(transcript) {
     const raw = String(transcript || '');
-    if (!normalizeForTransferGuard(raw)) return 'hai';
-    if (AIZUCHI_QUESTION_RE.test(raw)) return 'hai';
-    // 頼みの形の問い（「お名前をお願いします」「ご用件をお聞かせください」）＝聞かれた物と頼む語が同じ文に在る
-    if (raw.split(/[。！!？?]/).some((sent) => ASK_RE.test(sent) && (ASK_COMPANY_RE.test(sent) || ASK_REASON_RE.test(sent) || ASK_ADDRESSEE_RE.test(sent)))) return 'hai';
-    if (negativeIgnoringApology(raw) || AIZUCHI_NEGATIVE_RE.test(raw)) return 'hai';
-    if (AIZUCHI_ACK_ONLY_RE.test(stripForJudge(raw))) return 'hai';
-    return 'thanks';
+    if (!normalizeForTransferGuard(raw)) return 'none';
+    const bare = stripForJudge(raw);
+    if (!bare || AIZUCHI_FILLER_ONLY_RE.test(bare) || isFillerWordsOnly(raw)) return 'none'; // 「えー」「ええと」も（codex 監査）
+    if (AIZUCHI_YES_ONLY_RE.test(bare)) return 'thanks';
+    if (isCourtesyOnly(raw)) return 'thanks'; // あいさつ・お礼だけ（「お世話になっております」）に「承知しました」は合わない
+    if (AIZUCHI_QUESTION_RE.test(raw)) return 'thanks';
+    return 'ack';
 }
 
-// 「ありがとうございます」で始まる台本＝相づちで「ありがとうございます」を言った同じ発話の返答は頭を落とした方を流す（二重に言わない）
-export const THANKS_PREFIX_RE = /^ありがとうございます[。、！!]?\s*/;
-export function thanksRestText(text) {
+// 相づちの音（ElevenLabs の声で作る）。ack は2本を交互に使う
+//   tts＝ElevenLabs に渡す文（読み方の指定つき）。text は画面と DB の文。
+//   ⚠ 本番は eleven_v4（Railway の env）＝見本も v4 で作る。v3 は指定つきの「承知」を中国語読み（チョンジ）にし、ひらがなで渡すと「招致」の高低（しょ↘うち）になる（Tom が聞き分けた・2026-10-11）＝v4・漢字で渡す。
+//   ⚠ 1回ごとに読み方が揺れる＝Tom が聞いて選んだテイクを、このファイル名で先に置く（エンジンはファイル名が合えば作り直さない）
+export const AIZUCHI_CLIPS = [
+    { key: 'aizuchi_thanks', text: 'ありがとうございます！', tts: '[cheerfully] ありがとうございます！', kind: 'thanks' },
+    { key: 'aizuchi_shouchi', text: '承知しました！', tts: '[cheerfully] 承知しました！', kind: 'ack' },
+    { key: 'aizuchi_kashikomari', text: 'かしこまりました！', tts: '[cheerfully] かしこまりました！', kind: 'ack' },
+];
+// 相づちの音のファイル名は読み方の指定も含める（指定を変えたら作り直す）
+export const aizuchiFilename = (a, voiceId) => thanksClipFilename(a.key, `${a.text}\n${a.tts}`, voiceId);
+const AIZUCHI_KEYS = new Set(AIZUCHI_CLIPS.map((c) => c.key));
+// 台本の頭が相づちと同じ言葉＝同じ発話で相づちを言った直後は頭を落とした方（<key>__rest）を流す（二重に言わない）
+const AIZUCHI_PREFIX = [
+    { kind: 'thanks', re: /^ありがとうございます[。、！!]?\s*/ },
+    { kind: 'ack', re: /^(?:承知(?:いた|致)?しました|かしこまりました)[。、！!]?\s*/ },
+];
+export function aizuchiPrefixOf(text) {
     const t = String(text || '');
-    return THANKS_PREFIX_RE.test(t) ? t.replace(THANKS_PREFIX_RE, '') : null;
+    for (const p of AIZUCHI_PREFIX) if (p.re.test(t)) return { kind: p.kind, rest: t.replace(p.re, '') };
+    return null;
 }
-export const THANKS_KEY = 'aizuchi_thanks';
-export const THANKS_TEXT = 'ありがとうございます。';
 export const restKeyOf = (key) => `${key}__rest`;
 // 作った音のファイル名＝文と声で決まる（文か声が変わったら別の名前＝作り直しの印）
 export function thanksClipFilename(key, text, voiceId) {
     return `t_${key}_${createHash('sha256').update(`${voiceId}\n${text}`).digest('hex').slice(0, 8)}.mp3`;
 }
-export function thanksTargets(clips) {
-    return [...clips.values()].filter((c) => c.key !== THANKS_KEY && !c.key.endsWith('__rest') && thanksRestText(c.text) != null);
+export function aizuchiTargets(clips) {
+    return [...clips.values()].filter((c) => !AIZUCHI_KEYS.has(c.key) && !c.key.endsWith('__rest') && aizuchiPrefixOf(c.text) != null);
 }
-// 使えるか＝相づち・対象の台本・作った音の全部が ElevenLabs の声で、作った音が今の文と声の物（肉声・別の声と混ぜない＝監査 2026-10-10）
-export function thanksConfig(clips, voiceId) {
-    const off = { thanksKey: null, thanksRestKey: new Map() };
+// 使えるか＝相づち3本・対象の台本・作った音の全部が ElevenLabs の声で、作った音が今の文と声の物（肉声・別の声と混ぜない＝監査 2026-10-10）
+//   返す値＝{ aizuchi: { thanks, ack: [..] } | null, aizuchiRest: Map(台本の key → { kind, restKey｜'' }) }
+export function aizuchiConfig(clips, voiceId) {
+    const off = { aizuchi: null, aizuchiRest: new Map() };
     const el = (c) => c?.source === 'elevenlabs';
     const made = (c, text) => el(c) && c.audio_ready === true && c.text === text && c.filename === thanksClipFilename(c.key, text, voiceId);
-    if (!voiceId || !made(clips.get(THANKS_KEY), THANKS_TEXT)) return off;
+    const madeAizuchi = (a) => { const c = clips.get(a.key); return el(c) && c.audio_ready === true && c.text === a.text && c.filename === aizuchiFilename(a, voiceId); };
+    if (!voiceId || !AIZUCHI_CLIPS.every(madeAizuchi)) return off;
     const fillers = [...clips.values()].filter((c) => c.clip_type === 'filler');
     if (!fillers.length || !fillers.every(el)) return off;
     const map = new Map();
-    for (const c of thanksTargets(clips)) {
-        if (!el(c)) return off;
-        const rest = thanksRestText(c.text);
-        if (!rest.trim()) { map.set(c.key, ''); continue; }
+    for (const c of aizuchiTargets(clips)) {
+        if (!el(c) || c.audio_ready !== true) return off;
+        const { kind, rest } = aizuchiPrefixOf(c.text);
+        if (!rest.trim()) { map.set(c.key, { kind, restKey: '' }); continue; }
         if (!made(clips.get(restKeyOf(c.key)), rest)) return off;
-        map.set(c.key, restKeyOf(c.key));
+        map.set(c.key, { kind, restKey: restKeyOf(c.key) });
     }
-    return { thanksKey: THANKS_KEY, thanksRestKey: map };
+    return {
+        aizuchi: { thanks: 'aizuchi_thanks', ack: AIZUCHI_CLIPS.filter((a) => a.kind === 'ack').map((a) => a.key) },
+        aizuchiRest: map,
+    };
 }
+export const isAizuchiKey = (key) => AIZUCHI_KEYS.has(key);
 
 // 電話を取った瞬間の「ププッ」（試しの架電の録音10本すべての相手側の頭に在る 約440Hz・0.05秒×2）を見分ける。
 //   samples＝8kHz の PCM（声の線を越えた枠だけ）。400〜500Hz の1本の音にエネルギーが集まっている割合（0〜1）を返す（録音のププッ 0.88・「はい」0.11）。

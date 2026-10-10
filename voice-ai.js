@@ -160,10 +160,14 @@ export function softenEndings(text) {
         .replace(/か(?=[。．？?！!]|\s*$)/g, 'かぁ');
 }
 
-function speedUp(mp3) {
+// trim＝前後の無音を切る（相づちの「承知しました！」は後ろに 0.9秒の無音が付いた＝次の台本が遅れる・2026-10-11）
+const TRIM_FILTER = 'silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.03,areverse,silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,areverse';
+// tempo＝相づちの3本は 1.0（2026-10-11 Tom が 1.1倍速と 1.0倍速を聞き比べて「それで行こう」）・台本は VOICE_TEMPO
+function speedUp(mp3, { trim = false, tempo = VOICE_TEMPO } = {}) {
+    const filter = [trim ? TRIM_FILTER : null, tempo !== 1 ? `atempo=${tempo}` : null].filter(Boolean).join(',') || 'anull';
     return new Promise((resolve, reject) => {
         const proc = spawn(ffmpegStatic || 'ffmpeg',
-            ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-filter:a', `atempo=${VOICE_TEMPO}`, '-b:a', '128k', '-f', 'mp3', 'pipe:1'],
+            ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-filter:a', filter, '-b:a', '128k', '-f', 'mp3', 'pipe:1'],
             { stdio: ['pipe', 'pipe', 'pipe'] });
         const out = [];
         let err = '';
@@ -215,7 +219,7 @@ export async function makeNameAudio(spokenName, gender) {
 }
 
 // ElevenLabs で1テイク（mp3 のバイト列）。1回＝1本・毎回課金（2本目も課金される＝声セットの家 ⏳）
-export async function elevenTts(text, voiceId) {
+export async function elevenTts(text, voiceId, { trim = false, tempo = VOICE_TEMPO } = {}) {
     const res = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
         {
@@ -229,7 +233,7 @@ export async function elevenTts(text, voiceId) {
         const detail = await res.text().catch(() => '');
         throw new Error(`ElevenLabs ${res.status}: ${detail.slice(0, 200)}`);
     }
-    return speedUp(Buffer.from(await res.arrayBuffer()));
+    return speedUp(Buffer.from(await res.arrayBuffer()), { trim, tempo });
 }
 
 export function registerVoiceAi(fastify, deps) {
