@@ -2935,6 +2935,7 @@ fastify.register(async (fastify) => {
         // 💥 森さんの試しの電話＝電話の録音の案内とあいさつが重なり、想定外の返事から自由会話へ落ちた
         const ANSWER_QUIET_MS = 2500; // だれも話さなければこの時間であいさつ
         const ANSWER_MAX_MS = 8000;   // 相手が話し続けても（録音の案内など）この時間であいさつ
+        const ANSWER_MIN_VOICE_BYTES = 2400; // 0.3秒（8kHz μ-law）＝これより短い第一声は電話を取った音として聞き流す
         let answerTimers = [];
         // 設定を読めず今の挙動で動いた通話（判定の記録に event=fallback を1行残す）
         let tsFallback = false;
@@ -4769,9 +4770,15 @@ fastify.register(async (fastify) => {
                     speechChunks = [];
                     console.log(`[vad] speech end (${utterance.length} bytes)`);
                     if (state === 'AWAIT_ANSWER') {
-                        // 相手の第一声（「はい、◯◯です」・録音の案内）＝判定はせず、記録だけ残してあいさつへ
-                        greetAfterAnswer('answered');
-                        checkAnswerUtterance(utterance);
+                        // 電話を取った時の「プツッ」（声の長さ 0.3秒未満）は第一声にしない＝続きを待つ（無言なら 2.5秒であいさつ）
+                        //   💥 2026-10-10 試しの架電＝取った瞬間の 0.2秒の音で名乗り、Tom「先に自己紹介してたよ」
+                        if (utterance.length - (SILENCE_END_FRAMES + PREROLL_FRAMES) * 160 < ANSWER_MIN_VOICE_BYTES) {
+                            console.log(`[answer] ignored a short sound (${utterance.length} bytes)`);
+                        } else {
+                            // 相手の第一声（「はい、◯◯です」・録音の案内）＝判定はせず、記録だけ残してあいさつへ
+                            greetAfterAnswer('answered');
+                            checkAnswerUtterance(utterance);
+                        }
                     } else if (utterance.length >= MIN_UTTERANCE_BYTES || carryAudio) {
                         handleUserUtterance(utterance, { early }).catch((err) =>
                             console.error('handleUserUtterance error:', err)
