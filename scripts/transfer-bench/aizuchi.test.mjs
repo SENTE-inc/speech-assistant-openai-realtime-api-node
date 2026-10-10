@@ -1,7 +1,7 @@
 // 相づち「はい」→「ありがとうございます」（2026-10-10 Tom「本番にgo」）
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chooseAizuchi, thanksRestText, thanksConfig, thanksClipFilename } from '../../transfer-logic.js';
+import { chooseAizuchi, thanksRestText, thanksConfig, thanksClipFilename, pickupBeepToneRatio } from '../../transfer-logic.js';
 
 const THANKS = ['少々お待ちください', 'お世話になっております', 'すいません、少々お待ちください', 'かしこまりました、おつなぎします',
     'お電話代わりました、田中です', '確認してまいります', 'ありがとうございます', '十五時には戻るでしょう', '何時でも大丈夫です', 'よろしくお願いします', '対応できます。', 'かしこまりました、おつなぎします'];
@@ -38,4 +38,20 @@ test('台本の文が変わった・声が変わった・肉声が混じる → 
     assert.equal(thanksConfig(full(), null).thanksKey, null);
     const notReady = full(); notReady.set('aizuchi_thanks', { ...notReady.get('aizuchi_thanks'), audio_ready: false });
     assert.equal(thanksConfig(notReady, V).thanksKey, null);
+});
+
+// 電話を取った瞬間の「ププッ」（約440Hz の澄んだ音）と声を見分ける（録音の実測＝ププッ 0.54〜0.55・声 0.00〜0.01）
+test('pickupBeepToneRatio: 440Hz の澄んだ音は高い・倍音の多い声らしい音と雑音は低い', () => {
+    const n = 960; // 0.12秒
+    const tone = Array.from({ length: n }, (_, i) => Math.round(9000 * Math.sin(2 * Math.PI * 440 * i / 8000)));
+    const voice = Array.from({ length: n }, (_, i) => {
+        let s = 0;
+        for (let h = 1; h <= 12; h++) s += Math.sin(2 * Math.PI * 140 * h * i / 8000 + h) * 3000 / h;
+        return Math.round(s + (Math.random() * 2 - 1) * 1500);
+    });
+    const noise = Array.from({ length: n }, () => Math.round((Math.random() * 2 - 1) * 6000));
+    assert.ok(pickupBeepToneRatio(tone) > 0.8, `tone=${pickupBeepToneRatio(tone)}`);
+    assert.ok(pickupBeepToneRatio(voice) < 0.3, `voice=${pickupBeepToneRatio(voice)}`);
+    assert.ok(pickupBeepToneRatio(noise) < 0.3, `noise=${pickupBeepToneRatio(noise)}`);
+    assert.equal(pickupBeepToneRatio([]), 0);
 });

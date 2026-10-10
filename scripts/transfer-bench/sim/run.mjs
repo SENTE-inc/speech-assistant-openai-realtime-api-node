@@ -49,6 +49,7 @@ function frame(kind, k = 0) {
         const tt = phase / 8000;
         if (kind === 'speech') s = Math.sin(2 * Math.PI * SPEECH_HZ[k] * tt) * 9000 + (Math.random() * 2 - 1) * 800;
         if (kind === 'music') s = Math.sin(2 * Math.PI * MUSIC_HZ * tt) * 9000;
+        if (kind === 'beep') s = Math.sin(2 * Math.PI * 440 * tt) * 9000; // 電話を取った瞬間の「ププッ」
         phase++;
         b[i] = linearToMulaw(Math.round(s));
     }
@@ -714,7 +715,7 @@ const SCENARIOS = {
     answer_pickup_beep: {
         settings: V2(),
         timeline: [
-            { kind: 'speech', ms: 60, text: '' }, { kind: 'silence', ms: 40 }, { kind: 'speech', ms: 60, text: '' },
+            { kind: 'beep', ms: 60 }, { kind: 'silence', ms: 40 }, { kind: 'beep', ms: 60 },
             { kind: 'silence', ms: 1300 }, { kind: 'speech', ms: 1500, text: 'はい、テスト株式会社です。' }, { kind: 'silence', ms: 6000 },
         ],
         haiku: () => 'reprompt',
@@ -722,7 +723,7 @@ const SCENARIOS = {
         doneWhen: (log) => log.some((l) => /✓ Finished greeting/.test(l.line)),
         check(r) {
             const errs = [];
-            if (!has(r, /\[answer\] ignored a short sound/)) errs.push('ププッを聞き流していない');
+            if (!has(r, /\[answer\] ignored the pickup beep/)) errs.push('ププッを聞き流していない');
             if (!has(r, /\[answer\] greeting after answered/)) errs.push('名乗りの終わりであいさつしていない');
             const ends = r.log.map((l, i) => (/\[vad\] speech end/.test(l.line) ? i : -1)).filter((i) => i >= 0);
             const greet = r.log.findIndex((l) => /Playing (greeting|name_lead)/.test(l.line));

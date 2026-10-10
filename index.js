@@ -14,7 +14,7 @@ import {
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
     decideFastHandover, decideAfterClassifierV2, decideHold, isWordless, decideAskedQuestion, isCourtesyOnly,
     isIncompleteUtterance, isFillerWordsOnly, isRepeatRequest, classifyAbsentReply, parseRecallAt, retryIntervalFor,
-    matchHandover, firstMatch, NEGATIVE_RE, chooseAizuchi, thanksRestText, thanksConfig, thanksTargets, THANKS_KEY, THANKS_TEXT, restKeyOf, thanksClipFilename,
+    matchHandover, firstMatch, NEGATIVE_RE, chooseAizuchi, thanksRestText, thanksConfig, thanksTargets, THANKS_KEY, THANKS_TEXT, restKeyOf, thanksClipFilename, pickupBeepToneRatio,
 } from './transfer-logic.js';
 import {
     existsSync,
@@ -2935,7 +2935,18 @@ fastify.register(async (fastify) => {
         // 💥 森さんの試しの電話＝電話の録音の案内とあいさつが重なり、想定外の返事から自由会話へ落ちた
         const ANSWER_QUIET_MS = 2500; // だれも話さなければこの時間であいさつ
         const ANSWER_MAX_MS = 8000;   // 相手が話し続けても（録音の案内など）この時間であいさつ
-        const ANSWER_MIN_VOICE_BYTES = 2400; // 0.3秒（8kHz μ-law）＝これより短い第一声は電話を取った音として聞き流す
+        // ププッの見分け＝声の線を越えた枠が 0.3秒未満・400〜500Hz の1本の音に 30% 以上が集まる
+        //   （録音10本のププッは 0.12秒・0.54〜0.55／短い「はい」・人の声は 0.00〜0.01＝2026-10-10 実測）
+        const ANSWER_BEEP_MAX_S = 0.3;
+        const ANSWER_BEEP_MIN_RATIO = 0.3;
+        const pickupBeepOf = (mulaw) => {
+            const voiced = [];
+            for (let i = 0; i + 160 <= mulaw.length; i += 160) {
+                const fr = mulaw.subarray(i, i + 160);
+                if (calculateRms(fr) > VAD_RMS_THRESHOLD) for (const b of fr) voiced.push(muLawDecode(b));
+            }
+            return { seconds: voiced.length / 8000, ratio: pickupBeepToneRatio(voiced) };
+        };
         let answerTimers = [];
         // 設定を読めず今の挙動で動いた通話（判定の記録に event=fallback を1行残す）
         let tsFallback = false;
@@ -4770,10 +4781,12 @@ fastify.register(async (fastify) => {
                     speechChunks = [];
                     console.log(`[vad] speech end (${utterance.length} bytes)`);
                     if (state === 'AWAIT_ANSWER') {
-                        // 電話を取った時の「プツッ」（声の長さ 0.3秒未満）は第一声にしない＝続きを待つ（無言なら 2.5秒であいさつ）
-                        //   💥 2026-10-10 試しの架電＝取った瞬間の 0.2秒の音で名乗り、Tom「先に自己紹介してたよ」
-                        if (utterance.length - (SILENCE_END_FRAMES + PREROLL_FRAMES) * 160 < ANSWER_MIN_VOICE_BYTES) {
-                            console.log(`[answer] ignored a short sound (${utterance.length} bytes)`);
+                        // 電話を取った時の「ププッ」（約440Hz の澄んだ短い音）は第一声にしない＝続きを待つ（無言なら 2.5秒であいさつ）。
+                        //   短い「はい」は声＝今どおり第一声（Tom「ププっに特化できないの？」2026-10-10）
+                        //   💥 2026-10-10 試しの架電＝取った瞬間のププッで名乗り、Tom「先に自己紹介してたよ」
+                        const beep = pickupBeepOf(utterance);
+                        if (beep.seconds < ANSWER_BEEP_MAX_S && beep.ratio >= ANSWER_BEEP_MIN_RATIO) {
+                            console.log(`[answer] ignored the pickup beep (${beep.seconds.toFixed(2)}s, tone=${beep.ratio.toFixed(2)})`);
                         } else {
                             // 相手の第一声（「はい、◯◯です」・録音の案内）＝判定はせず、記録だけ残してあいさつへ
                             greetAfterAnswer('answered');
