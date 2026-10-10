@@ -2965,7 +2965,14 @@ fastify.register(async (fastify) => {
         const MIN_UTTERANCE_BYTES = 4000; // ~500ms of audio (8kHz mulaw)
         const CALL_START_GRACE_MS = 5000;  // ignore inbound audio for the first 5s (Twilio trial preamble)
         const POST_PLAYBACK_DELAY_MS = 800; // wait this long after a clip before re-arming VAD
-        const HUMAN_PAUSE_MS = 600; // hold the filler clip for this long after silence-end so the caller's last word lands cleanly
+        // 相づちは文字起こしが返ったらすぐ流す（言い終わりの判定の 0.8秒が人の間の代わり）。
+        //   2026-10-10 Tom「じゃあ0.8秒で」＝人の CM の返事は 90% が言い終わりから 0.8秒以内（SF の録音 465本）＝旧 600ms の待ちを外した
+        const HUMAN_PAUSE_MS = 0;
+        // 黙って 0.3秒で文字起こしを先に始める（言い終わりの判定は 0.8秒のまま）＝閉じた時に結果が出ていれば相づちは 0.8秒で出る。
+        //   その前に話し始めたら捨てる（音も文字起こしもやり直し）
+        const EARLY_STT_FRAMES = 15;
+        const EARLY_STT_QUIET_RMS = 1000; // 先に始めた後にこれより大きい音（声の線 2000 未満の小声）が来たら使わない＝閉じた時の音で取り直す（codex 監査）
+        let earlyStt = null; // { chunks, promise, maxRms }＝speechChunks の同じ配列・その後ずっと静かだった時だけ使う
         const PREROLL_FRAMES = 15;       // ~300ms kept before VAD confirms speech, so soft onsets aren't clipped
         const MAX_UTTERANCE_FRAMES = 300; // 6s＝設定が在る通話の1発話の上限（§1-d）
         const HOLD_RMS_THRESHOLD = 350;   // 保留音の「音あり」の線＝発話の線（2000）より低い＝小さな保留音も拾う（試しの電話で決め直す）
@@ -4122,7 +4129,7 @@ fastify.register(async (fastify) => {
         // After a user utterance: filler + Whisper + Claude + action
         // -----------------------------------------------------------------
         //   heldTranscript＝言いかけの待ちが期限切れ＝文字起こしをやり直さず、その文で判定だけ続ける（もう言いかけ判定はしない）
-        const handleUserUtterance = async (mulawAudio, { forced = false, heldTranscript = null } = {}) => {
+        const handleUserUtterance = async (mulawAudio, { forced = false, heldTranscript = null, early = null } = {}) => {
             // 処理の間に閉じた発話＝最新の1つだけ持ち越す（待機を続ける・待機に入る時に回す＝§1-d）
             if (state === 'PROCESSING' && (waitCtx || captureWhileProcessing)) {
                 pendingUtterance = { audio: mulawAudio, forced };
@@ -4130,6 +4137,7 @@ fastify.register(async (fastify) => {
             }
             if (state !== 'LISTENING') return; // PLAYING／PROCESSING／ENDED／REALTIME／INITIAL は受けない
             if (carryAudio) {
+                early = null; // 先に始めた文字起こしは切れ端を含まない
                 mulawAudio = Buffer.concat([carryAudio, mulawAudio]);
                 carryAudio = null;
                 console.log(`[merge] joined with the previous fragment (${mulawAudio.length} bytes)`);
@@ -4161,7 +4169,8 @@ fastify.register(async (fastify) => {
             // Start Whisper immediately so STT runs during the human-pause
             // window — the overall response latency stays roughly the same
             // even though the filler is delayed.
-            const whisperPromise = heldTranscript != null ? Promise.resolve(heldTranscript) : transcribeWhisper(mulawAudio, cfg.transcriptionPrompt).catch((err) => {
+            if (early) console.log('[stt] using the early transcription (started at 0.3s of silence)');
+            const whisperPromise = heldTranscript != null ? Promise.resolve(heldTranscript) : early ? early.promise : transcribeWhisper(mulawAudio, cfg.transcriptionPrompt).catch((err) => {
                 console.error('Whisper error:', err);
                 return null;
             });
@@ -4696,6 +4705,7 @@ fastify.register(async (fastify) => {
             if (isLoud) {
                 speechFrames++;
                 silenceFrames = 0;
+                earlyStt = null; // 黙りの途中で声が戻った＝先に始めた文字起こしは使わない
                 if (!speechActive && speechFrames >= SPEECH_START_FRAMES) {
                     speechActive = true;
                     speechStartedAt = Date.now();
@@ -4734,9 +4744,25 @@ fastify.register(async (fastify) => {
             } else {
                 speechFrames = 0;
                 silenceFrames++;
+                if (earlyStt && rms > earlyStt.maxRms) earlyStt.maxRms = rms;
+                if (speechActive && silenceFrames === EARLY_STT_FRAMES && state === 'LISTENING' && !carryAudio && !held) {
+                    const audio = Buffer.concat(speechChunks);
+                    if (audio.length >= MIN_UTTERANCE_BYTES) {
+                        earlyStt = {
+                            chunks: speechChunks,
+                            maxRms: 0,
+                            promise: transcribeWhisper(audio, cfg.transcriptionPrompt).catch((err) => {
+                                console.error('Whisper error (early):', err);
+                                return null;
+                            }),
+                        };
+                    }
+                }
                 if (speechActive && silenceFrames >= SILENCE_END_FRAMES) {
                     speechActive = false;
                     const utterance = Buffer.concat(speechChunks);
+                    const early = earlyStt && earlyStt.chunks === speechChunks && earlyStt.maxRms < EARLY_STT_QUIET_RMS && state === 'LISTENING' && !carryAudio ? earlyStt : null;
+                    earlyStt = null;
                     speechChunks = [];
                     console.log(`[vad] speech end (${utterance.length} bytes)`);
                     if (state === 'AWAIT_ANSWER') {
@@ -4744,7 +4770,7 @@ fastify.register(async (fastify) => {
                         greetAfterAnswer('answered');
                         checkAnswerUtterance(utterance);
                     } else if (utterance.length >= MIN_UTTERANCE_BYTES || carryAudio) {
-                        handleUserUtterance(utterance).catch((err) =>
+                        handleUserUtterance(utterance, { early }).catch((err) =>
                             console.error('handleUserUtterance error:', err)
                         );
                     } else {

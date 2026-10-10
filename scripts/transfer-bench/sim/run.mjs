@@ -1081,6 +1081,7 @@ for (const name of names) {
         if (process.env.SIM_VERBOSE) for (const l of r.log) console.log(`     ${l.t}s ${l.line}`);
     } else {
         console.log(`✓ ${name}（${r.elapsed.toFixed(1)}s）`);
+        if (process.env.SIM_VERBOSE === "all") for (const l of r.log) console.log(`     ${l.t}s ${l.line}`);
     }
 }
 engine.kill();
