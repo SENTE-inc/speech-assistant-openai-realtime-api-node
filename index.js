@@ -14,7 +14,7 @@ import {
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
     decideFastHandover, decideAfterClassifierV2, decideHold, isWordless, decideAskedQuestion, isCourtesyOnly,
     isIncompleteUtterance, isFillerWordsOnly, isRepeatRequest, classifyAbsentReply, parseRecallAt, retryIntervalFor,
-    matchHandover, firstMatch, NEGATIVE_RE,
+    matchHandover, firstMatch, NEGATIVE_RE, chooseAizuchi, thanksRestText, thanksConfig, thanksTargets, THANKS_KEY, THANKS_TEXT, restKeyOf, thanksClipFilename,
 } from './transfer-logic.js';
 import {
     existsSync,
@@ -540,6 +540,8 @@ async function loadPlaybook(tenantId, projectId = null, gender = null) {
         intentByName: new Map(intents.map((i) => [i.name, i])),
     };
     cfg.classifierPrompt = buildClassifierPrompt(cfg);
+    // 相づちの「ありがとうございます」＝声セットに在り、「ありがとうございます」で始まる台本の全部に頭を落とした方が揃った時だけ使う（揃わなければ「はい」のまま）
+    Object.assign(cfg, thanksConfig(cfg.clips, pb.voice_ai_voice_id));
 
     // Vocabulary hint for STT — biases gpt-transcribe toward this tenant's
     // expected phrases so homophones (e.g. 代表/対象) resolve correctly.
@@ -553,7 +555,10 @@ async function loadPlaybook(tenantId, projectId = null, gender = null) {
 
     playbookCache.set(cacheKey, { cfg, loadedAt: Date.now() });
     // 不在の流れの4本が欠けていれば、その声セットの声で作って足す（裏で・人の手を通さない＝2026-10-08 Tom「勝手に作成できるようにしたい」）
-    ensureAbsentClips(pb, cfg).catch((err) => console.error(`[absent-clips] ${pb.id} failed: ${err.message}`));
+    // 相づちの「ありがとうございます」は不在の4本の後に作る（不在の「ありがとうございます。ちなみに…」の頭を落とした方も作る＝監査 2026-10-10）
+    ensureAbsentClips(pb, cfg).catch((err) => console.error(`[absent-clips] ${pb.id} failed: ${err.message}`))
+        .then(() => ensureThanksClips(pb))
+        .catch((err) => console.error(`[thanks-clips] ${pb.id} failed: ${err.message}`));
 
     // Warm the clip cache in the background so the first call isn't slow.
     for (const key of cfg.clips.keys()) {
@@ -1186,6 +1191,63 @@ const ABSENT_KEYS = ABSENT_CLIPS.map((c) => c.key);
 // ElevenLabs の声が無い声セット（肉声だけ等）は作らない＝今の流れ（辞去で終話）のまま。失敗したらその声セットは1時間おく。
 // 4本で約150字・声セットごとに1回（ElevenLabs の月の上限の数には入れない）。家＝~/sente/sente_aivoice_canonical.md §3「📐 実装の計画 v3」
 const absentClipsTried = new Map(); // playbookId -> 次に試してよい時刻
+// 相づちの「ありがとうございます」（2026-10-10 Tom「本番にgo」・森さん「ありがとうございます。でもいいかもね」）
+//   aizuchi_thanks＝「ありがとうございます。」1本と、「ありがとうございます」で始まる台本ごとに頭を落とした方（<key>__rest）を
+//   声セットの ElevenLabs の声で作って足す（不在の4本と同じ作り）。相づちとその声セットの台本が ElevenLabs の声の物だけ（肉声・別の声に混ぜない）。
+//   台本の文が変わったら頭を落とした方も作り直す（文を比べる）。家＝~/sente/sfav_transfer_tuning_plan.md「相づち」
+const thanksClipsBusy = new Set(); // playbookId＝作っている最中（同じプロセスで重ねない）
+const thanksClipsFailedAt = new Map(); // playbookId -> 失敗した時刻（失敗した時だけ1時間おく）
+async function ensureThanksClips(pb) {
+    if (!process.env.ELEVENLABS_API_KEY || !pb?.voice_ai_voice_id) return;
+    const base = (pb.audio_base_path || '').trim();
+    if (!base || thanksClipsBusy.has(pb.id)) return;
+    const failed = thanksClipsFailedAt.get(pb.id);
+    if (failed && Date.now() - failed < 60 * 60 * 1000) return;
+    thanksClipsBusy.add(pb.id);
+    let wrote = 0;
+    try {
+        // 今の行を読み直す（不在の4本を足した直後も拾う）
+        const { data, error } = await supabase.from('audio_clips').select('*').eq('playbook_id', pb.id).eq('active', true);
+        if (error) throw new Error(`read clips: ${error.message}`);
+        const clips = new Map((data || []).map((c) => [c.key, c]));
+        const voice = pb.voice_ai_voice_id;
+        const fillers = [...clips.values()].filter((c) => c.clip_type === 'filler');
+        const targets = thanksTargets(clips);
+        if (!fillers.length || [...fillers, ...targets].some((c) => c.source !== 'elevenlabs')) return;
+        const want = [{ key: THANKS_KEY, text: THANKS_TEXT, sort_order: 40 }];
+        for (const c of targets) {
+            const rest = thanksRestText(c.text);
+            if (rest.trim()) want.push({ key: restKeyOf(c.key), text: rest, sort_order: (c.sort_order ?? 0) + 100 });
+        }
+        for (const c of want) {
+            const filename = thanksClipFilename(c.key, c.text, voice);
+            const have = clips.get(c.key);
+            if (have && have.source === 'elevenlabs' && have.audio_ready === true && have.text === c.text && have.filename === filename) continue;
+            const mp3 = await elevenTts(c.text, voice);
+            const { error: upErr } = await supabase.storage.from(AUDIO_BUCKET)
+                .upload(`${base}/${filename}`, mp3, { contentType: 'audio/mpeg', upsert: true });
+            if (upErr) throw new Error(`upload ${c.key}: ${upErr.message}`);
+            const { error: wErr } = await supabase.from('audio_clips').upsert({
+                playbook_id: pb.id, tenant_id: pb.tenant_id, key: c.key, clip_type: 'response', filename, text: c.text,
+                source: 'elevenlabs', audio_ready: true, suppress_farewell: false, sort_order: c.sort_order, active: true,
+                updated_at: new Date().toISOString(),
+            }, { onConflict: 'playbook_id,key' });
+            if (wErr) throw new Error(`write ${c.key}: ${wErr.message}`);
+            wrote++;
+        }
+        thanksClipsFailedAt.delete(pb.id);
+    } catch (err) {
+        thanksClipsFailedAt.set(pb.id, Date.now());
+        throw err;
+    } finally {
+        thanksClipsBusy.delete(pb.id);
+        if (wrote) {
+            console.log(`[thanks-clips] wrote ${wrote} clips to playbook ${pb.id}`);
+            bustPlaybookCache(pb.tenant_id); // 途中で落ちても書けた分は次の電話から読む
+        }
+    }
+}
+
 async function ensureAbsentClips(pb, cfg) {
     if (!process.env.ELEVENLABS_API_KEY || !pb?.voice_ai_voice_id) return;
     const base = (pb.audio_base_path || '').trim();
@@ -2866,6 +2928,7 @@ fastify.register(async (fastify) => {
         // 「もう一度」で流し直す、最後に流し終えた返答の列（つなぎの「はい」と聞き返しは入れない）
         let lastResponseSeq = null;
         let repeatCount = 0;
+        let thanksSaidAt = 0; // 相づちの「ありがとうございます」を言い終えた時刻＝直後の「ありがとうございます…」の台本は頭を落として流す
         const REPEAT_MAX = 2;
         let lastRecorded = null; // { turn, text }＝同じ発話の繰り返しの数に最後に入れた発話（捨てた切れ端を外すため）
         // あいさつは相手の第一声が終わってから流す（2026-10-06 Tom「最初は向こうが名乗るだろうから、それを待ってから自己紹介」＝声セットの家 D7 を覆した）
@@ -3087,6 +3150,14 @@ fastify.register(async (fastify) => {
         // Playback (one key → cached mulaw → chunked → mark → await)
         // -----------------------------------------------------------------
         const playAudio = async (key) => {
+            // 相づちの「ありがとうございます」の直後（2秒以内）に「ありがとうございます」で始まる台本＝頭を落とした方（二重に言わない）
+            if (thanksSaidAt && key !== cfg?.thanksKey) {
+                const recent = Date.now() - thanksSaidAt < 2000;
+                thanksSaidAt = 0;
+                const sub = recent ? cfg?.thanksRestKey?.get(key) : undefined;
+                if (sub === '') return 'done';
+                if (sub) key = sub;
+            }
             playbackActive++;
             try {
                 return await playAudioInner(key);
@@ -4084,6 +4155,7 @@ fastify.register(async (fastify) => {
                 disableVad('processing utterance');
             }
             const t0 = Date.now();
+            thanksSaidAt = 0; // 前の発話の相づちを持ち越さない（「もう一度」の流し直しに効かせない＝監査 2026-10-10）
             console.log(`▶ State: PROCESSING (${mulawAudio.length} bytes captured)`);
 
             // Start Whisper immediately so STT runs during the human-pause
@@ -4103,11 +4175,15 @@ fastify.register(async (fastify) => {
             const fillerKeys = inWait ? [] : (cfg?.fillerKeys || []);
             const fillerKey = fillerKeys.length ? fillerKeys[haiPatternIndex % fillerKeys.length] : null;
             haiPatternIndex++;
-            const startFiller = (delayMs) => new Promise((resolve) =>
+            const startFiller = (delayMs, text) => new Promise((resolve) =>
                 setTimeout(resolve, delayMs)
-            ).then(() => {
+            ).then(async () => {
                 if (state === 'ENDED' || !fillerKey || transferCommitted || stale()) return;
-                return playAudio(fillerKey);
+                // 相づち＝基本は「ありがとうございます」・問いかけ／否定の語／相づちだけには「はい」（声セットに無ければ「はい」）
+                const key = cfg?.thanksKey && chooseAizuchi(text) === 'thanks' ? cfg.thanksKey : fillerKey;
+                const r = await playAudio(key);
+                if (key === cfg?.thanksKey && r === 'done' && !stale() && state !== 'ENDED') thanksSaidAt = Date.now(); // 次の発話が始まっていたら持ち越さない（監査 2026-10-10）
+                return r;
             }).catch((err) => console.error('Filler playback error:', err));
             // 「はい」は全部の通話で中身を聞いてから決める（版6 は v2 だけだった）＝担当者本人の名乗り・言いかけ・「もう一度」には流さない
             //   （一度送った音は止められない＝言いかけで黙るには先に流さないしかない・2026-10-08 森さん FB／codex 監査）
@@ -4136,7 +4212,7 @@ fastify.register(async (fastify) => {
 
             const fast = transcript && ts?.v2 ? decideFastHandover({ transcript, ts }) : null;
             const repeatAsk = !!transcript && !inWait && !fast && isRepeatRequest(transcript);
-            fillerPromise = (fast || repeatAsk) ? Promise.resolve() : startFiller(Math.max(0, HUMAN_PAUSE_MS - (Date.now() - t0)));
+            fillerPromise = (fast || repeatAsk) ? Promise.resolve() : startFiller(Math.max(0, HUMAN_PAUSE_MS - (Date.now() - t0)), transcript);
 
             if (!transcript) {
                 if (inWait) {

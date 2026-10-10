@@ -665,3 +665,55 @@ export function isCourtesyOnly(transcript) {
 // 録音のお知らせ（人が出る前に流れる）と、番号を選ぶ案内（CM が番号を押して進める＝録音 465本で人の CM が番号を押して本人まで行った通話が 11）を分ける（2026-10-10）
 const RECORDING_NOTICE_RE = /録音させて(?:いただ|頂)|録音いたし|録音しており|録音しています|録音します|録音されます|通話内容を録音/;
 const IVR_MENU_RE = /番号|ボタン|プッシュ|ダイヤル|メニュー|お選びください|ガイダンスに従|音声案内|[0-9０-９一二三四五六七八九十]\s*(?:番)?\s*を\s*(?:押|選)|番を押/;
+
+// 相づちの言葉（2026-10-10 Tom「本番にgo」・森さん「会話の流れによるけど、ありがとうございます。でもいいかもね」＝SF Slack `1791554772.289199`）
+//   基本は「ありがとうございます」（受けの言葉で判定の間を埋める）。問いかけ・頼み（社名・名前・用件を聞く）・断りや不在・分からない（否定の語）・
+//   相づちだけの発言（「はい」「ええ」「どうも」）には「はい」。返す値＝'thanks'｜'hai'。声セットに「ありがとうございます」が揃わなければ呼び出し側で「はい」
+const AIZUCHI_QUESTION_RE = /[?？]|か[。\s]*$|ですか|ますか|でしょうか|ましたか|(?:何|なん)でしょう|どちら様|どなた|どういった|どのような|いかが|何の|なんの|ません[かけ]/;
+const AIZUCHI_NEGATIVE_RE = /対応(?:できません|できない|いたしかねます|しかねます)|できません|できかねます|いたしかねます|存じ(?:上げ)?ません|わかりかねます|分かりかねます|わかりません|分かりません/;
+const AIZUCHI_ACK_ONLY_RE = /^(?:はい|ええ|うん|ああ|あ|はいはい|そうですね|そうです|なるほど|えっと|あの|もしもし|どうも|承知(?:いた|致)?しました|わかりました|分かりました|かしこまりました)+$/;
+export function chooseAizuchi(transcript) {
+    const raw = String(transcript || '');
+    if (!normalizeForTransferGuard(raw)) return 'hai';
+    if (AIZUCHI_QUESTION_RE.test(raw)) return 'hai';
+    // 頼みの形の問い（「お名前をお願いします」「ご用件をお聞かせください」）＝聞かれた物と頼む語が同じ文に在る
+    if (raw.split(/[。！!？?]/).some((sent) => ASK_RE.test(sent) && (ASK_COMPANY_RE.test(sent) || ASK_REASON_RE.test(sent) || ASK_ADDRESSEE_RE.test(sent)))) return 'hai';
+    if (negativeIgnoringApology(raw) || AIZUCHI_NEGATIVE_RE.test(raw)) return 'hai';
+    if (AIZUCHI_ACK_ONLY_RE.test(stripForJudge(raw))) return 'hai';
+    return 'thanks';
+}
+
+// 「ありがとうございます」で始まる台本＝相づちで「ありがとうございます」を言った同じ発話の返答は頭を落とした方を流す（二重に言わない）
+export const THANKS_PREFIX_RE = /^ありがとうございます[。、！!]?\s*/;
+export function thanksRestText(text) {
+    const t = String(text || '');
+    return THANKS_PREFIX_RE.test(t) ? t.replace(THANKS_PREFIX_RE, '') : null;
+}
+export const THANKS_KEY = 'aizuchi_thanks';
+export const THANKS_TEXT = 'ありがとうございます。';
+export const restKeyOf = (key) => `${key}__rest`;
+// 作った音のファイル名＝文と声で決まる（文か声が変わったら別の名前＝作り直しの印）
+export function thanksClipFilename(key, text, voiceId) {
+    return `t_${key}_${createHash('sha256').update(`${voiceId}\n${text}`).digest('hex').slice(0, 8)}.mp3`;
+}
+export function thanksTargets(clips) {
+    return [...clips.values()].filter((c) => c.key !== THANKS_KEY && !c.key.endsWith('__rest') && thanksRestText(c.text) != null);
+}
+// 使えるか＝相づち・対象の台本・作った音の全部が ElevenLabs の声で、作った音が今の文と声の物（肉声・別の声と混ぜない＝監査 2026-10-10）
+export function thanksConfig(clips, voiceId) {
+    const off = { thanksKey: null, thanksRestKey: new Map() };
+    const el = (c) => c?.source === 'elevenlabs';
+    const made = (c, text) => el(c) && c.audio_ready === true && c.text === text && c.filename === thanksClipFilename(c.key, text, voiceId);
+    if (!voiceId || !made(clips.get(THANKS_KEY), THANKS_TEXT)) return off;
+    const fillers = [...clips.values()].filter((c) => c.clip_type === 'filler');
+    if (!fillers.length || !fillers.every(el)) return off;
+    const map = new Map();
+    for (const c of thanksTargets(clips)) {
+        if (!el(c)) return off;
+        const rest = thanksRestText(c.text);
+        if (!rest.trim()) { map.set(c.key, ''); continue; }
+        if (!made(clips.get(restKeyOf(c.key)), rest)) return off;
+        map.set(c.key, restKeyOf(c.key));
+    }
+    return { thanksKey: THANKS_KEY, thanksRestKey: map };
+}
