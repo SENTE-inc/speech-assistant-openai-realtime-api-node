@@ -221,6 +221,9 @@ export const LEVEL_PHRASES = {
     transfer_phrases: ['詳しく聞かせて', '詳しく聞きたい', '興味があります', '興味あります', '聞かせてください'],
     wait_phrases: ['少々お待ち', 'お待ちください', 'お待ちいただけ', 'ちょっと待って', '確認します', '呼んできます', '今呼びます', '呼びますので', '担当に代わ', '担当者に代わ', 'お繋ぎ', 'おつなぎ', '代わります', '替わります', '変わります'],
     block_phrases: ['代わりに伝え', '代わりに承', '代わりにご用件', '代わりにお伺い', '代わりにお聞き'],
+    // 本人の確かめ句＝Haiku が transfer と言った時だけ、関門（step 8s）で取次の裏付けにする。句だけでは取次にしない＝最速の道（handover_phrases）には入れない。
+    // 版6で名乗り（最速）と前向きに割った時、旧関門の「私です」等の確かめが消えた＝それを戻す（2026-10-10 SF の録音 465本の流し直し＝~/sente/sfav_transfer_tuning_plan.md「版7.1」）
+    self_confirm_phrases: ['私です', '私でございます', 'わたくしでございます', '私になります', '私でいい', '私で大丈夫', '僕で大丈夫', '私が担当', '私担当'],
 };
 
 export function normalizeSettings(row) {
@@ -264,7 +267,7 @@ export function settingsHash(ts) {
         ...(ts.v2 ? {
             level: ts.level, on_words: ts.on_words, on_hold_without_words: ts.on_hold_without_words, on_handover: ts.on_handover,
             hold_music_seconds: ts.hold_music_seconds, hold_music_record_only: ts.hold_music_record_only,
-            handover_phrases: ts.handover_phrases,
+            handover_phrases: ts.handover_phrases, self_confirm_phrases: ts.self_confirm_phrases,
         } : {}),
     });
     return createHash('sha256').update(body).digest('hex');
@@ -278,6 +281,28 @@ export function settingsHash(ts) {
 export const NEGATIVE_RE = /いません|おりません|いない|おらず|不在|外出|席を外|出張|休み|結構|けっこう|お断り|断って|必要(が)?(ありません|ない)|不要|間に合って|いりません|興味(が|は)?(ない|ありません)|受け付けて|ではありません|ではない|じゃない|じゃありません|違います|ちがいます/;
 // 質問・受付・第三者の話＝名乗りではない（最速の道に乗せない）
 const NOT_SELF_RE = /[?？]|ですか|ますか|でしょうか|ましたか|受付|の者|の方|別の/;
+
+// 確かめ句を本人の名乗りとして使わない時＝①受付・第三者の語 ②代わりに受ける・呼ぶ・伝える説明（「担当を呼ぶのは私ですけど」「私ですが、担当へ伝えます」）
+//   ③句を含む節が疑問形（「私でいいですか」「私が担当なんですか」「私です？」「私でいいのか判断がつきますか」）。
+//   節＝句の後ろから、次の区切り（、。！!？? の手前・「けど／けれど」の手前・「です／ます／ございます／だ」の直後の「が」の手前）まで。
+//   句がどこか1か所でも疑問形なら使わない（安全側）。「私ですけど、どういったご用件でしょうか」「僕で大丈夫ですがどういったご用件ですか」＝使う
+const SELF_CONFIRM_NOT_SELF_RE = /受付|の者|別の|呼ぶ|呼び|呼んで|伝え|取り次|取次|おつなぎ|お繋ぎ|代わりに|かわりに/;
+const SELF_CONFIRM_CLAUSE_END_RE = /けれど|けど|(?:^|です|ます|ございます|だ)が|[、。，．！!？?]/;
+export function isSelfConfirmQuestion(transcript, phrases) {
+    const t = String(transcript || '').replace(/\s+/g, ' ');
+    if (SELF_CONFIRM_NOT_SELF_RE.test(t)) return true;
+    for (const p of [].concat(phrases || [])) {
+        if (!p) continue;
+        for (let i = t.indexOf(p); i >= 0; i = t.indexOf(p, i + 1)) {
+            const rest = t.slice(i + p.length);
+            const m = SELF_CONFIRM_CLAUSE_END_RE.exec(rest);
+            const clause = m ? rest.slice(0, m.index + (m[0].endsWith('が') ? m[0].length - 1 : 0)) : rest;
+            const end = m ? m[0] : '';
+            if (/[？?]/.test(end) || /か\s*$/.test(clause)) return true;
+        }
+    }
+    return false;
+}
 
 // 担当者本人の言い方（森さんが画面で足す・消す）。「＊」は名前などの1〜8字（「担当の＊です」＝担当の山田です）。
 // ＊には「者・人・方・番号」を入れない＝「担当の者は」「代表の番号です」を名乗りにしない
@@ -336,6 +361,14 @@ export function decideAfterClassifierV2({ transcript, intentName, intentDef, ts,
     if (words) {
         if (ts.on_words === 'transfer') return { step: '7', action: 'transfer', gate: 'words', matched: waitHit };
         return { step: '7', action: inWait ? 'continue_wait' : 'wait_enter', gate: `words_${ts.on_words}`, matched: waitHit };
+    }
+    // 本人の確かめ句（Haiku が transfer の時だけ）＝否定・つながない句・句を含む節の疑問形（「私ですか」「私でいいですか」）・受付や第三者の語があれば使わない。
+    //   4字未満の規則（transferGate）より先に見る＝「私です」は3字。名乗りの後に用件を聞く「私ですけど、どういったご用件でしょうか」は通す
+    if (intentDef?.is_transfer && !blocked) {
+        const sc = matchPhrases(transcript, ts.self_confirm_phrases);
+        if (sc && !NEGATIVE_RE.test(transcript || '') && !isSelfConfirmQuestion(transcript, ts.self_confirm_phrases)) {
+            return { step: '8s', action: 'transfer', gate: 'self_confirm', matched: sc };
+        }
     }
     // 前向き（「詳しく聞かせてください」等）＝今の関門
     if (intentDef?.is_transfer) {

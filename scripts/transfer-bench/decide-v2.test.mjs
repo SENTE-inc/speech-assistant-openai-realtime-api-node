@@ -183,3 +183,52 @@ test('「担当者です」「担当者の山田です」はどの段でも最�
         for (const t of ['担当者です。', '担当者の山田です。']) assert.equal(decideFastHandover({ transcript: t, ts })?.action, 'transfer_fast', `${l} ${t}`);
     }
 });
+
+// 版7.1＝本人の確かめ句（Haiku が transfer の時だけ取次の裏付けにする・最速の道には入れない）
+// 例は SF の録音 465本の流し直しで、今の関門が止めていた本人の発言（家＝~/sente/sfav_transfer_tuning_plan.md「版7.1」）
+const SELF_CONFIRM = [
+    'はい、私です', '私です。', 'はい、私でございます。', 'はい、 私になりますが', '私でいいと思うんですけど何ですか?',
+    '僕で大丈夫ですがどういったご用件ですか', 'あ、私ですけれどもどういった内容でしょうか',
+    'いや私が担当ですけど何かあるんでしょうか', '私担当ですけども何でしょうか', 'わたくしでございます。',
+];
+for (const level of ['loose', 'normal', 'strict']) {
+    const ts = normalizeSettings(levelRow(level));
+    for (const text of SELF_CONFIRM) {
+        test(`確かめ句「${text}」(Haiku=transfer) × ${level} → transfer`, () => {
+            assert.equal(decide(text, 'transfer', { ts }), 'transfer');
+        });
+    }
+    test(`確かめ句は最速の道に乗らない（Haiku を待つ）× ${level}`, () => {
+        assert.equal(decideFastHandover({ transcript: 'はい、私です', ts }), null);
+    });
+}
+// 句だけでは取次にしない＝Haiku が transfer 以外なら今どおり
+const SELF_CONFIRM_NOT = [
+    ['はい、私です', 'reprompt', 'reprompt'],
+    ['はい、私です', 'openai_realtime', 'realtime'],
+    ['あ、私ですか?', 'transfer', 'reprompt'],          // 句の直後が「か」＝聞き返し
+    ['私ですか', 'transfer', 'reprompt'],
+    ['受付の私ですが、ご用件をお伺いします', 'transfer', 'reprompt'], // 受付と名乗った
+    ['私ですが、担当は不在です', 'transfer', 'reprompt'],   // 否定の語
+    ['私しかいないと思いますが。', 'transfer', 'reprompt'],   // 本人だが「いない」が否定の語に当たる＝否定を優先（取りこぼしは承知）
+    ['私でいいですか。', 'transfer', 'reprompt'],            // 句を含む節が疑問形（codex 監査 2026-10-10）
+    ['私が担当なんですか', 'transfer', 'reprompt'],
+    ['私です？', 'transfer', 'reprompt'],
+    ['私ですか。はい、私です。', 'transfer', 'reprompt'],     // どこか1か所でも疑問形なら使わない（安全側）
+    ['私がお伺いしますので、ご用件をどうぞ。', 'transfer', 'reprompt'], // 受付が用件を代わりに聞く＝句に入れない
+    ['まず私がお受けします。', 'transfer', 'reprompt'],
+    ['担当を呼ぶのは私ですけど、ご用件は何ですか。', 'transfer', 'reprompt'], // 呼ぶ・伝える＝代わりに受ける人（codex 再監査）
+    ['私ですが、ご用件を伺って担当へ伝えます。', 'transfer', 'reprompt'],
+    ['私でいいのか判断がつきますか。', 'transfer', 'reprompt'],   // 「が」で節を切らない（です・ます・ございます・だ の直後だけ）
+    ['私でいいというお考えがあるんですか。', 'transfer', 'reprompt'],
+    ['私です\nか？', 'transfer', 'reprompt'],                  // 改行入り
+    ['私でございますが、代わりにご用件を承ります', 'transfer', 'reprompt'], // つながない句
+];
+for (const [text, haiku, want] of SELF_CONFIRM_NOT) {
+    test(`確かめ句でも取次にしない「${text}」(Haiku=${haiku}) → ${want}`, () => {
+        assert.equal(decide(text, haiku), want);
+    });
+}
+test('確かめ句は待機中も Haiku が transfer なら取次', () => {
+    assert.equal(decide('はい、私です', 'transfer', { inWait: true }), 'transfer');
+});
