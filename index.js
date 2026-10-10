@@ -2971,7 +2971,9 @@ fastify.register(async (fastify) => {
         // 黙って 0.3秒で文字起こしを先に始める（言い終わりの判定は 0.8秒のまま）＝閉じた時に結果が出ていれば相づちは 0.8秒で出る。
         //   その前に話し始めたら捨てる（音も文字起こしもやり直し）
         const EARLY_STT_FRAMES = 15;
-        const EARLY_STT_QUIET_RMS = 1000; // 先に始めた後にこれより大きい音（声の線 2000 未満の小声）が来たら使わない＝閉じた時の音で取り直す（codex 監査）
+        // 先に始めた後にこれより大きい音が1枚でも来たら使わない＝閉じた時の全部の音で取り直す（codex 監査2回）。
+        //   線は保留音の「音あり」と同じ 350＝小声も拾う側に倒す（回線の雑音で超えても、いつもの文字起こしに戻るだけ）
+        const EARLY_STT_QUIET_RMS = 350; // ＝HOLD_RMS_THRESHOLD（下で宣言）
         let earlyStt = null; // { chunks, promise, maxRms }＝speechChunks の同じ配列・その後ずっと静かだった時だけ使う
         const PREROLL_FRAMES = 15;       // ~300ms kept before VAD confirms speech, so soft onsets aren't clipped
         const MAX_UTTERANCE_FRAMES = 300; // 6s＝設定が在る通話の1発話の上限（§1-d）
@@ -4750,7 +4752,7 @@ fastify.register(async (fastify) => {
                     if (audio.length >= MIN_UTTERANCE_BYTES) {
                         earlyStt = {
                             chunks: speechChunks,
-                            maxRms: 0,
+                            maxRms: rms, // この枠は音に入っていない＝判定にだけ入れる
                             promise: transcribeWhisper(audio, cfg.transcriptionPrompt).catch((err) => {
                                 console.error('Whisper error (early):', err);
                                 return null;
@@ -4762,6 +4764,7 @@ fastify.register(async (fastify) => {
                     speechActive = false;
                     const utterance = Buffer.concat(speechChunks);
                     const early = earlyStt && earlyStt.chunks === speechChunks && earlyStt.maxRms < EARLY_STT_QUIET_RMS && state === 'LISTENING' && !carryAudio ? earlyStt : null;
+                    if (earlyStt && !early) console.log(`[stt] early transcription dropped (maxRms=${earlyStt.maxRms.toFixed(0)})`);
                     earlyStt = null;
                     speechChunks = [];
                     console.log(`[vad] speech end (${utterance.length} bytes)`);
