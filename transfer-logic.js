@@ -689,8 +689,9 @@ export function chooseAizuchi(transcript) {
 //   ⚠ 1回ごとに読み方が揺れる＝Tom が聞いて選んだテイクを、このファイル名で先に置く（エンジンはファイル名が合えば作り直さない）
 export const AIZUCHI_CLIPS = [
     { key: 'aizuchi_thanks', text: 'ありがとうございます！', tts: '[cheerfully] ありがとうございます！', kind: 'thanks' },
-    { key: 'aizuchi_shouchi', text: '承知しました！', tts: '[cheerfully] 承知しました！', kind: 'ack' },
-    { key: 'aizuchi_kashikomari', text: 'かしこまりました！', tts: '[cheerfully] かしこまりました！', kind: 'ack' },
+    // 承知・かしこまりは「明るく」の指定を外す（2026-10-11 Tom「かしこまりましたと承知しましただけやたら元気で温度感が変」＝周りの台本と揃える）
+    { key: 'aizuchi_shouchi', text: '承知しました！', tts: '承知しました！', kind: 'ack' },
+    { key: 'aizuchi_kashikomari', text: 'かしこまりました！', tts: 'かしこまりました！', kind: 'ack' },
 ];
 // 相づちの音のファイル名は読み方の指定も含める（指定を変えたら作り直す）
 export const aizuchiFilename = (a, voiceId) => thanksClipFilename(a.key, `${a.text}\n${a.tts}`, voiceId);

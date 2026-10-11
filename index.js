@@ -2488,6 +2488,9 @@ async function voiceSetGate(tenantId, projectId, gender = null, userId = null) {
         return { reason: '台本を読めませんでした' };
     }
     if (!pb) return { reason: '台本がありません（Voice Setup で台本と音声を設定してください）', code: VOICE_NOT_READY };
+    // 相づちの音（言い回しを替えた後の作り直し）は架電を始めた時点で裏で作る＝最初の1本から新しい音で出る
+    //   （通話の時だけ作ると、替えた直後の1本目は古い設定のまま読み込まれて相づちが出ない）
+    ensureThanksClips(pb).catch((err) => console.error(`[thanks-clips] ${pb.id} failed: ${err.message}`));
     const { data: clips, error: clipErr } = await supabase
         .from('audio_clips').select('key, audio_ready').eq('playbook_id', pb.id).eq('active', true);
     if (clipErr) {
