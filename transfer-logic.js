@@ -688,8 +688,8 @@ export function chooseAizuchi(transcript) {
 //   ⚠ 本番は eleven_v4（Railway の env）＝見本も v4 で作る。v3 は指定つきの「承知」を中国語読み（チョンジ）にし、ひらがなで渡すと「招致」の高低（しょ↘うち）になる（Tom が聞き分けた・2026-10-11）＝v4・漢字で渡す。
 //   ⚠ 1回ごとに読み方が揺れる＝Tom が聞いて選んだテイクを、このファイル名で先に置く（エンジンはファイル名が合えば作り直さない）
 export const AIZUCHI_CLIPS = [
-    { key: 'aizuchi_thanks', text: 'ありがとうございます！', tts: '[cheerfully] ありがとうございます！', kind: 'thanks' },
-    // 承知・かしこまりは「明るく」の指定を外す（2026-10-11 Tom「かしこまりましたと承知しましただけやたら元気で温度感が変」＝周りの台本と揃える）
+    // 3本とも「明るく」の指定を外す（2026-10-11 Tom「かしこまりましたと承知しましただけやたら元気で温度感が変」「ありがとうございます！！だけバカに明るいやつ残ってるよ」＝周りの台本と揃える）
+    { key: 'aizuchi_thanks', text: 'ありがとうございます！', tts: 'ありがとうございます！', kind: 'thanks' },
     { key: 'aizuchi_shouchi', text: '承知しました！', tts: '承知しました！', kind: 'ack' },
     { key: 'aizuchi_kashikomari', text: 'かしこまりました！', tts: 'かしこまりました！', kind: 'ack' },
 ];
