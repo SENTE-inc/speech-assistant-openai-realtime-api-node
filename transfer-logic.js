@@ -700,6 +700,19 @@ const AIZUCHI_PREFIX = [
     { kind: 'thanks', re: /^ありがとうございます[。、！!]?\s*/ },
     { kind: 'ack', re: /^(?:承知(?:いた|致)?しました|かしこまりました)[。、！!]?\s*/ },
 ];
+// 名乗りの1本に名前まで入っている（「…の森と申します。」）＝後ろに CM の名前をつながない
+//   （2026-10-11 Tom「セールスフォージの森です 川上です」＝録音の名乗りに名前が入った声セットで二重に名乗った）
+export function leadNamesItself(text) {
+    return /(?:と申します|でございます)[。！!]?\s*$/.test(String(text || '').trim());
+}
+
+// 戻りの時間が分かった（callback_scheduled）＝もう一度時間を聞かず「そのお時間に改めて」で受ける
+//   （2026-10-11 Tom「最後にいつ担当者がいるか2回聞かれた」＝既定の意図の声が callback_request のままだった）
+export function intentClipKey(intent, hasClip) {
+    if (intent?.name === 'callback_scheduled' && hasClip('absent_time_ack')) return 'absent_time_ack';
+    return intent?.audio_key || null;
+}
+
 export function aizuchiPrefixOf(text) {
     const t = String(text || '');
     for (const p of AIZUCHI_PREFIX) if (p.re.test(t)) return { kind: p.kind, rest: t.replace(p.re, '') };

@@ -69,3 +69,19 @@ test('対象の台本の音が揃っていない → 使わない（codex 監査
     const notReady = full(); notReady.set('send_material', { ...notReady.get('send_material'), audio_ready: false });
     assert.equal(aizuchiConfig(notReady, V).aizuchi, null);
 });
+
+// 名乗りに名前まで入った声セット／戻りの時間が分かった時の声（2026-10-11 Tom の試し架電）
+import { leadNamesItself, intentClipKey } from '../../transfer-logic.js';
+test('名乗りの1本に名前が入っているか', () => {
+    assert.equal(leadNamesItself('お世話になっております。株式会社セールス・フォージの森と申します。'), true);
+    assert.equal(leadNamesItself('株式会社セールス・フォージの山田でございます'), true);
+    assert.equal(leadNamesItself('お世話になっております。株式会社セールス・フォージの'), false);
+    assert.equal(leadNamesItself(''), false);
+});
+test('戻りの時間が分かった時は「そのお時間に改めて」', () => {
+    const has = (keys) => (k) => keys.includes(k);
+    assert.equal(intentClipKey({ name: 'callback_scheduled', audio_key: 'callback_request' }, has(['absent_time_ack'])), 'absent_time_ack');
+    assert.equal(intentClipKey({ name: 'callback_scheduled', audio_key: 'callback_request' }, has([])), 'callback_request');
+    assert.equal(intentClipKey({ name: 'callback_request', audio_key: 'callback_request' }, has(['absent_time_ack'])), 'callback_request');
+    assert.equal(intentClipKey(null, has([])), null);
+});

@@ -14,7 +14,7 @@ import {
     decideBeforeClassifier, decideAfterClassifier, normalizeSettings, settingsHash,
     decideFastHandover, decideAfterClassifierV2, decideHold, isWordless, decideAskedQuestion, isCourtesyOnly,
     isIncompleteUtterance, isFillerWordsOnly, isRepeatRequest, classifyAbsentReply, parseRecallAt, retryIntervalFor,
-    matchHandover, firstMatch, NEGATIVE_RE, chooseAizuchi, aizuchiPrefixOf, aizuchiConfig, aizuchiTargets, AIZUCHI_CLIPS, aizuchiFilename, isAizuchiKey, restKeyOf, thanksClipFilename, pickupBeepToneRatio,
+    matchHandover, firstMatch, NEGATIVE_RE, chooseAizuchi, aizuchiPrefixOf, aizuchiConfig, aizuchiTargets, AIZUCHI_CLIPS, aizuchiFilename, isAizuchiKey, restKeyOf, leadNamesItself, intentClipKey, thanksClipFilename, pickupBeepToneRatio,
 } from './transfer-logic.js';
 import {
     existsSync,
@@ -446,6 +446,8 @@ async function ensureCmNameAudio(userId) {
 // 通話の声セットに CM の名前の音をのせる（name_lead が在る声セットだけ・キャッシュの cfg は他の通話と共有＝複製する）
 function withCmName(cfg, name) {
     if (!cfg?.clips?.has('name_lead') || !name?.path) return cfg;
+    // 名乗りの1本に名前まで入った声セット（録音で「…の森と申します。」）＝名前を重ねない
+    if (leadNamesItself(cfg.clips.get('name_lead')?.text)) return cfg;
     const clips = new Map(cfg.clips);
     clips.set('cm_name', { key: 'cm_name', clip_type: 'response', filename: '', fullPath: name.path, text: name.text });
     return { ...cfg, clips };
@@ -3478,7 +3480,8 @@ fastify.register(async (fastify) => {
                 if (state !== 'PLAYING') return;
             } else if (cfg?.clips?.has('name_lead')) {
                 // 関門で止まるはずの形（受電・手動・名前の音の読み損ね）＝名前を抜いて「◯◯の」から用件へつなぐ
-                console.error('[greeting] name_lead set without the operator name audio; skipping the name');
+                //   名乗りの1本に名前まで入った声セットはこれが正しい形（名前を重ねない）
+                if (!leadNamesItself(cfg.clips.get('name_lead')?.text)) console.error('[greeting] name_lead set without the operator name audio; skipping the name');
                 await playAudio('name_lead');
                 if (state !== 'PLAYING') return;
             }
@@ -4200,7 +4203,8 @@ fastify.register(async (fastify) => {
             // 不在＝戻りの時間を聞く流れ（4本がそろった声セットだけ・辞去や終話より前）
             if (intentDef?.name === 'not_available' && await startAbsentFlow()) return;
             // intent（否定＝切る）／answer（答えて聞く・待機中は待機を続ける）
-            if (!intentDef?.audio_key || !cfg.clips.has(intentDef.audio_key)) {
+            const intentKey = intentClipKey(intentDef, (k) => cfg.clips.has(k));
+            if (!intentKey || !cfg.clips.has(intentKey)) {
                 console.error(`[intent] "${intentDef?.name}" has no playable clip`);
                 if (meta.inWait) { continueWait(); return; }
                 // 切る意図（断り・不在・折り返し）は声が無くても切る＝CM へつながない（codex レビュー）
@@ -4208,7 +4212,7 @@ fastify.register(async (fastify) => {
                 await fallbackToAgent('no playable clip');
                 return;
             }
-            const looped = waitCtx ? false : recordClaudeDecision(intentDef.audio_key);
+            const looped = waitCtx ? false : recordClaudeDecision(intentKey);
             consecutiveEmpty = 0;
             // 戻り時間（「16時頃戻ります」）は声を流す前に書く（相手が声の途中で切っても残る）
             if (intentDef.wants_callback_info) {
@@ -4217,7 +4221,7 @@ fastify.register(async (fastify) => {
             }
             state = 'PLAYING';
             disableVad('playing response');
-            const played = await playClip(intentDef.audio_key);
+            const played = await playClip(intentKey);
             if (looped) { await endCallWithFarewell('loop_detected'); return; }
             if (intentDef.end_call) { await endCallWithFarewell(intentDef.end_reason || 'rejected'); return; }
             // 流した後に CM へ（資料送付＝送付先は CM が伺う・2026-10-07）
@@ -4531,7 +4535,8 @@ fastify.register(async (fastify) => {
                 await repromptOrEnd();
                 return;
             }
-            if (!intent.audio_key || !cfg.clips.has(intent.audio_key)) {
+            const intentKey = intentClipKey(intent, (k) => cfg.clips.has(k));
+            if (!intentKey || !cfg.clips.has(intentKey)) {
                 console.error(`[intent] "${intent.name}" has no playable clip`);
                 if (intent.end_call) { await endCallWithFarewell(intent.end_reason || 'rejected'); return; }
                 await fallbackToAgent('no playable clip');
@@ -4559,7 +4564,7 @@ fastify.register(async (fastify) => {
 
             // B-1 — Loop detection on Claude's decisions. Record FIRST so we
             // still play the current clip before ending.
-            const looped = recordClaudeDecision(intent.audio_key);
+            const looped = recordClaudeDecision(intentKey);
 
             consecutiveEmpty = 0;
             if (intent.wants_callback_info) {
@@ -4568,7 +4573,7 @@ fastify.register(async (fastify) => {
             }
             state = 'PLAYING';
             disableVad('playing response');
-            await playClip(intent.audio_key);
+            await playClip(intentKey);
 
             if (intent.is_transfer) {
                 // 「おつなぎします」の最中に切れた・こちらが切った＝取次へ進まない（段0）
